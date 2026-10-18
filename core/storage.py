@@ -396,9 +396,9 @@ class Store:
     # ------------------------------------------------------------------
     # история чата
     # ------------------------------------------------------------------
-    async def add_message(self, session_id: str, message: Message) -> None:
-        def run(conn: sqlite3.Connection) -> None:
-            conn.execute(
+    async def add_message(self, session_id: str, message: Message) -> int:
+        def run(conn: sqlite3.Connection) -> int:
+            cursor = conn.execute(
                 "INSERT INTO messages (session_id, role, text, kind, payload, actions, task_id, created_at) "
                 "VALUES (?,?,?,?,?,?,?,?)",
                 (
@@ -412,8 +412,44 @@ class Store:
                     message.created_at,
                 ),
             )
+            return int(cursor.lastrowid or 0)
+
+        return await self._call(run)
+
+    async def set_message_task(self, message_id: int, task_id: str) -> None:
+        """Привязывает сообщение к задаче: у каждой задачи своя переписка."""
+        if not message_id or not task_id:
+            return
+
+        def run(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                "UPDATE messages SET task_id = ? WHERE id = ? AND (task_id IS NULL OR task_id = '')",
+                (task_id, int(message_id)),
+            )
 
         await self._call(run)
+
+    async def history_for_task(self, task_id: str, limit: int = 100) -> list[dict[str, Any]]:
+        """Переписка конкретной задачи — своя у каждой, как отдельный чат."""
+
+        def run(conn: sqlite3.Connection):
+            cursor = conn.execute(
+                "SELECT * FROM messages WHERE task_id = ? ORDER BY id ASC LIMIT ?",
+                (task_id, limit),
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+        rows = await self._call(run)
+        for row in rows:
+            try:
+                row["payload"] = json.loads(row.get("payload") or "{}")
+            except ValueError:
+                row["payload"] = {}
+            try:
+                row["actions"] = json.loads(row.get("actions") or "[]")
+            except ValueError:
+                row["actions"] = []
+        return rows
 
     async def history(self, session_id: str, limit: int = 60) -> list[dict[str, Any]]:
         def run(conn: sqlite3.Connection):

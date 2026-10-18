@@ -13,6 +13,9 @@
     notifications: 0,
     es: null,
     lastTaskId: null,
+    // Открытая задача = открытый чат. У каждой задачи своя переписка и контекст.
+    taskId: null,
+    introHTML: null,
   };
 
   // ------------------------------------------------------------------
@@ -62,6 +65,70 @@
   function clearIntro() {
     const intro = chat.querySelector(".chat__intro");
     if (intro) intro.remove();
+  }
+
+  function rememberIntro() {
+    const intro = chat.querySelector(".chat__intro");
+    if (intro && !state.introHTML) state.introHTML = intro.outerHTML;
+  }
+
+  function showIntro() {
+    if (!state.introHTML) return;
+    if (chat.querySelector(".chat__intro")) return;
+    chat.insertAdjacentHTML("afterbegin", state.introHTML);
+  }
+
+  function clearChat() {
+    chat.querySelectorAll(".msg").forEach((node) => node.remove());
+    showIntro();
+  }
+
+  async function openConversation(taskId) {
+    if (state.busy) return;
+    state.taskId = taskId || null;
+    clearChat();
+    const known = (state.tasks || []).find((task) => task.id === taskId);
+    showCurrentTask(known ? known.params?.title || known.user_query || "" : "");
+    if (taskId) {
+      try {
+        const data = await api(`/api/history?task_id=${encodeURIComponent(taskId)}`);
+        (data.messages || []).forEach((row) => {
+          renderMessage(
+            {
+              role: row.role,
+              text: row.text,
+              kind: row.kind,
+              actions: row.actions || [],
+              created_at: row.created_at,
+              task_id: row.task_id,
+            },
+            { scroll: false }
+          );
+        });
+      } catch (error) {
+        console.warn("история задачи не загрузилась", error);
+      }
+    }
+    chat.scrollTop = chat.scrollHeight;
+    refreshTasks();
+  }
+
+  function showCurrentTask(title) {
+    const node = $("current-task");
+    if (!node) return;
+    const text = title ? `чат: «${title}»` : "";
+    node.textContent = text;
+    node.hidden = !text;
+    const subtitle = $("marquee-subtitle");
+    if (subtitle) subtitle.hidden = Boolean(text);
+  }
+
+  function startNewTask() {
+    state.taskId = null;
+    clearChat();
+    showCurrentTask("");
+    $("input").focus();
+    refreshTasks();
   }
 
   function renderMessage(message, { scroll = true } = {}) {
@@ -246,8 +313,14 @@
     try {
       const payload = await api("/api/chat", {
         method: "POST",
-        body: { text: value, mode: state.mode },
+        body: { text: value, mode: state.mode, task_id: state.taskId || null },
       });
+      const created = payload.task && payload.task.id;
+      if (created && created !== state.taskId) {
+        state.taskId = created;
+        clearChat();
+        showCurrentTask(payload.task.params?.title || payload.task.user_query || "");
+      }
       renderTurn(payload);
     } catch (error) {
       removePending();
@@ -333,14 +406,8 @@
   // ------------------------------------------------------------------
   // Панель задач
   // ------------------------------------------------------------------
-  const ACTIVE_STATES = new Set([
-    "searching",
-    "awaiting_choice",
-    "awaiting_confirm",
-    "awaiting_setup",
-    "downloading",
-    "monitoring",
-  ]);
+  // В работе — всё, что не закрыто: отменённые и скачанные уходят в архив.
+  const FINISHED_STATES = new Set(["cancelled", "done", "not_found"]);
 
   const STATE_TITLES = {
     searching: "поиск",
@@ -358,6 +425,13 @@
   function taskCard(task) {
     const card = document.createElement("div");
     card.className = `task-card task-card--${task.state}`;
+    if (task.id === state.taskId) card.classList.add("is-current");
+    card.title = "Открыть чат этой задачи";
+    card.addEventListener("click", (event) => {
+      if (event.target.closest("button")) return;
+      openConversation(task.id);
+      closePanel();
+    });
 
     const title = document.createElement("h3");
     title.className = "task-card__title";
@@ -434,7 +508,7 @@
         })
       );
     }
-    if (ACTIVE_STATES.has(task.state)) {
+    if (!FINISHED_STATES.has(task.state)) {
       actions.appendChild(
         smallButton("Отменить", "btn btn--danger", async (event) => {
           event.target.disabled = true;
@@ -502,8 +576,13 @@
         api("/api/tasks"),
         api("/api/downloads?limit=30"),
       ]);
-      const active = tasks.filter((task) => ACTIVE_STATES.has(task.state));
-      const past = tasks.filter((task) => !ACTIVE_STATES.has(task.state));
+      state.tasks = tasks;
+      if (state.taskId) {
+        const current = tasks.find((task) => task.id === state.taskId);
+        if (current) showCurrentTask(current.params?.title || current.user_query || "");
+      }
+      const active = tasks.filter((task) => !FINISHED_STATES.has(task.state));
+      const past = tasks.filter((task) => FINISHED_STATES.has(task.state));
 
       const activeBox = $("active-tasks");
       activeBox.innerHTML = "";
@@ -999,30 +1078,6 @@
   // ------------------------------------------------------------------
   // Инициализация
   // ------------------------------------------------------------------
-  async function loadHistory() {
-    try {
-      const data = await api("/api/history");
-      if (!data.messages || !data.messages.length) return;
-      clearIntro();
-      data.messages.forEach((row) => {
-        renderMessage(
-          {
-            role: row.role,
-            text: row.text,
-            kind: row.kind,
-            actions: row.actions || [],
-            created_at: row.created_at,
-            task_id: row.task_id,
-          },
-          { scroll: false }
-        );
-      });
-      chat.scrollTop = chat.scrollHeight;
-    } catch (error) {
-      console.warn("история не загрузилась", error);
-    }
-  }
-
   function bind() {
     document.querySelectorAll(".mode-btn").forEach((button) => {
       button.addEventListener("click", () => setMode(button.dataset.mode));
@@ -1057,6 +1112,8 @@
       button.addEventListener("click", () => toggleSection(button.dataset.toggle));
     }
     restoreSections();
+
+    $("new-task").addEventListener("click", startNewTask);
 
     $("bell").addEventListener("click", () => {
       const tray = $("notification-tray");
@@ -1096,11 +1153,27 @@
     });
   }
 
+  async function openLatestConversation() {
+    try {
+      const data = await api("/api/tasks");
+      const tasks = (data.tasks || []).slice().sort((a, b) =>
+        String(b.updated_at || "").localeCompare(String(a.updated_at || ""))
+      );
+      if (tasks.length) {
+        await openConversation(tasks[0].id);
+        return;
+      }
+    } catch (error) {
+      console.warn("не удалось открыть последнюю задачу", error);
+    }
+    startNewTask();
+  }
+
   async function init() {
+    rememberIntro();
     bind();
     setMode("oneshot");
-    await loadHistory();
-    await refreshTasks();
+    await openLatestConversation();
     await refreshStatus();
     connectEvents();
     setInterval(refreshTasks, 5000);

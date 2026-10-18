@@ -283,6 +283,15 @@ body {
 .task-list:empty { display: none; }
 
 .task-card {
+  cursor: pointer;
+}
+
+.task-card.is-current {
+  border-color: rgba(224, 162, 83, .55);
+  box-shadow: 0 0 0 1px rgba(224, 162, 83, .18), inset 0 0 20px rgba(224, 162, 83, .06);
+}
+
+.task-card {
   border: 1px solid var(--line-soft);
   border-left: 3px solid var(--amber);
   background: linear-gradient(180deg, rgba(50, 37, 20, .5), rgba(24, 17, 10, .7));
@@ -488,6 +497,17 @@ body {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.marquee__task {
+  margin: 2px 0 0;
+  font-size: 10.5px;
+  letter-spacing: .08em;
+  color: var(--amber);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 52vw;
 }
 
 .marquee__right { margin-left: auto; display: flex; align-items: center; gap: 8px; }
@@ -766,12 +786,39 @@ body {
   background: linear-gradient(180deg, rgba(20, 15, 9, .5), rgba(12, 9, 6, .92));
 }
 
+.composer__top {
+  display: flex;
+  align-items: stretch;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.new-task {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+  padding: 0 14px;
+  font-family: var(--serif);
+  font-size: 12px;
+  letter-spacing: .04em;
+  color: var(--amber-bright);
+  background: rgba(224, 162, 83, .08);
+  border: 1px solid rgba(224, 162, 83, .45);
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background .15s, transform .15s;
+}
+.new-task:hover { background: rgba(224, 162, 83, .16); }
+.new-task:active { transform: translateY(1px); }
+.new-task span[aria-hidden] { font-size: 16px; line-height: 1; }
+
 .composer__modes {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 8px;
-  margin-bottom: 10px;
   max-width: 520px;
+  flex: 1;
 }
 
 .mode-btn {
@@ -1140,6 +1187,8 @@ body {
 
   .composer { padding: 10px 12px calc(12px + env(safe-area-inset-bottom)); }
   .composer__modes { max-width: none; }
+  .new-task__label { display: none; }
+  .new-task { width: 46px; justify-content: center; padding: 0; }
   .mode-btn { padding: 8px 10px; }
   .composer__hint { display: none; }
 

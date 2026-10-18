@@ -131,6 +131,7 @@ async def logout(response: Response) -> dict[str, Any]:
 class ChatPayload(BaseModel):
     text: str
     mode: str = "chat"  # oneshot | periodic | chat
+    task_id: str | None = None  # открытая задача: её переписка и есть контекст
 
 
 class ActionPayload(BaseModel):
@@ -146,13 +147,18 @@ def _turn_to_json(turn) -> dict[str, Any]:
 
 
 @app.get("/api/history")
-async def history(session: str = Depends(current_session)) -> dict[str, Any]:
+async def history(
+    task_id: str = "", session: str = Depends(current_session)
+) -> dict[str, Any]:
+    """Переписка задачи (или последние сообщения сессии, если задача не выбрана)."""
+    if task_id:
+        return {"messages": await agent.history_for_task(task_id)}
     return {"messages": await agent.history(session)}
 
 
 @app.post("/api/chat")
 async def chat(payload: ChatPayload, session: str = Depends(current_session)) -> dict[str, Any]:
-    turn = await agent.handle_message(session, payload.text, payload.mode)
+    turn = await agent.handle_message(session, payload.text, payload.mode, payload.task_id)
     return _turn_to_json(turn)
 
 

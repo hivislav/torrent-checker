@@ -89,7 +89,8 @@
           <span class="marquee__lamp" aria-hidden="true"></span>
           <div>
             <h1 class="marquee__title">Кинозал</h1>
-            <p class="marquee__subtitle">агент по раздачам · kinozal.me · transmission</p>
+            <p class="marquee__subtitle" id="marquee-subtitle">агент по раздачам · kinozal.me · transmission</p>
+            <p class="marquee__task" id="current-task" hidden></p>
           </div>
         </div>
         <div class="marquee__right">
@@ -123,7 +124,12 @@
       </div>
 
       <form class="composer" id="composer">
-        <div class="composer__modes" role="group" aria-label="Режим задачи">
+        <div class="composer__top">
+          <button type="button" class="new-task" id="new-task" title="Начать новую задачу (свой чат и контекст)">
+            <span aria-hidden="true">＋</span>
+            <span class="new-task__label">Новая задача</span>
+          </button>
+          <div class="composer__modes" role="group" aria-label="Режим задачи">
           <button type="button" class="mode-btn is-active" data-mode="oneshot">
             <span class="mode-btn__icon" aria-hidden="true">⏱</span>
             <span class="mode-btn__label">Разово</span>
@@ -134,6 +140,7 @@
             <span class="mode-btn__label">Периодически</span>
             <span class="mode-btn__hint">следить за новым</span>
           </button>
+          </div>
         </div>
         <div class="composer__row">
           <textarea

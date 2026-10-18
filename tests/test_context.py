@@ -109,6 +109,38 @@ async def test_reset() -> None:
     agent.store.close()
 
 
+async def test_task_chats() -> None:
+    print("\n== у каждой задачи своя переписка ==")
+    agent = make_agent("chats-")
+    session = "s1"
+    first = Task(id="chat-a", kind="oneshot", state="awaiting_choice", session_id=session,
+                 user_query="Дюна", params={"title": "Дюна"})
+    second = Task(id="chat-b", kind="oneshot", state="awaiting_choice", session_id=session,
+                  user_query="Тед Лассо", params={"title": "Тед Лассо"})
+    await agent.store.save_task(first)
+    await agent.store.save_task(second)
+
+    for task, word in ((first, "дюна"), (second, "тед")):
+        user_id = await agent._remember(  # noqa: SLF001
+            session, Message(role="user", text=f"ищу {word}", kind="text", task_id=task.id)
+        )
+        turn = type("T", (), {"task": task, "messages": []})()
+        turn.messages = [Message(role="agent", text=f"ответ про {word}", kind="text")]
+        await agent._tag_turn(user_id, turn)  # noqa: SLF001
+        await agent._remember_many(session, turn.messages)  # noqa: SLF001
+
+    a = await agent.history_for_task("chat-a")
+    b = await agent.history_for_task("chat-b")
+    check("в чате первой задачи только её сообщения",
+          [m["text"] for m in a] == ["ищу дюна", "ответ про дюна"], [m["text"] for m in a])
+    check("во второй — свои",
+          [m["text"] for m in b] == ["ищу тед", "ответ про тед"], [m["text"] for m in b])
+    window = await agent._task_window("chat-a")  # noqa: SLF001
+    check("контекст модели — тоже только своей задачи",
+          [item["text"] for item in window] == ["ищу дюна", "ответ про дюна"], window)
+    agent.store.close()
+
+
 async def test_foreign_query() -> None:
     print("\n== чужой запрос не уточняет старую задачу ==")
     agent = make_agent("foreign-")
@@ -349,6 +381,7 @@ async def test_live_dialog() -> None:
 async def main() -> int:
     await test_window()
     await test_reset()
+    await test_task_chats()
     await test_foreign_query()
     await test_prompt()
     test_refinement_rules()

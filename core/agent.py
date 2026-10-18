@@ -261,22 +261,29 @@ class Agent:
     # ------------------------------------------------------------------
     # Публичный API (используется веб-слоем и будущим ботом)
     # ------------------------------------------------------------------
-    async def handle_message(self, session_id: str, text: str, mode: str = "chat") -> Turn:
+    async def handle_message(
+        self, session_id: str, text: str, mode: str = "chat", task_id: str | None = None
+    ) -> Turn:
+        """Ответ на сообщение. `task_id` — открытая задача (её переписка и есть контекст).
+
+        У каждой задачи своя история: сообщения хранятся с её id, и окно контекста
+        собирается только из них. Новый запрос без task_id начинает новую задачу.
+        """
         text = (text or "").strip()
         turn = Turn()
         if not text:
             turn.add("Пустой запрос. Напишите, что искать — например «Дюна 1080p».")
             return turn
 
-        await self._remember(session_id, Message(role="user", text=text, kind="text"))
+        user_message_id = await self._remember(
+            session_id, Message(role="user", text=text, kind="text", task_id=task_id or "")
+        )
 
-        # Контекст: последние сообщения переписки и незакрытая задача. Без этого
-        # уточнение «нет, я про 4 сезон» начинало бы новый поиск с нуля.
-        window = await self._context_window(session_id, limit=self.settings.context_messages + 1)
-        if window and window[-1].get("text") == text:
-            window = window[:-1]  # само текущее сообщение в истории не нужно
-        window = window[-self.settings.context_messages :]
-        active = await self._active_task(session_id)
+        # Контекст — переписка именно этой задачи (как отдельный чат).
+        current = await self.store.get_task(task_id) if task_id else None
+        window = await self._task_window(current.id) if current is not None else []
+        window = [item for item in window if item.get("text") != text]
+        active = current or await self._active_task(session_id)
 
         try:
             parsed = await self._parse_query(text, window, active)
@@ -289,7 +296,11 @@ class Agent:
             "periodic" if intent == "monitor" else "oneshot"
         )
         # Уточнение ищем только среди задач того же типа, что запрошен кнопкой.
-        active = await self._active_task(session_id, kind=effective_mode)
+        if current is None:
+            active = await self._active_task(session_id, kind=effective_mode)
+        elif mode in ("oneshot", "periodic") and current.kind != effective_mode:
+            # Переключили режим — это уже другая задача, а не уточнение.
+            active = None
 
         # Дополнение к уточнению: сначала ответили списком названий, потом человек
         # добавил слово («возвращение»). Ищем внутри уже найденного, а не с нуля.
@@ -300,6 +311,7 @@ class Agent:
             and await self._narrow_pool(active, text, turn)
         ):
             turn.task = await self.store.get_task(active.id)
+            await self._tag_turn(user_message_id, turn)
             await self._remember_many(session_id, turn.messages)
             return turn
 
@@ -324,6 +336,7 @@ class Agent:
             )
             await self._refine_task(active, parsed, text, turn)
             turn.task = await self.store.get_task(active.id)
+            await self._tag_turn(user_message_id, turn)
             await self._remember_many(session_id, turn.messages)
             return turn
         effective_mode = mode
@@ -332,6 +345,7 @@ class Agent:
             if intent == "question" and not parsed.get("title"):
                 reply = await self._chat_answer(text, window)
                 turn.add(reply)
+                await self._tag_turn(user_message_id, turn)
                 await self._remember_many(session_id, turn.messages)
                 return turn
 
@@ -350,6 +364,7 @@ class Agent:
         else:
             await self._start_oneshot(session_id, text, parsed, turn)
 
+        await self._tag_turn(user_message_id, turn)
         await self._remember_many(session_id, turn.messages)
         return turn
 
@@ -881,6 +896,10 @@ class Agent:
     async def history(self, session_id: str, limit: int = 80) -> list[dict[str, Any]]:
         return await self.store.history(session_id, limit)
 
+    async def history_for_task(self, task_id: str, limit: int = 200) -> list[dict[str, Any]]:
+        """Переписка одной задачи — то, что видно при переключении на неё."""
+        return await self.store.history_for_task(task_id, limit)
+
     async def downloads(self, limit: int = 50) -> list[dict[str, Any]]:
         """Что лежит на диске: наши записи ПЛЮС всё, что есть в очереди Transmission.
 
@@ -988,6 +1007,34 @@ class Agent:
     # ------------------------------------------------------------------
     # Разбор запроса и поиск
     # ------------------------------------------------------------------
+    async def _tag_turn(self, user_message_id: int, turn: Turn) -> None:
+        """Привязывает ход переписки к задаче: у каждой задачи своя история."""
+        if turn.task is None:
+            return
+        await self.store.set_message_task(user_message_id, turn.task.id)
+        for message in turn.messages:
+            if not message.task_id:
+                message.task_id = turn.task.id
+
+    async def _task_window(self, task_id: str) -> list[dict[str, str]]:
+        """История одной задачи для модели — свой контекст у каждой задачи."""
+        rows = await self.store.history_for_task(task_id, limit=self.settings.context_messages)
+        return self._shape_window(rows, self.settings.context_messages)
+
+    def _shape_window(self, rows: list[dict[str, Any]], limit: int) -> list[dict[str, str]]:
+        window: list[dict[str, str]] = []
+        for row in rows[-limit:]:
+            role = "assistant" if row.get("role") == "agent" else row.get("role")
+            if role not in ("user", "assistant"):
+                continue
+            text = str(row.get("text") or "").strip()
+            if not text:
+                continue
+            if len(text) > 400:
+                text = text[:400] + "…"
+            window.append({"role": role, "text": text})
+        return window
+
     async def _context_window(self, session_id: str, limit: int | None = None) -> list[dict[str, str]]:
         """Последние сообщения переписки — скользящее окно для модели.
 
@@ -4110,8 +4157,8 @@ class Agent:
         await self.store.save_task(task)
         return task
 
-    async def _remember(self, session_id: str, message: Message) -> None:
-        await self.store.add_message(session_id, message)
+    async def _remember(self, session_id: str, message: Message) -> int:
+        return await self.store.add_message(session_id, message)
 
     async def _remember_many(self, session_id: str, messages: list[Message]) -> None:
         for message in messages:
