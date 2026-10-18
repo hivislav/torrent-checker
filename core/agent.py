@@ -145,6 +145,7 @@ kinozal.me, скачивает торрент-файлы и ставит их в
 PARAM_TITLES = {
     "title": "название",
     "type": "тип",
+    "aliases": "другое название",
     "original_title": "оригинальное название",
     "quality": "качество",
     "voice": "озвучка",
@@ -298,10 +299,13 @@ class Agent:
         )
         # Уточнение ищем только среди задач того же типа, что запрошен кнопкой.
         if current is None:
+            # Без открытой задачи — начинаем новую (так же работают API и бот).
             active = await self._active_task(session_id, kind=effective_mode)
-        elif mode in ("oneshot", "periodic") and current.kind != effective_mode:
-            # Переключили режим — это уже другая задача, а не уточнение.
-            active = None
+        else:
+            # Внутри задачи новых задач не заводим: всё, что человек пишет,
+            # относится к ней. Другое название — это правка задачи, а не
+            # новый поиск (для новой задачи есть кнопка «Новая задача»).
+            active = current
 
         # Дополнение к уточнению: сначала ответили списком названий, потом человек
         # добавил слово («возвращение»). Ищем внутри уже найденного, а не с нуля.
@@ -317,7 +321,16 @@ class Agent:
             return turn
 
         # Уточнение к текущей задаче — правим её, а не заводим новую.
-        refined = active is not None and self._is_refinement(text, parsed, active)
+        if current is not None:
+            refined = True
+            if not self._is_refinement(text, parsed, current):
+                journal.add(
+                    "agent",
+                    "внутри задачи: трактуем как правку задачи",
+                    {"задача": current.id, "текст": text, "разобрано": parsed},
+                )
+        else:
+            refined = active is not None and self._is_refinement(text, parsed, active)
         if active is not None and not refined:
             # Не уточнение: если модель повторила старое название, берём
             # название из текста, а не из контекста прошлой задачи. Но если
@@ -655,14 +668,14 @@ class Agent:
             {"было": before, "стало": merged, "изменено": changed},
         )
 
-        shown = {
-            key: (
-                "сериал" if key == "type" and value == "series"
-                else "фильм" if key == "type" and value == "movie"
-                else value
-            )
-            for key, value in changed.items()
-        }
+        shown: dict[str, Any] = {}
+        for key, value in changed.items():
+            if key == "type":
+                shown[key] = "сериал" if value == "series" else "фильм" if value == "movie" else value
+            elif key == "aliases" and isinstance(value, list):
+                shown[key] = ", ".join(str(item) for item in value)
+            else:
+                shown[key] = value
         pool = [] if title_changed else [Torrent.from_dict(item) for item in (task.options or {}).get("pool", [])]
         if pool:
             # Название не менялось — ищем заново не надо, перебираем то, что уже есть.

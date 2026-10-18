@@ -166,6 +166,38 @@ async def test_answered_once() -> None:
     agent.store.close()
 
 
+async def test_nothing_new_inside_task() -> None:
+    print("\n== внутри задачи новых задач не появляется ==")
+    agent = make_agent("inside-")
+    task = Task(id="inside-task", kind="oneshot", state="awaiting_choice", session_id="s1",
+                user_query="Дюна", params={"title": "Дюна"})
+    await agent.store.save_task(task)
+
+    async def fake_parse(text, window, active):
+        return {"title": "Тед Лассо", "quality": "1080p", "intent": "find"}
+
+    async def fake_search(params):
+        return []
+
+    async def fake_selection(task_obj, turn):
+        turn.add("ищу дальше", kind="text", task_id=task_obj.id)
+
+    agent._parse_query = fake_parse  # noqa: SLF001
+    agent._search = fake_search  # type: ignore[assignment]
+    agent._selection_step = fake_selection  # type: ignore[assignment]
+
+    turn = await agent.handle_message("s1", "Тед Лассо 1080p", "chat", task.id)
+    check("задача осталась той же", turn.task is not None and turn.task.id == "inside-task",
+          turn.task.id if turn.task else None)
+    stored = await agent.store.get_task("inside-task")
+    check("название изменилось внутри задачи",
+          (stored.params or {}).get("title") == "Тед Лассо", stored.params)
+    check("качество применилось", (stored.params or {}).get("quality") == "1080p", stored.params)
+    all_tasks = await agent.store.list_tasks(limit=20)
+    check("новых задач не появилось", len(all_tasks) == 1, [t.id for t in all_tasks])
+    agent.store.close()
+
+
 async def test_foreign_query() -> None:
     print("\n== чужой запрос не уточняет старую задачу ==")
     agent = make_agent("foreign-")
@@ -414,6 +446,7 @@ async def main() -> int:
     await test_reset()
     await test_task_chats()
     await test_answered_once()
+    await test_nothing_new_inside_task()
     await test_foreign_query()
     await test_prompt()
     test_refinement_rules()
