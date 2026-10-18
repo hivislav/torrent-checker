@@ -215,23 +215,36 @@ def is_new_episode(
     known_ids: set[str],
     season_episodes: dict[int, int],
     max_ts: float,
+    next_episode: int = 0,
 ) -> bool:
-    """Новая ли это раздача относительно того, что мы уже знаем."""
-    if torrent.id in known_ids:
-        return False
+    """Новая ли это раздача относительно того, что мы уже знаем.
 
-    if torrent.episodes and torrent.seasons and len(torrent.seasons) == 1:
+    Для сериалов решает НОМЕР СЕРИИ, а не id раздачи: на трекере одна и та же
+    раздача обновляется по мере выхода серий («1-2 выпуски» → «1-3»), и новый
+    выпуск приходит с тем же id. Поэтому проверка серии идёт раньше проверки
+    «эту раздачу мы уже видели».
+    """
+    has_single_season = bool(torrent.episodes and torrent.seasons and len(torrent.seasons) == 1)
+    if has_single_season:
         season = torrent.seasons[0]
+        floor = next_episode or 0
+        if floor:
+            return max(torrent.episodes) >= floor
         return max(torrent.episodes) > season_episodes.get(season, 0)
 
     if torrent.episodes and torrent.seasons:
-        # Пачка на несколько сезонов: судим только по дате заливки.
+        # Пачка на несколько сезонов: нумерация сквозная, судим по дате заливки.
+        if torrent.id in known_ids:
+            return False
         return (torrent.uploaded_ts or 0) > max_ts
 
     if torrent.episodes:
-        return max(torrent.episodes) > max(season_episodes.values() or [0])
+        floor = next_episode or (max(season_episodes.values() or [0]) + 1)
+        return max(torrent.episodes) >= floor
 
-    # Не сериал (фильм, музыка, книга) — новое по дате размещения.
+    # Фильм, музыка, книга — новое по дате размещения.
+    if torrent.id in known_ids:
+        return False
     return (torrent.uploaded_ts or 0) > max_ts
 
 
@@ -242,6 +255,7 @@ def find_new(
     known_ids: set[str],
     season_episodes: dict[int, int] | None = None,
     max_uploaded_ts: float = 0.0,
+    next_episode: int = 0,
 ) -> list[Torrent]:
     """Что появилось нового с прошлой проверки.
 
@@ -258,6 +272,7 @@ def find_new(
             known_ids=known_ids,
             season_episodes=season_episodes,
             max_ts=max_uploaded_ts,
+            next_episode=next_episode,
         )
     ]
     return newest_first(fresh)

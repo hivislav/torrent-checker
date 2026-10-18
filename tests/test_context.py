@@ -125,8 +125,12 @@ def test_refinement_rules() -> None:
         not agent._is_refinement("Дюна", {"title": "Дюна"}, task),  # noqa: SLF001
     )
     check(
-        "явный refine от модели уважается",
-        agent._is_refinement("второй вариант", {"refine": True, "title": "Другое"}, task),  # noqa: SLF001
+        "явный refine с тем же названием уважается",
+        agent._is_refinement("второй вариант", {"refine": True, "title": "Тед Лассо"}, task),  # noqa: SLF001
+    )
+    check(
+        "другое название перебивает флаг refine",
+        not agent._is_refinement("нет, мне нужен другой фильм", {"refine": True, "title": "Дюна"}, task),  # noqa: SLF001
     )
     agent.store.close()
 

@@ -126,11 +126,19 @@ def test_new_episodes() -> None:
     )
     check("11-я серия новая", [t.id for t in fresh] == ["22"], [t.id for t in fresh])
 
+    # Ту же раздачу трекер обновляет новыми сериями: id тот же, серия новая.
     fresh_known = find_new(
         [ep11], {"title": "Тед Лассо"}, known_ids={"20", "21", "22"},
         season_episodes=season_map, max_uploaded_ts=0,
     )
-    check("уже известная раздача не новая", fresh_known == [], fresh_known)
+    check("известная раздача с новой серией — новая", [t.id for t in fresh_known] == ["22"], fresh_known)
+
+    # А если эта серия уже скачана — второй раз не предлагаем.
+    fresh_done = find_new(
+        [ep11], {"title": "Тед Лассо"}, known_ids={"20", "21", "22"},
+        season_episodes={4: 11}, max_uploaded_ts=0,
+    )
+    check("уже скачанную серию не предлагаем", fresh_done == [], fresh_done)
 
     movie_old = parse_torrent(make("30", "Дюна / Dune / 2021 / Дубляж / BDRip",
                                    uploaded="10.09.2026 в 12:00"))

@@ -63,7 +63,10 @@ CREATE TABLE IF NOT EXISTS downloads (
     transmission_hash TEXT NOT NULL DEFAULT '',
     added_at TEXT NOT NULL
 );
-CREATE UNIQUE INDEX IF NOT EXISTS idx_downloads_torrent ON downloads(torrent_id);
+-- Уникальность по раздаче И серии: одна и та же раздача обновляется на трекере
+-- и приносит новые выпуски, поэтому записей по ней может быть несколько.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_downloads_episode
+    ON downloads(torrent_id, IFNULL(season, 0), IFNULL(episode, 0));
 CREATE INDEX IF NOT EXISTS idx_downloads_series ON downloads(series_key);
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -117,6 +120,13 @@ class Store:
         }
         if "name" not in columns:
             self._conn.execute("ALTER TABLE downloads ADD COLUMN name TEXT NOT NULL DEFAULT ''")
+        # Старый уникальный индекс «одна запись на раздачу» мешает запоминать
+        # несколько серий из одной и той же пачки — заменяем на составной.
+        self._conn.execute("DROP INDEX IF EXISTS idx_downloads_torrent")
+        self._conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_downloads_episode "
+            "ON downloads(torrent_id, IFNULL(season, 0), IFNULL(episode, 0))"
+        )
 
     # ------------------------------------------------------------------
     # низкий уровень

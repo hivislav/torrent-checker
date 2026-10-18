@@ -73,31 +73,70 @@ class FileEntry:
 
 
 # Числа, которые встречаются в именах релизов, но серией не являются:
-# разрешение, кодек, год, «часть», аудио-каналы.
-_NOT_EPISODE = {
-    264, 265, 480, 576, 720, 1080, 1440, 2160, 4320,
-    5, 8, 10, 12, 24, 25, 30, 50, 60,
-    1, 2, 3, 4, 6, 7, 9, 11, 13, 14,  # «Часть 2», «CD1» — слишком неоднозначно
-}
+# разрешение, кодек, «часть», аудио-каналы. Для «одиночного номера» такие
+# значения отбрасываем, иначе «Part.2» превращалось бы в серию 2.
+_NOT_EPISODE = {264, 265, 480, 576, 720, 1080, 1440, 2160, 4320}
+
+# Номер серии в начале имени файла: так оформляют релизы на трекере
+# («01. Звёзды в джунглях.S03.2026.WEB-DLRip.avi», «02 - Название.mkv»).
+_LEADING_EPISODE = re.compile(r"^(\d{1,2})\s*[._-]\s*(?!\d)")
+# Только сезон, без серии: «S03», «3 сезон».
+_SEASON_ONLY = (
+    re.compile(r"(?i)\bs(\d{1,2})\b(?!\s*[._-]?\s*e)"),
+    re.compile(r"(?i)(\d{1,2})\s*[-_]?\s*сезон"),
+)
 
 
-def detect_episode(name: str) -> tuple[int | None, int | None]:
-    """(сезон, серия) из имени файла. Что не нашлось — None."""
+def _detect_pair(text: str) -> tuple[int | None, int | None]:
     for pattern in _SEASON_EPISODE_PATTERNS:
-        match = pattern.search(name)
+        match = pattern.search(text)
         if match:
             return int(match.group(1)), int(match.group(2))
     for pattern in _EPISODE_ONLY_PATTERNS[:-1]:
-        match = pattern.search(name)
+        match = pattern.search(text)
         if match:
             return None, int(match.group(1))
-    # Последний, самый осторожный вариант: одиночный номер между разделителями.
-    match = _EPISODE_ONLY_PATTERNS[-1].search(name)
+    match = _EPISODE_ONLY_PATTERNS[-1].search(text)
     if match:
         number = int(match.group(1))
         if number not in _NOT_EPISODE and 1 <= number <= 99:
             return None, number
     return None, None
+
+
+def _detect_season(text: str) -> int | None:
+    for pattern in _SEASON_ONLY:
+        match = pattern.search(text)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def detect_episode(name: str) -> tuple[int | None, int | None]:
+    """(сезон, серия) из имени файла. Что не нашлось — None.
+
+    Разбор идёт по имени файла (последний сегмент пути), а если там ничего нет —
+    по всему пути: иногда номер стоит только в названии папки.
+    """
+    base = name.rsplit("/", 1)[-1]
+    for source in (base, name):
+        if not source:
+            continue
+        season, episode = _detect_pair(source)
+        if episode is None and source is base:
+            # «01. Название…» — ведущий номер это серия.
+            match = _LEADING_EPISODE.match(base)
+            if match:
+                number = int(match.group(1))
+                if number not in _NOT_EPISODE:
+                    episode = number
+        if season is None:
+            season = _detect_season(source)
+        if episode is not None:
+            return season, episode
+    # Сезон нашёлся, а серии нет (например, «сезон 3, полный»).
+    season = _detect_season(base) or _detect_season(name)
+    return season, None
 
 
 def parse_files(files: Iterable[dict]) -> list[FileEntry]:

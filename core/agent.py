@@ -240,6 +240,11 @@ class Agent:
             log.warning("разбор запроса не удался: %s", exc)
 
         intent = str(parsed.get("intent") or "")
+        effective_mode = mode if mode in ("oneshot", "periodic") else (
+            "periodic" if intent == "monitor" else "oneshot"
+        )
+        # Уточнение ищем только среди задач того же типа, что запрошен кнопкой.
+        active = await self._active_task(session_id, kind=effective_mode)
 
         # Уточнение к текущей задаче — правим её, а не заводим новую.
         if active is not None and self._is_refinement(text, parsed, active):
@@ -279,26 +284,36 @@ class Agent:
     # ------------------------------------------------------------------
     RESUME_STATES = ("awaiting_choice", "awaiting_confirm", "not_found", "awaiting_setup")
 
-    async def _active_task(self, session_id: str) -> Task | None:
-        """Незакрытая задача этой сессии — к ней относятся уточнения."""
+    async def _active_task(self, session_id: str, kind: str | None = None) -> Task | None:
+        """Незакрытая задача этой сессии — к ней относятся уточнения.
+
+        `kind` фильтрует по типу: уточнение к разовой задаче не должно
+        переиспользовать периодическую (и наоборот) — это разные кнопки и
+        разные состояния.
+        """
         tasks = await self.store.list_tasks(limit=20)
         for task in tasks:
-            if task.session_id == session_id and task.state in self.RESUME_STATES:
-                return task
+            if task.session_id != session_id or task.state not in self.RESUME_STATES:
+                continue
+            if kind and task.kind != kind:
+                continue
+            return task
         return None
 
     def _is_refinement(self, text: str, parsed: dict[str, Any], active: Task) -> bool:
         """Это уточнение к активной задаче, а не новая задача?"""
+        new_title = str(parsed.get("title") or "").strip()
+        old_title = str((active.params or {}).get("title") or "").strip()
+        # Другое явное название — всегда новая задача. Флаг модели здесь не
+        # главный: она склонна считать уточнением любой следующий запрос.
+        if new_title and old_title and normalize(new_title) != normalize(old_title):
+            return False
         if parsed.get("refine") is True:
             return True
-        new_title = str(parsed.get("title") or "").strip()
         if not new_title:
             # «4К», «7 серия», «нет, другой» — без названия это уточнение.
             return True
-        old_title = str((active.params or {}).get("title") or "").strip()
-        if normalize(new_title) == normalize(old_title):
-            return True
-        return False
+        return normalize(new_title) == normalize(old_title)
 
     async def _refine_task(
         self, task: Task, parsed: dict[str, Any], text: str, turn: Turn
@@ -456,9 +471,9 @@ class Agent:
             if torrent is None:
                 turn.add("Эта раздача больше не в списке — дождитесь следующей проверки.", kind="error")
             else:
-                # Ручное «скачать» по периодической задаче: показываем полную
-                # карточку и выбор серии — как в разовой задаче.
-                await self._download_with_report(task, torrent, turn, periodic_context=True)
+                # Нажатие «Скачать» в уведомлении — это и есть подтверждение:
+                # ставим в очередь сразу, выбирая только новые серии.
+                await self._auto_download(task, torrent, turn)
         elif kind == "start_download" and task:
             await self._start_download(task, turn,
                                        periodic_context=task.kind == "periodic")
@@ -493,8 +508,21 @@ class Agent:
         elif kind == "download_all" and task:
             entries = self._entries_from_task(task)
             plan = self._plan_files(task, entries)
-            plan = {**plan, "kind": "all", "wanted": None,
-                    "size": plan.get("total_size"), "episode": None, "names": []}
+            plan = {
+                **plan,
+                "kind": "all",
+                "wanted": None,
+                "size": plan.get("total_size"),
+                "episode": None,
+                "names": [],
+                "selected_episodes": sorted(
+                    {
+                        int(group.get("episode"))
+                        for group in (plan.get("episodes") or [])
+                        if isinstance(group, dict) and group.get("episode") is not None
+                    }
+                ),
+            }
             task.options = {**(task.options or {}), "plan": plan}
             await self.store.save_task(task)
             message = turn.add(
@@ -1132,8 +1160,13 @@ class Agent:
         raw = (task.options or {}).get("files") or []
         return parse_files(raw)
 
-    async def _fetch_torrent(self, torrent: Torrent) -> tuple[Path | None, str]:
-        """Сохраняет .torrent на внешний диск. Возвращает (путь, ошибка)."""
+    async def _fetch_torrent(self, torrent: Torrent, *, refresh: bool = False) -> tuple[Path | None, str]:
+        """Сохраняет .torrent на внешний диск. Возвращает (путь, ошибка).
+
+        `refresh=True` — перекачать даже если файл уже есть. Это обязательно для
+        периодических задач: на трекере одна и та же раздача обновляется новыми
+        выпусками, и старый .torrent уже не содержит нужную серию.
+        """
         try:
             ensure_dir(self.settings.torrents_dir)
         except TargetUnavailable as exc:
@@ -1146,7 +1179,7 @@ class Agent:
             return None, f"папка для torrent-файлов недоступна: {exc}"
 
         path = self.settings.torrents_dir / f"{torrent.id}.torrent"
-        if path.exists() and path.stat().st_size > 0:
+        if not refresh and path.exists() and path.stat().st_size > 0:
             return path, ""  # уже скачан — второй раз не тянем
 
         result = await self.mcp.download(torrent.id, path)
@@ -1258,6 +1291,8 @@ class Agent:
                     "names": picked["names"],
                     "episode": picked["episode"],
                     "season": picked["season"] if picked["season"] is not None else season,
+                    # Что именно скачаем — по этим сериям пишется память агента.
+                    "selected_episodes": [picked["episode"]],
                 }
             if pack:
                 return {**base, "kind": "choose", "reason": "missing_episode"}
@@ -1550,6 +1585,13 @@ class Agent:
     async def _auto_download(self, task: Task, torrent: Torrent, turn: Turn) -> None:
         """Скачивание без диалога (периодическая задача в режиме «качать сразу»)."""
         result = await self._download(task, torrent)
+        if result.get("ok") and result.get("skipped"):
+            turn.add(
+                f"«{torrent.title}» — {result['reason']}. Продолжаю следить.",
+                kind="text",
+                task_id=task.id,
+            )
+            return
         if not result["ok"]:
             if result.get("retryable"):
                 await self._report_storage_problem(task, torrent, result, turn)
@@ -1627,29 +1669,41 @@ class Agent:
             transmission_error = str(exc)
             log.warning("Transmission не принял торрент: %s", exc)
 
-        recorded = torrent
-        if plan.get("episode"):
-            # Запоминаем именно ту серию, которую скачали: иначе в памяти
-            # останется пачка «1–10», и следующая проверка решит, что серии
-            # 8–10 уже есть. У Torrent серия — вычисляемое свойство, поэтому
-            # подменяем список серий и сезоны, а не поле episode.
-            try:
-                recorded = replace(
-                    torrent,
-                    episodes=[int(plan["episode"])],
-                    seasons=(
-                        [int(plan["season"])]
-                        if plan.get("season") is not None
-                        else torrent.seasons
-                    ),
-                    episodes_total=torrent.episodes_total,
-                )
-            except Exception:  # noqa: BLE001
-                recorded = torrent
-
-        await self.store.record_download(
-            task, recorded, str(path), transmission_hash, torrent_name=added.get("name") or ""
+        # Запоминаем каждую скачанную серию отдельной строкой. Иначе пачка
+        # «1–10» осталась бы в памяти как одна запись, и следующая проверка
+        # решила бы, что серии 8–10 уже есть. У Torrent серия — вычисляемое
+        # свойство, поэтому подменяем список серий, а не поле episode.
+        raw_selected = plan.get("selected_episodes") or (
+            [plan["episode"]] if plan.get("episode") is not None else []
         )
+        episodes: list[int] = []
+        for item in raw_selected:
+            value = item.get("episode") if isinstance(item, dict) else item
+            if value is not None:
+                episodes.append(int(value))
+        if episodes:
+            for episode in sorted(set(episodes)):
+                try:
+                    recorded = replace(
+                        torrent,
+                        episodes=[episode],
+                        seasons=(
+                            [int(plan["season"])]
+                            if plan.get("season") is not None
+                            else torrent.seasons
+                        ),
+                        episodes_total=torrent.episodes_total,
+                    )
+                except Exception:  # noqa: BLE001
+                    recorded = torrent
+                await self.store.record_download(
+                    task, recorded, str(path), transmission_hash,
+                    torrent_name=added.get("name") or "",
+                )
+        else:
+            await self.store.record_download(
+                task, torrent, str(path), transmission_hash, torrent_name=added.get("name") or ""
+            )
         task.last_result = f"скачано: {torrent.title}"
         task.last_error = ""
         seen = list(task.params.get("seen_ids") or [])
@@ -1667,10 +1721,12 @@ class Agent:
     async def _download(self, task: Task, torrent: Torrent) -> dict[str, Any]:
         """Автоматический путь (периодические задачи): без диалога.
 
-        Если в раздаче пачка серий, качаем только новые относительно уже
-        скачанных — иначе «новая серия» тянула бы весь сезон заново.
+        Качаем ровно те серии, ради которых задача заведена: начиная с
+        `episode_from` и не ниже той, что идёт за уже скачанной. Если раздача —
+        пачка на 14 выпусков, где сейчас 1–2, а нужна третья, то при появлении
+        «1–3» скачается только третий файл.
         """
-        path, error = await self._fetch_torrent(torrent)
+        path, error = await self._fetch_torrent(torrent, refresh=True)
         if path is None:
             task.last_error = error
             task.state = "failed"
@@ -1679,21 +1735,50 @@ class Agent:
 
         entries = parse_files(file_list(path))
         plan = self._plan_files(task, entries)
-        if plan["kind"] == "choose":
-            season = plan.get("season")
-            baseline = 0
-            episodes_map = (task.params or {}).get("baseline_episodes") or {}
-            if season is not None:
-                baseline = int(episodes_map.get(str(season)) or 0)
-            if not baseline:
-                baseline = await self._last_episode_for(task)
-            picked = pick_new_episodes(entries, after_episode=baseline, season=season)
-            if picked:
-                plan = {**plan, "kind": "episode", "wanted": picked["indexes"],
-                        "size": picked["size"], "names": picked["names"],
-                        "episode": picked["episode"], "season": season}
-            else:
-                plan = {**plan, "kind": "all", "wanted": None, "size": plan.get("total_size")}
+
+        params = task.params or {}
+        try:
+            season = int(params["season"]) if params.get("season") is not None else None
+        except (TypeError, ValueError):
+            season = None
+        next_episode = int(params.get("next_episode") or 0)
+        if not next_episode:
+            next_episode = self._next_episode(params, {})
+
+        picked = None
+        if next_episode:
+            picked = pick_new_episodes(entries, after_episode=next_episode - 1, season=season)
+        if picked:
+            journal.add(
+                "agent",
+                f"автоскачивание: серии {picked.get('episodes')}",
+                {"next_episode": next_episode, "размер": picked.get("size")},
+            )
+            plan = {
+                **plan,
+                "kind": "episode",
+                "wanted": picked["indexes"],
+                "size": picked["size"],
+                "names": picked["names"],
+                "episode": picked["episode"],
+                "season": season,
+                "selected_episodes": [
+                    int(item) for item in (picked.get("episodes") or []) if item is not None
+                ],
+            }
+        elif plan["kind"] == "choose" and plan.get("pack") and next_episode:
+            # В раздаче есть серии, но нужной пока нет (например, просили с
+            # третьей, а на трекере 1–2). Ничего не качаем: ждём появления.
+            return {
+                "ok": True,
+                "skipped": True,
+                "reason": f"серий с {next_episode} в раздаче пока нет",
+                "path": str(path),
+                "plan": plan,
+            }
+        elif plan["kind"] == "choose":
+            # Серий в раздаче не разобрать вовсе — берём всю пачку, как раньше.
+            plan = {**plan, "kind": "all", "wanted": None, "size": plan.get("total_size")}
 
         task.options = {**(task.options or {}), "plan": plan, "torrent_path": str(path)}
         return await self._finalize_download(task, torrent, path, plan)
@@ -1928,6 +2013,23 @@ class Agent:
                 log.exception("ошибка в шедулере")
                 await asyncio.sleep(5)
 
+    @staticmethod
+    def _next_episode(params: dict[str, Any], season_episodes: dict[int, int]) -> int:
+        """Следующая серия, которую надо взять: max(«начиная с N», скачанные+1)."""
+        try:
+            floor = int(params.get("episode_from") or 0)
+        except (TypeError, ValueError):
+            floor = 0
+        try:
+            season = int(params["season"]) if params.get("season") is not None else None
+        except (TypeError, ValueError):
+            season = None
+        if season is not None:
+            known = int(season_episodes.get(season, 0))
+        else:
+            known = max(season_episodes.values() or [0])
+        return max(floor, known + 1 if known else 0)
+
     async def _run_check_isolated(self, task: Task) -> None:
         """Одна задача — одна корутина: падение одной не влияет на остальные."""
         self._running_checks.add(task.id)
@@ -1978,12 +2080,20 @@ class Agent:
                     continue
             max_ts = max(max_ts, float(params.get("baseline_ts") or 0.0))
 
+            # Какую серию ищем следующей: «начиная с N» из запроса, но не ниже
+            # той, что идёт за уже скачанной. Так задача «качай новые серии,
+            # начиная с третьей» после скачивания третьей ищет четвёртую, а не
+            # третью повторно.
+            next_episode = self._next_episode(params, season_episodes)
+            task.params["next_episode"] = next_episode
+
             fresh = find_new(
                 matched or by_title,
                 params,
                 known_ids=seen,
                 season_episodes=season_episodes,
                 max_uploaded_ts=max_ts,
+                next_episode=next_episode,
             )
             task.found_total = len(matched)
             task.next_check_at = None
