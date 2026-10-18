@@ -54,7 +54,12 @@ from core.notify import DesktopNotifier, EventBus
 from core.push import WebPush
 from core.parsing import parse_torrent
 from core.storage import Store
-from core.transmission import Transmission, TransmissionError
+from core.transmission import (
+    NotEnoughSpace,
+    StorageUnavailable,
+    Transmission,
+    TransmissionError,
+)
 
 log = logging.getLogger("agent")
 
@@ -276,6 +281,8 @@ class Agent:
                 turn.add("Эта раздача больше не в списке — дождитесь следующей проверки.", kind="error")
             else:
                 await self._download_with_report(task, torrent, turn, periodic_context=True)
+        elif kind == "retry_transmission" and task:
+            await self._retry_transmission(task, turn)
         elif kind == "check_now" and task:
             await self.check_task(task, manual=True, turn=turn)
         elif kind == "forget_downloads":
@@ -331,6 +338,7 @@ class Agent:
             gate = {"ok": False, "error": str(exc)[:200]}
 
         transmission = await self.transmission.test_connection()
+        storage = self.transmission.storage_info().to_dict()
         return {
             "model": {
                 "name": self.settings.llm_model,
@@ -340,6 +348,7 @@ class Agent:
             "mcp": {"ready": self.mcp.ready},
             "gate": gate,
             "transmission": transmission,
+            "storage": storage,
             "tasks": {
                 "active": len(await self.store.list_tasks(limit=500, states=["monitoring"])),
             },
@@ -822,6 +831,9 @@ class Agent:
             return
 
         if not result["ok"]:
+            if result.get("retryable"):
+                await self._report_storage_problem(task, torrent, result, turn)
+                return
             turn.add(
                 f"Не удалось скачать «{torrent.title}»: {result['error']}",
                 kind="error",
@@ -862,6 +874,61 @@ class Agent:
         )
         await self.desktop.send("Торрент скачан", torrent.title[:120])
 
+    async def _report_storage_problem(
+        self, task: Task, torrent: Torrent, result: dict[str, Any], turn: Turn
+    ) -> None:
+        """Сообщает, что скачать некуда: нет диска или мало места.
+
+        .torrent уже лежит на диске агента, поэтому как только место появится,
+        раздача ставится в очередь одной кнопкой — заново искать не нужно.
+        """
+        storage = self.transmission.storage_info()
+        head = (
+            "Не могу поставить раздачу в очередь — внешний диск не готов."
+            if result.get("reason") == "disk"
+            else "Не хватает места на внешнем диске."
+        )
+        text = f"{head}\n\n• {torrent.title}\n{result['error']}"
+        if storage.ok:
+            text += (
+                f"\n\nДиск «{storage.to_dict()['volume']}»: свободно "
+                f"{storage.to_dict()['free_human']} из {storage.to_dict()['total_human']}."
+            )
+        text += (
+            f"\n\nФайл раздачи уже сохранён ({result.get('path')}), "
+            "освободите место и нажмите «Поставить в очередь»."
+        )
+
+        message = turn.add(text, kind="error", task_id=task.id, payload={"task": task.to_dict()})
+        message.actions = [
+            Action(
+                id="retry-transmission",
+                label="Поставить в очередь",
+                kind="retry_transmission",
+                payload={"task_id": task.id, "torrent_id": torrent.id},
+                style="primary",
+            ),
+            Action(
+                id="cancel-after-space",
+                label="Отмена",
+                kind="cancel",
+                payload={"task_id": task.id},
+                style="danger",
+            ),
+        ]
+        await self.events.publish(
+            {
+                "type": "notification",
+                "level": "error",
+                "task_id": task.id,
+                "title": "Нет места на внешнем диске",
+                "text": text,
+                "message": message.to_dict(),
+            }
+        )
+        await self.desktop.send("Нет места на внешнем диске", f"{torrent.title}"[:120])
+        await self.push.send("Нет места на внешнем диске", text[:200])
+
     async def _download(self, task: Task, torrent: Torrent) -> dict[str, Any]:
         """Качает .torrent через MCP, ставит в Transmission и запоминает факт."""
         path = self.settings.torrents_dir / f"{torrent.id}.torrent"
@@ -878,7 +945,23 @@ class Agent:
         try:
             added = await self.transmission.add(path)
             transmission_hash = str(added.get("hash") or "")
-            transmission_note = f"в очереди ({added.get('name') or torrent.title})"
+            transmission_note = (
+                f"в очереди ({added.get('name') or torrent.title}) → "
+                f"{added.get('download_dir') or self.transmission.download_dir}"
+            )
+        except (NotEnoughSpace, StorageUnavailable) as exc:
+            # Ключевое: раздача НЕ ставится в очередь и НЕ считается скачанной.
+            # Иначе агент «запомнил бы» её и больше не предложил, хотя файла нет.
+            task.last_error = str(exc)
+            task.state = "failed"
+            await self.store.save_task(task)
+            return {
+                "ok": False,
+                "error": str(exc),
+                "retryable": True,
+                "reason": "space" if isinstance(exc, NotEnoughSpace) else "disk",
+                "path": str(path),
+            }
         except TransmissionError as exc:
             transmission_error = str(exc)
             log.warning("Transmission не принял торрент: %s", exc)
@@ -897,6 +980,52 @@ class Agent:
             "transmission": transmission_note,
             "transmission_error": transmission_error,
         }
+
+    async def _retry_transmission(self, task: Task, turn: Turn) -> None:
+        """Повторная попытка постановки уже скачанного .torrent в очередь."""
+        torrent = Torrent.from_dict(task.candidate or {})
+        path = self.settings.torrents_dir / f"{torrent.id}.torrent"
+        if not path.exists():
+            turn.add(
+                "Файл раздачи не найден — начните задачу заново.",
+                kind="error",
+                task_id=task.id,
+            )
+            return
+        try:
+            added = await self.transmission.add(path)
+        except (NotEnoughSpace, StorageUnavailable) as exc:
+            task.state = "failed"
+            task.last_error = str(exc)
+            await self.store.save_task(task)
+            await self._report_storage_problem(
+                task,
+                torrent,
+                {"error": str(exc), "reason": "space", "path": str(path)},
+                turn,
+            )
+            return
+        except TransmissionError as exc:
+            turn.add(f"Transmission не принял раздачу: {exc}", kind="error", task_id=task.id)
+            return
+
+        await self.store.record_download(
+            task, torrent, str(path), str(added.get("hash") or "")
+        )
+        task.state = "done" if task.kind == "oneshot" else "monitoring"
+        task.last_error = ""
+        task.last_result = f"скачано: {torrent.title}"
+        if task.kind == "periodic":
+            self._schedule_next(task)
+        await self.store.save_task(task)
+        message = turn.add(
+            f"Поставил в очередь: «{torrent.title}» → {added.get('download_dir')}",
+            kind="task",
+            task_id=task.id,
+            payload={"task": task.to_dict()},
+        )
+        if task.kind == "periodic":
+            message.actions = self._task_actions(task)
 
     # ------------------------------------------------------------------
     # Периодическая проверка (вызывается шедулером)
@@ -1121,6 +1250,16 @@ class Agent:
             f"• {best.title}\n   {describe(best)}\n\n"
             "Берём в работу?"
         )
+        # Сразу видно, куда лягут файлы и хватает ли там места.
+        storage = self.transmission.storage_info()
+        info = storage.to_dict()
+        if storage.ok:
+            text += (
+                f"\n\nКачать буду на «{info['volume']}» ({info['path']}), "
+                f"свободно {info['free_human']} из {info['total_human']}."
+            )
+        else:
+            text += f"\n\n⚠ Внешний диск недоступен: {storage.error}"
         if alternatives:
             text += "\n\nДругие варианты:"
             for index, item in enumerate(alternatives, start=2):

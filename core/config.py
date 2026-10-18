@@ -85,6 +85,10 @@ class Settings:
     transmission_port: int
     transmission_username: str
     transmission_password: str
+    # Куда складывать загрузки. Всегда внешний диск: при отключённом диске
+    # агент честно откажется ставить раздачу, а не зальёт её на внутренний.
+    transmission_download_dir: Path
+    transmission_min_free_gb: float
 
     # --- обход Cloudflare ---
     gate_host: str
@@ -155,6 +159,10 @@ def get_settings() -> Settings:
         transmission_port=_as_int(get("TRANSMISSION_PORT"), 9091),
         transmission_username=get("TRANSMISSION_USERNAME", ""),
         transmission_password=get("TRANSMISSION_PASSWORD", ""),
+        transmission_download_dir=resolve(
+            get("TRANSMISSION_DOWNLOAD_DIR", "/Volumes/EAGET/torrents")
+        ),
+        transmission_min_free_gb=float(get("TRANSMISSION_MIN_FREE_GB", "5") or 5),
         gate_host=get("GATE_HOST", "127.0.0.1"),
         gate_port=_as_int(get("GATE_PORT"), 8123),
         gate_chrome_path=get(

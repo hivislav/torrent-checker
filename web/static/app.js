@@ -375,6 +375,15 @@
           ? `${mark(true)} ${status.transmission.version || ""}`
           : `<span class="status-bad">${(status.transmission.error || "").slice(0, 80)}</span>`,
       ]);
+      if (status.storage) {
+        const disk = status.storage;
+        rows.push([
+          `диск ${disk.volume || "?"}`,
+          disk.ok
+            ? `${mark(true)} свободно ${disk.free_human} из ${disk.total_human}`
+            : `<span class="status-bad">${(disk.error || "нет доступа").slice(0, 80)}</span>`,
+        ]);
+      }
       rows.push(["в работе", String(status.tasks.active)]);
       box.innerHTML = rows
         .map(([key, value]) => `<b>${key}</b><span>${value}</span>`)

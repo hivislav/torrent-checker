@@ -237,7 +237,10 @@ case "${1:-start}" in
     ;;
   restart)
     "$0" stop
-    sleep 1
+    # Пауза нужна не для красоты: старый шлюз гасит свой Chrome, и если новый
+    # стартует в тот же момент, второй экземпляр с тем же профилем не поднимет
+    # порт отладки и упадёт с «Failed to connect to browser».
+    sleep 3
     "$0" start
     ;;
   status) cmd_status ;;

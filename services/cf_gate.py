@@ -107,6 +107,15 @@ def looks_like_challenge(status: int, body: bytes, url: str = "") -> bool:
     return any(marker in head for marker in CHALLENGE_MARKERS)
 
 
+def _free_port() -> int:
+    """Свободный локальный порт для отладки Chrome."""
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
 class CloudflareGate:
     """Держит Chrome живым и раздаёт запросы к kinozal.me."""
 
@@ -119,6 +128,8 @@ class CloudflareGate:
         self._cookies: dict[str, str] = {}
         self._impersonate: str | None = None
         self._browser_lock = asyncio.Lock()
+        self._debug_port = _free_port()
+        self._chrome_process: asyncio.subprocess.Process | None = None
         self._site_lock = asyncio.Lock()  # один вход в сайт за раз
 
     # ------------------------------------------------------------------
@@ -135,20 +146,75 @@ class CloudflareGate:
                 pass
             self._browser = None
             self._tab = None
+        if self._chrome_process is not None and self._chrome_process.returncode is None:
+            try:
+                self._chrome_process.terminate()
+                await asyncio.wait_for(self._chrome_process.wait(), timeout=10)
+            except Exception:  # noqa: BLE001
+                try:
+                    self._chrome_process.kill()
+                except Exception:  # noqa: BLE001
+                    pass
+        self._chrome_process = None
+        # Даже если браузер «остановлен», процесс мог остаться — тогда следующий
+        # запуск упрётся в занятый профиль.
+        await asyncio.to_thread(self._kill_stale_chrome, self.settings.gate_profile_dir)
 
     async def _ensure_browser(self) -> uc.Browser:
         if self._browser is not None and self._tab is not None:
             return self._browser
         profile = self.settings.gate_profile_dir
         profile.mkdir(parents=True, exist_ok=True)
-        # Прошлый запуск мог оставить Chrome с тем же профилем (например, после
-        # падения сервиса). Второй Chrome с тем же --user-data-dir не поднимет
-        # свой порт отладки: он просто передаёт вкладку первому, и подключение
-        # падает с «Failed to connect to browser». Поэтому сначала убираем свой
-        # (и только свой — по пути профиля) процесс, потом стартуем.
+        # Два процесса не должны запускать Chrome с одним профилем одновременно
+        # (например, старый шлюз ещё гасит свой браузер, а новый уже стартует):
+        # второй экземпляр передаёт вкладку первому и не поднимает свой порт
+        # отладки. Держим межпроцессную блокировку на время запуска.
+        import fcntl
+        import os as _os
+
+        lock_path = profile / ".launch.lock"
+
+        def take_lock() -> int:
+            fd = _os.open(lock_path, _os.O_CREAT | _os.O_RDWR, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX)  # flock возвращает None, fd нужен нам
+            return fd
+
+        lock_fd = await asyncio.to_thread(take_lock)
+        try:
+            return await self._ensure_browser_locked()
+        finally:
+            def release() -> None:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                    _os.close(lock_fd)
+                except OSError:
+                    pass
+
+            await asyncio.to_thread(release)
+
+    async def _ensure_browser_locked(self) -> uc.Browser:
+        """Запускает Chrome сам и подключается к уже открытому порту отладки.
+
+        Почему не «просто uc.start()»: nodriver после запуска ждёт порт отладки
+        всего ~2,7 секунды (0,25 + 5 × 0,5). Холодный старт Chrome с нашим
+        профилем занимает больше, и подключение стабильно падало с «Failed to
+        connect to browser», хотя браузер поднимался. Поэтому процесс запускаем
+        сами, ждём готовности порта сколько нужно, и только потом подключаемся
+        (nodriver это умеет: если заданы host и port, он attach'ится к живому
+        браузеру).
+        """
+        if self._browser is not None and self._tab is not None:
+            return self._browser
+        profile = self.settings.gate_profile_dir
+        profile.mkdir(parents=True, exist_ok=True)
         await asyncio.to_thread(self._kill_stale_chrome, profile)
 
         args = [
+            self.settings.gate_chrome_path,
+            f"--user-data-dir={profile}",
+            f"--remote-debugging-port={self._debug_port}",
+            "--remote-debugging-host=127.0.0.1",
+            "--remote-allow-origins=*",
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-background-timer-throttling",
@@ -160,19 +226,39 @@ class CloudflareGate:
             # мешать пользователю он не должен.
             "--window-position=-2400,-2400",
         ]
+        if self.settings.gate_headless:
+            args.insert(1, "--headless=new")
+        # Chrome не может инициализировать свою песочницу внутри чужой (например,
+        # под песочницей агента), поэтому она отключена — этим браузером
+        # управляем только мы, по петле.
+        args.append("--no-sandbox")
+
         last_error: Exception | None = None
         for attempt in range(3):
             log.info(
-                "запускаю Chrome для обхода Cloudflare (профиль %s, попытка %s/3)",
+                "запускаю Chrome для обхода Cloudflare (профиль %s, порт %s, попытка %s/3)",
                 profile,
+                self._debug_port,
                 attempt + 1,
             )
             try:
+                if self._chrome_process is not None and self._chrome_process.returncode is None:
+                    self._chrome_process.kill()
+                    await asyncio.sleep(1)
+                self._chrome_process = await asyncio.create_subprocess_exec(
+                    *args,
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                if not await self._wait_for_debug_port(timeout=45):
+                    raise ChallengeBlocked("порт отладки Chrome не открылся за 45 секунд")
+
                 browser = await uc.start(
-                    headless=self.settings.gate_headless,
+                    host="127.0.0.1",
+                    port=self._debug_port,
                     user_data_dir=str(profile),
                     browser_executable_path=self.settings.gate_chrome_path,
-                    browser_args=args,
                     sandbox=False,
                 )
                 tab = await browser.get("about:blank")
@@ -182,15 +268,38 @@ class CloudflareGate:
                     self._ua = await tab.evaluate("navigator.userAgent")
                 except Exception:  # noqa: BLE001
                     self._ua = None
+                log.info("Chrome подключён (порт отладки %s)", self._debug_port)
                 return browser
             except Exception as exc:  # noqa: BLE001 - пробуем ещё раз после уборки
                 last_error = exc
-                log.warning("Chrome не поднялся: %s", str(exc).splitlines()[-1][:120])
+                log.warning("Chrome не поднялся: %s", str(exc).replace("\n", " ")[-160:])
                 self._browser = None
                 self._tab = None
+                if self._chrome_process is not None and self._chrome_process.returncode is None:
+                    self._chrome_process.kill()
                 await asyncio.to_thread(self._kill_stale_chrome, profile)
-                await asyncio.sleep(1.5 + attempt)
+                await asyncio.sleep(2.0 + attempt * 1.5)
         raise ChallengeBlocked(f"не удалось запустить Chrome: {last_error}")
+
+    async def _wait_for_debug_port(self, timeout: float) -> bool:
+        """Ждёт, пока Chrome откроет порт отладки (и ответит по HTTP)."""
+        import httpx
+
+        deadline = time.time() + timeout
+        url = f"http://127.0.0.1:{self._debug_port}/json/version"
+        async with httpx.AsyncClient(timeout=3) as client:
+            while time.time() < deadline:
+                try:
+                    response = await client.get(url)
+                    if response.status_code == 200 and "webSocketDebuggerUrl" in response.text:
+                        return True
+                except Exception:  # noqa: BLE001 - порт ещё закрыт
+                    pass
+                if self._chrome_process is not None and self._chrome_process.returncode is not None:
+                    log.warning("Chrome завершился с кодом %s", self._chrome_process.returncode)
+                    return False
+                await asyncio.sleep(0.4)
+        return False
 
     @staticmethod
     def _kill_stale_chrome(profile: Path) -> None:
@@ -203,7 +312,11 @@ class CloudflareGate:
         import signal
         import subprocess
 
-        marker = f"--user-data-dir={profile}"
+        # ВАЖНО: без ведущих "--". BSD-шный pgrep принимает шаблон, начинающийся
+        # с дефиса, за опцию ("illegal option -- -"), молча ничего не находит —
+        # и осиротевший Chrome остаётся держать профиль, из-за чего следующий
+        # запуск падает с «Failed to connect to browser».
+        marker = f"user-data-dir={profile}"
         try:
             listing = subprocess.run(
                 ["pgrep", "-f", marker], capture_output=True, text=True, timeout=10
@@ -235,6 +348,16 @@ class CloudflareGate:
         for pid in pids:
             try:
                 os.kill(pid, signal.SIGKILL)
+            except OSError:
+                continue
+        # Chrome держит в профиле SingletonLock/SingletonCookie/SingletonSocket.
+        # Если процесс убили не по-хорошему, эти файлы остаются и следующий
+        # запуск передаёт вкладку «мёртвому» экземпляру: свой порт отладки он не
+        # поднимает, и подключение падает с «Failed to connect to browser».
+        time.sleep(0.5)
+        for name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+            try:
+                (profile / name).unlink()
             except OSError:
                 continue
 

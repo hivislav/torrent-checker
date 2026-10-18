@@ -99,7 +99,13 @@ class KinozalMCP:
             chunk = getattr(block, "text", None)
             if chunk:
                 text += chunk
-        if getattr(result, "isError", False):
+        # В Python-SDK поле называется is_error, в TypeScript-описании — isError.
+        # Проверяем оба: иначе текст ошибки тихо возвращался как «результат»,
+        # и поиск выглядел как «ничего не нашлось».
+        failed = bool(
+            getattr(result, "is_error", False) or getattr(result, "isError", False)
+        )
+        if failed:
             raise MCPError(text or f"инструмент {tool} вернул ошибку")
         if not text:
             return None
