@@ -101,7 +101,7 @@ ensure_cert() {
     -keyout "$KEY_FILE" -out "$CERT_FILE" \
     -subj "/CN=kinozal-agent" \
     -addext "subjectAltName=${san}" \
-    -addext "basicConstraints=critical,CA:FALSE" \
+    -addext "basicConstraints=critical,CA:TRUE" \
     -addext "keyUsage=digitalSignature,keyEncipherment" \
     -addext "extendedKeyUsage=serverAuth" >/dev/null 2>&1
   chmod 600 "$KEY_FILE"
