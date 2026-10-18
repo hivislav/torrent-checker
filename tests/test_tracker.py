@@ -148,13 +148,13 @@ async def test_ask_dimension() -> None:
     await agent._ask_dimension(task, turn, "quality", ["1080p", "720p"], 3, found=found)
     message = turn.messages[-1]
     check("видно количество раздач", "нашлось 3 раздачи" in message.text, message.text[:120])
-    check("перечислено, что нашлось", "Новая битва экстрасенсов — 2 раздачи" in message.text,
-          message.text[:400])
-    check("сказано, что слова не совпали",
-          "похожие, но не те сериалы" in message.text, message.text[:400])
+    check("сказано, что это другие сериалы",
+          "другие сериалы" in message.text, message.text[:400])
     check("подсказки перечислены так же, как на кнопках",
-          "Похоже, вы искали" in message.text and "Экстрасенсы. Реванш" in message.text,
+          "вы имели в виду" in message.text and "Экстрасенсы. Реванш" in message.text,
           message.text[:400])
+    check("нет второго списка «что нашлось»",
+          "Что нашлось:" not in message.text, message.text[:400])
     labels = [action.label for action in message.actions]
     check("качество кнопками", labels[:2] == ["1080p", "720p"], labels)
     check("похожие названия кнопками", any(label.startswith("Это «") for label in labels), labels)
@@ -176,7 +176,8 @@ async def test_ask_dimension() -> None:
                        series_title="Тед Лассо", seeds=30)],
     )
     text2 = turn2.messages[-1].text
-    check("при точном названии без предупреждения", "похожие, но не те" not in text2, text2[:200])
+    check("при точном названии без предупреждения",
+          "другие сериалы" not in text2 and "Что нашлось:" not in text2, text2[:200])
 
 
 class ListingMCP:
@@ -264,6 +265,55 @@ async def test_card_without_torrent() -> None:
           [message.text[:60] for message in turn2.messages])
 
 
+async def test_title_first() -> None:
+    print("\n== неточное название: сначала сериал, потом качество ==")
+    tmp = Path(tempfile.mkdtemp(prefix="title-first-"))
+    settings = dataclasses.replace(
+        get_settings(),
+        data_dir=tmp,
+        db_path=tmp / "title-first.sqlite3",
+        torrents_dir=tmp / "torrent-files",
+        transmission_download_dir=tmp / "torrents",
+    )
+    agent = Agent(settings)
+    task = Task(
+        id="title-task", kind="oneshot", state="searching", session_id="checks",
+        user_query="Битва экстрасенсов реванш",
+        params={"title": "Битва экстрасенсов реванш"},
+    )
+    other = Torrent(
+        id="900", title="Новая битва экстрасенсов (25 сезон: 15 выпуск) / HDTV (1080p)",
+        size="5.7 ГБ", seeds=50, series_title="Новая битва экстрасенсов",
+        qualities=["1080p"], seasons=[25], episodes=[15],
+    )
+    other2 = Torrent(
+        id="901", title="Новая Битва экстрасенсов (25 сезон: 14 выпуск) / HDTV (720p)",
+        size="3 ГБ", seeds=10, series_title="Новая Битва экстрасенсов",
+        qualities=["720p"], seasons=[25], episodes=[14],
+    )
+    task.options = {
+        "pool": [other.to_dict(), other2.to_dict()],
+        "suggestions": [
+            {"title": "Экстрасенсы. Реванш", "torrent_id": "2154198", "score": 0.85},
+            {"title": "Битва экстрасенсов", "torrent_id": "836714", "score": 0.68},
+        ],
+    }
+    await agent.store.save_task(task)
+    turn = Turn()
+    await agent._selection_step(task, turn)
+    message = turn.messages[-1]
+    check("спрашиваем сериал, а не качество",
+          "Какой сериал вы имели в виду?" in message.text, message.text[:300])
+    check("в списке те же названия, что на кнопках",
+          "Экстрасенсы. Реванш" in message.text and "Битва экстрасенсов" in message.text,
+          message.text[:400])
+    labels = [action.label for action in message.actions]
+    check("кнопок качества здесь нет", not any(label in ("1080p", "720p") for label in labels), labels)
+    check("есть кнопки подсказок",
+          sum(1 for label in labels if label.startswith("Это «")) == 2, labels)
+    check("есть отмена", any(action.kind == "cancel" for action in message.actions), labels)
+
+
 async def test_alternatives_and_pack() -> None:
     print("\n== варианты подписаны, сезон предлагается кнопкой ==")
     tmp = Path(tempfile.mkdtemp(prefix="pack-"))
@@ -322,6 +372,7 @@ async def main() -> int:
     test_error_text()
     await test_fetch_torrent()
     await test_ask_dimension()
+    await test_title_first()
     await test_card_without_torrent()
     await test_alternatives_and_pack()
     print("\n=== ИТОГ ===")

@@ -1084,6 +1084,15 @@ class Agent:
 
         fresh = [t for t in matched if t.id not in downloaded] or matched
 
+        # Название совпало не точно: сначала уточняем сериал кнопками. Иначе
+        # пришлось бы спрашивать «какое качество» у чужих раздач и показывать
+        # два списка, которые спорят друг с другом.
+        ranked = rank(fresh, params)
+        suggestions = (task.options or {}).get("suggestions") or []
+        if suggestions and ranked and self._missing_tokens(task.title, ranked[0].title):
+            await self._ask_title(task, suggestions, len(fresh), turn)
+            return
+
         # Не хватает параметров — предлагаем только то, что реально есть
         # с учётом уже заданных условий.
         missing: list[str] = []
@@ -1107,6 +1116,53 @@ class Agent:
 
         best_list = rank(fresh, task.params)
         await self._present_candidate(task, best_list, turn)
+
+    async def _ask_title(
+        self, task: Task, suggestions: list[dict], found_count: int, turn: Turn
+    ) -> None:
+        """Название не совпало — спрашиваем, какой сериал имелся в виду.
+
+        Качество и озвучку спрашивать раньше времени бессмысленно: они
+        относятся к раздачам чужого сериала.
+        """
+        lines = [
+            f"По запросу «{task.title}» нашлось "
+            f"{_plural(found_count, 'раздача', 'раздачи', 'раздач')}, но это другие сериалы.",
+            "",
+            "Какой сериал вы имели в виду?",
+            "",
+        ]
+        for item in suggestions[:5]:
+            lines.append(f"• {item['title']}")
+        lines.append("")
+        lines.append("Кнопка выберет название — и я поищу заново уже по нему.")
+        message = turn.add(
+            "\n".join(lines),
+            kind="tickets",
+            task_id=task.id,
+            payload={"task": task.to_dict(), "suggestions": suggestions},
+        )
+        for item in suggestions[:5]:
+            message.actions.append(
+                Action(
+                    id=f"similar-title-{item['torrent_id']}",
+                    label=f"Это «{item['title']}»"[:60],
+                    kind="choose",
+                    payload={"task_id": task.id, "dimension": "title", "value": item["title"]},
+                    group="Похожие названия",
+                )
+            )
+        message.actions.append(
+            Action(
+                id="cancel-title",
+                label="Отмена",
+                kind="cancel",
+                payload={"task_id": task.id},
+                style="danger",
+            )
+        )
+        task.state = "awaiting_choice"
+        await self.store.save_task(task)
 
     async def _offer_suggestions(self, task: Task, suggestions: list[dict], turn: Turn) -> None:
         """«Не найдено — возможно, вы имели в виду…» с кнопками."""
@@ -1275,37 +1331,39 @@ class Agent:
             f"{_plural(count, 'раздача', 'раздачи', 'раздач')}. {title}",
             "",
         ]
-        # Показываем, ЧТО именно нашлось: при неточном названии трекер всё равно
-        # отдаёт похожие сериалы, и без списка непонятно, откуда взялись 41.
         found = found or []
         suggestions = (task.options or {}).get("suggestions") or []
-        shows: dict[str, int] = {}
-        for item in found:
-            name = (item.series_title or "").strip() or (item.title or "").strip()
-            if name:
-                shows[name] = shows.get(name, 0) + 1
-        top = sorted(shows.items(), key=lambda pair: -pair[1])[:4]
         best_found = max(found, key=lambda item: item.seeds, default=None) if found else None
         # Сравниваем с названием, по которому реально искали (после подсказки),
         # а не с исходной опечаткой — иначе предупреждение висит и после выбора.
         weak = bool(suggestions) and best_found is not None and bool(
             self._missing_tokens(task.title, best_found.title)
         )
-        if top:
-            if weak:
-                lines.append("⚠ По вашим словам нашлись похожие, но не те сериалы:")
-            else:
-                lines.append("Что нашлось:")
-            for name, number in top:
-                lines.append(f"• {name} — {_plural(number, 'раздача', 'раздачи', 'раздач')}")
-            lines.append("")
         if weak:
-            # Список подсказок — ровно те же названия, что и на кнопках ниже:
-            # иначе «что нашлось» и кнопки спорят друг с другом.
-            lines.append("Похоже, вы искали (кнопки ниже):")
+            # Один список на всё: кандидаты, которые и станут кнопками ниже.
+            # Отдельный перечень «что нашлось по словам» только путал — там
+            # были чужие сериалы, да ещё с дублями из-за регистра.
+            lines.append("Похоже, это другие сериалы. Скорее всего, вы имели в виду (кнопки ниже):")
+            lines.append("")
             for item in suggestions[:3]:
                 lines.append(f"• {item['title']}")
             lines.append("")
+        else:
+            # Точное совпадение: показываем, какие сериалы реально есть в выдаче.
+            shows: dict[str, tuple[str, int]] = {}
+            for item in found:
+                name = (item.series_title or "").strip() or (item.title or "").strip()
+                key = normalize(name)
+                if not key:
+                    continue
+                title_text, number = shows.get(key, (name, 0))
+                shows[key] = (title_text, number + 1)
+            top = sorted(shows.values(), key=lambda pair: -pair[1])[:4]
+            if len(top) > 1:
+                lines.append("Что нашлось:")
+                for name, number in top:
+                    lines.append(f"• {name} — {_plural(number, 'раздача', 'раздачи', 'раздач')}")
+                lines.append("")
         lines.append(f"Доступно с учётом остальных условий: {shown}.")
         text = "\n".join(lines)
         group = "Качество" if dimension == "quality" else "Озвучка"
