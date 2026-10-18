@@ -1148,6 +1148,7 @@
       closePanel();
     });
     setupPullToRefresh();
+    setupHeaderReload();
 
     $("bell").addEventListener("click", () => {
       if ($("notification-tray").hidden) trayOpen();
@@ -1269,6 +1270,64 @@
         hint.classList.remove("is-visible");
       }
     }
+  }
+
+  // Потянуть за шапку («Кинозал» / название чата) → перезагрузка страницы.
+  function setupHeaderReload() {
+    if (!("ontouchstart" in window)) return;
+    const header = document.querySelector(".marquee");
+    const hint = $("pull-hint");
+    if (!header || !hint) return;
+    const threshold = 80;
+    let startY = 0;
+    let dragging = false;
+    let armed = false;
+
+    header.addEventListener(
+      "touchstart",
+      (event) => {
+        if (state.busy || event.touches.length !== 1) return;
+        if (event.target.closest("button")) return;
+        startY = event.touches[0].clientY;
+        dragging = true;
+        armed = false;
+      },
+      { passive: true }
+    );
+
+    header.addEventListener(
+      "touchmove",
+      (event) => {
+        if (!dragging) return;
+        const delta = event.touches[0].clientY - startY;
+        if (delta <= 0) {
+          dragging = false;
+          hint.classList.remove("is-visible", "is-busy");
+          return;
+        }
+        if (event.cancelable) event.preventDefault();
+        armed = delta > threshold;
+        hint.textContent = armed ? "отпустите, чтобы перезагрузить" : "потяните, чтобы перезагрузить";
+        hint.classList.add("is-visible", "is-busy");
+      },
+      { passive: false }
+    );
+
+    const finish = () => {
+      if (!dragging) return;
+      dragging = false;
+      if (armed) {
+        armed = false;
+        hint.textContent = "перезагружаю…";
+        hint.classList.add("is-visible", "is-busy");
+        window.location.reload();
+        return;
+      }
+      hint.classList.remove("is-visible", "is-busy");
+    };
+
+    header.addEventListener("touchend", finish, { passive: true });
+    header.addEventListener("touchcancel", finish, { passive: true });
   }
 
   function setupPullToRefresh() {
