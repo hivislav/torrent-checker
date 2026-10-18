@@ -416,6 +416,33 @@ class Store:
 
         return await self._call(run)
 
+    async def resolve_actions(self, task_id: str) -> int:
+        """Помечает последний вопрос задачи как отвеченный.
+
+        Кнопки в сообщении нажимаются один раз: как только действие выполнено,
+        этот вопрос закрыт, и после перезагрузки страницы кнопки снова не
+        активны.
+        """
+        rows = await self.history_for_task(task_id, limit=200)
+        for row in reversed(rows):
+            actions = row.get("actions") or []
+            if not actions:
+                continue
+            payload = row.get("payload") or {}
+            if payload.get("resolved"):
+                return 0
+            payload["resolved"] = True
+
+            def run(conn: sqlite3.Connection, message_id: int = int(row["id"]), body=payload) -> None:
+                conn.execute(
+                    "UPDATE messages SET payload = ? WHERE id = ?",
+                    (json.dumps(body, ensure_ascii=False), message_id),
+                )
+
+            await self._call(run)
+            return 1
+        return 0
+
     async def set_message_task(self, message_id: int, task_id: str) -> None:
         """Привязывает сообщение к задаче: у каждой задачи своя переписка."""
         if not message_id or not task_id:

@@ -365,6 +365,13 @@ class Agent:
             await self._start_oneshot(session_id, text, parsed, turn)
 
         await self._tag_turn(user_message_id, turn)
+        if turn.task is not None and turn.messages:
+            # Ответ появился — значит, вопрос, который висел, уже отвечен.
+            # (toggle_episode не шлёт сообщений: там выбор ещё идёт.)
+            try:
+                await self.store.resolve_actions(turn.task.id)
+            except Exception as exc:  # noqa: BLE001 - пометка не должна ронять ответ
+                log.warning("не удалось пометить вопрос отвеченным: %s", exc)
         await self._remember_many(session_id, turn.messages)
         return turn
 
@@ -863,6 +870,13 @@ class Agent:
         else:
             turn.add("Не понял действие. Попробуйте ещё раз.", kind="error")
 
+        if turn.task is not None and turn.messages:
+            # Ответ появился — значит, вопрос, который висел, уже отвечен.
+            # (toggle_episode не шлёт сообщений: там выбор ещё идёт.)
+            try:
+                await self.store.resolve_actions(turn.task.id)
+            except Exception as exc:  # noqa: BLE001 - пометка не должна ронять ответ
+                log.warning("не удалось пометить вопрос отвеченным: %s", exc)
         await self._remember_many(session_id, turn.messages)
         return turn
 
@@ -4158,8 +4172,12 @@ class Agent:
         return task
 
     async def _remember(self, session_id: str, message: Message) -> int:
+        # У сообщений с кнопками всегда известен статус «отвечено ли»:
+        # иначе после перезагрузки страницы старые кнопки снова активны.
+        if message.actions:
+            message.payload.setdefault("resolved", False)
         return await self.store.add_message(session_id, message)
 
     async def _remember_many(self, session_id: str, messages: list[Message]) -> None:
         for message in messages:
-            await self.store.add_message(session_id, message)
+            await self._remember(session_id, message)

@@ -405,6 +405,17 @@ body {
   transition: all .15s ease;
 }
 .btn:hover { color: var(--ink); border-color: var(--amber); }
+.btn:disabled,
+.btn[disabled] {
+  cursor: not-allowed;
+  opacity: .45;
+  filter: grayscale(.35);
+}
+.btn:disabled:hover { border-color: var(--line); color: var(--ink-dim); }
+
+/* Сообщение, на которое уже ответили: видно, что кнопки больше не работают. */
+.msg--answered .msg__actions { opacity: .5; }
+.msg--answered .msg__actions .btn--multi.is-selected { opacity: 1; }
 .btn--primary {
   border-color: var(--amber);
   color: #1a1207;

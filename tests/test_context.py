@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core.agent import Agent  # noqa: E402
 from core.config import get_settings  # noqa: E402
-from core.models import Message, Task  # noqa: E402
+from core.models import Action, Message, Task  # noqa: E402
 
 FAILS: list[str] = []
 
@@ -138,6 +138,31 @@ async def test_task_chats() -> None:
     window = await agent._task_window("chat-a")  # noqa: SLF001
     check("контекст модели — тоже только своей задачи",
           [item["text"] for item in window] == ["ищу дюна", "ответ про дюна"], window)
+    agent.store.close()
+
+
+async def test_answered_once() -> None:
+    print("\n== кнопки в сообщении нажимаются один раз ==")
+    agent = make_agent("answered-")
+    session = "s1"
+    task = Task(id="ans-task", kind="oneshot", state="awaiting_choice", session_id=session,
+                user_query="Дюна", params={"title": "Дюна"})
+    await agent.store.save_task(task)
+    question = Message(role="agent", text="Какое качество берём?", kind="tickets", task_id=task.id)
+    question.actions = [Action(id="q-1080", label="1080p", kind="choose",
+                               payload={"task_id": task.id, "dimension": "quality", "value": "1080p"})]
+    await agent._remember(session, question)  # noqa: SLF001
+
+    rows = await agent.history_for_task("ans-task")
+    check("у вопроса с кнопками есть статус «не отвечен»",
+          rows and rows[-1]["payload"].get("resolved") is False, rows and rows[-1]["payload"])
+
+    marked = await agent.store.resolve_actions("ans-task")
+    rows = await agent.history_for_task("ans-task")
+    check("после действия вопрос помечен отвеченным", marked == 1, marked)
+    check("флаг сохранился в базе", rows[-1]["payload"].get("resolved") is True, rows[-1]["payload"])
+    check("повторная пометка ничего не меняет",
+          await agent.store.resolve_actions("ans-task") == 0)
     agent.store.close()
 
 
@@ -382,6 +407,7 @@ async def main() -> int:
     await test_window()
     await test_reset()
     await test_task_chats()
+    await test_answered_once()
     await test_foreign_query()
     await test_prompt()
     test_refinement_rules()

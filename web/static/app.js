@@ -92,17 +92,23 @@
     if (taskId) {
       try {
         const data = await api(`/api/history?task_id=${encodeURIComponent(taskId)}`);
-        (data.messages || []).forEach((row) => {
+        const rows = data.messages || [];
+        let lastActionIndex = -1;
+        rows.forEach((row, index) => {
+          if ((row.actions || []).length) lastActionIndex = index;
+        });
+        rows.forEach((row, index) => {
           renderMessage(
             {
               role: row.role,
               text: row.text,
               kind: row.kind,
               actions: row.actions || [],
+              payload: row.payload || {},
               created_at: row.created_at,
               task_id: row.task_id,
             },
-            { scroll: false }
+            { scroll: false, answered: answeredAlready(row, index, lastActionIndex) }
           );
         });
       } catch (error) {
@@ -131,7 +137,32 @@
     refreshTasks();
   }
 
-  function renderMessage(message, { scroll = true } = {}) {
+  function answeredAlready(message, index, lastActionIndex) {
+    const resolved = message.payload && message.payload.resolved;
+    if (resolved === true) return true;
+    // Старые сообщения (до появления флага) считаем отвеченными, если после
+    // них было ещё одно сообщение с кнопками.
+    if (resolved === false) return false;
+    if (typeof index === "number" && typeof lastActionIndex === "number") {
+      return index < lastActionIndex;
+    }
+    return false;
+  }
+
+  function lockMessage(node) {
+    node.classList.add("msg--answered");
+    node.querySelectorAll(".msg__actions button").forEach((button) => {
+      button.disabled = true;
+    });
+  }
+
+  function lockAllMessages() {
+    chat.querySelectorAll(".msg:not(#pending-message)").forEach((node) => {
+      if (node.querySelector(".msg__actions button")) lockMessage(node);
+    });
+  }
+
+  function renderMessage(message, { scroll = true, answered = false } = {}) {
     clearIntro();
     const node = template.content.firstElementChild.cloneNode(true);
     node.classList.add(`msg--${message.role}`);
@@ -144,6 +175,7 @@
     node.querySelector(".msg__text").textContent = message.text || "";
 
     renderActions(node.querySelector(".msg__actions"), message.actions || []);
+    if (answered) lockMessage(node);
 
     chat.appendChild(node);
     if (scroll) chat.scrollTop = chat.scrollHeight;
@@ -278,6 +310,8 @@
 
   function renderTurn(payload) {
     removePending();
+    // Новый ответ = прошлый вопрос отвечен: его кнопки больше не нажимаются.
+    lockAllMessages();
     for (const message of payload.messages || []) {
       renderMessage(message);
       if (message.kind === "notice" || message.kind === "error") {
@@ -335,6 +369,8 @@
   async function runAction(action, button) {
     if (state.busy) return;
     state.busy = true;
+    const owner = button.closest(".msg");
+    if (owner) lockMessage(owner);
     button.disabled = true;
     renderPending();
     try {
@@ -349,7 +385,7 @@
       renderMessage({ role: "agent", text: `Ошибка: ${error.message}`, kind: "error" });
     } finally {
       state.busy = false;
-      button.disabled = false;
+      // Кнопку не возвращаем: сообщение уже отвечено, второй раз не нажать.
     }
   }
 
