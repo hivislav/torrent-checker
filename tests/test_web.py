@@ -86,6 +86,53 @@ def run() -> int:
         check("статус служб отрисован", "модель" in status, status[:120])
         page.screenshot(path=str(SHOTS / "03-panel.png"), animations="disabled")
 
+        print("\n== секции картотеки ==")
+        sections = page.evaluate(
+            """() => ['active','finished','downloads'].map(name => ({
+                name,
+                hasToggle: !!document.querySelector(`[data-toggle="${name}"]`),
+                hasBadge: !!document.querySelector(`[data-section="${name}"] .badge`),
+                hasHint: !!document.querySelector(`[data-section="${name}"] .panel__hint`),
+            }))"""
+        )
+        for item in sections:
+            check(f"секция «{item['name']}» с кнопкой и счётчиком",
+                  item["hasToggle"] and item["hasBadge"], item)
+        check("у секций есть пояснения", all(item["hasHint"] for item in sections), sections)
+
+        def section_state(name):
+            return page.evaluate(
+                """(name) => {
+                    const box = document.querySelector(`[data-section="${name}"] .task-list`);
+                    return { hidden: box.hidden, display: getComputedStyle(box).display,
+                             items: box.children.length };
+                }""",
+                name,
+            )
+
+        # Каждая кнопка должна реально скрывать и показывать свой список.
+        for name in ("finished", "active", "downloads"):
+            before = section_state(name)
+            page.click(f'[data-toggle="{name}"]')
+            page.wait_for_timeout(250)
+            after = section_state(name)
+            changed = before["display"] != after["display"]
+            check(f"«{name}»: показать/скрыть работает", changed, (before, after))
+            page.click(f'[data-toggle="{name}"]')
+            page.wait_for_timeout(250)
+
+        # Состояние запоминается между перезагрузками.
+        page.click('[data-toggle="finished"]')
+        page.wait_for_timeout(300)
+        page.reload(wait_until="domcontentloaded")
+        page.wait_for_selector("#chat", timeout=20000)
+        page.wait_for_timeout(1500)
+        check("состояние секции запоминается", section_state("finished")["display"] != "none",
+              section_state("finished"))
+        page.click('[data-toggle="finished"]')
+        page.wait_for_timeout(250)
+        page.screenshot(path=str(SHOTS / "08-panel.png"), animations="disabled")
+
         print("\n== журнал отладки ==")
         page.click("#open-debug")
         page.wait_for_selector("#debug-modal:not([hidden])", timeout=10000)

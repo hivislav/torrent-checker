@@ -29,26 +29,40 @@
       </div>
 
       <div class="panel__scroll">
-        <section class="panel__section">
+        <!-- Три списка разного смысла: активные задачи, завершённые задачи и
+             то, что уже лежит на диске. У каждого — свой счётчик и своя
+             кнопка «показать/скрыть» (состояние запоминается). -->
+        <section class="panel__section" data-section="active">
           <h2 class="panel__section-title">
             <span class="reel" aria-hidden="true"></span> В работе
             <span class="badge" id="active-count">0</span>
+            <button class="link-btn" data-toggle="active">скрыть</button>
           </h2>
+          <p class="panel__hint">Ищут, ждут подтверждения или следят за новым.</p>
           <div class="task-list" id="active-tasks"></div>
         </section>
 
-        <section class="panel__section">
+        <section class="panel__section" data-section="finished">
           <h2 class="panel__section-title">
-            <span class="reel reel--done" aria-hidden="true"></span> Архив
-            <button class="link-btn" id="toggle-archive">показать</button>
+            <span class="reel reel--done" aria-hidden="true"></span> Завершённые
+            <span class="badge" id="finished-count">0</span>
+            <button class="link-btn" data-toggle="finished">показать</button>
           </h2>
-          <div class="task-list task-list--archive" id="past-tasks" hidden></div>
+          <p class="panel__hint">
+            Задачи, которые закончились: готово, отменено, не найдено или ошибка.
+          </p>
+          <div class="task-list" id="past-tasks" hidden></div>
         </section>
 
-        <section class="panel__section">
+        <section class="panel__section" data-section="downloads">
           <h2 class="panel__section-title">
-            <span class="reel reel--done" aria-hidden="true"></span> Скачано
+            <span class="reel reel--done" aria-hidden="true"></span> Скачано на диск
+            <span class="badge" id="download-count">0</span>
+            <button class="link-btn" data-toggle="downloads">скрыть</button>
           </h2>
+          <p class="panel__hint">
+            Файлы, которые уже в Transmission и на внешнем диске. Отсюда можно удалить.
+          </p>
           <div class="task-list" id="download-list"></div>
         </section>
 

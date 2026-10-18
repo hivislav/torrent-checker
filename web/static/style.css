@@ -24,6 +24,11 @@
 
 * { box-sizing: border-box; }
 
+/* Атрибут hidden обязан скрывать элемент, даже если класс задаёт display.
+   Без этого правила список с `display: flex` продолжал показываться — именно
+   поэтому кнопка «показать/скрыть» в архиве выглядела нерабочей. */
+[hidden] { display: none !important; }
+
 html, body {
   margin: 0;
   padding: 0;
@@ -245,7 +250,17 @@ body {
   background: rgba(0, 0, 0, .3);
 }
 
+.panel__hint {
+  margin: -4px 0 9px;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--ink-faint);
+}
+
+.panel__section.is-collapsed .panel__hint { display: none; }
+
 .task-list { display: flex; flex-direction: column; gap: 10px; }
+.task-list:empty { display: none; }
 
 .task-card {
   border: 1px solid var(--line-soft);
@@ -1032,6 +1047,7 @@ body {
 
   .notification-tray { right: 12px; left: 12px; width: auto; top: 56px; }
 
+  .panel__hint { display: none; }
   .modal__box--wide { width: 100%; max-height: 92vh; }
   .debug__pair { grid-template-columns: 1fr; gap: 2px; }
   .debug__note { display: none; }

@@ -183,6 +183,56 @@
   }
 
   // ------------------------------------------------------------------
+  // Сворачиваемые секции картотеки
+  // ------------------------------------------------------------------
+  // Состояние «свёрнуто/развёрнуто» хранится в localStorage: панель не должна
+  // каждый раз показывать одно и то же в неудобном виде.
+  const SECTIONS = {
+    active: { list: "active-tasks", hint: true, defaultHidden: false },
+    finished: { list: "past-tasks", hint: true, defaultHidden: true },
+    downloads: { list: "download-list", hint: true, defaultHidden: false },
+  };
+
+  const sectionKey = (name) => `kino.section.${name}`;
+
+  function sectionHidden(name) {
+    const config = SECTIONS[name];
+    if (!config) return false;
+    try {
+      const stored = localStorage.getItem(sectionKey(name));
+      if (stored !== null) return stored === "hidden";
+    } catch (_) {
+      /* приватный режим — просто не запоминаем */
+    }
+    return config.defaultHidden;
+  }
+
+  function applySection(name, hidden) {
+    const config = SECTIONS[name];
+    if (!config) return;
+    const box = $(config.list);
+    const button = document.querySelector(`[data-toggle="${name}"]`);
+    const section = document.querySelector(`[data-section="${name}"]`);
+    if (box) box.hidden = hidden;
+    if (button) button.textContent = hidden ? "показать" : "скрыть";
+    if (section) section.classList.toggle("is-collapsed", hidden);
+  }
+
+  function toggleSection(name) {
+    const hidden = !sectionHidden(name);
+    try {
+      localStorage.setItem(sectionKey(name), hidden ? "hidden" : "shown");
+    } catch (_) {
+      /* запомнить не получилось — не беда */
+    }
+    applySection(name, hidden);
+  }
+
+  function restoreSections() {
+    for (const name of Object.keys(SECTIONS)) applySection(name, sectionHidden(name));
+  }
+
+  // ------------------------------------------------------------------
   // Панель задач
   // ------------------------------------------------------------------
   const ACTIVE_STATES = new Set([
@@ -294,6 +344,14 @@
     return card;
   }
 
+  function placeholder(text) {
+    const box = document.createElement("div");
+    box.className = "task-card__meta";
+    box.style.padding = "2px 0";
+    box.textContent = text;
+    return box;
+  }
+
   function smallButton(label, className, handler) {
     const button = document.createElement("button");
     button.type = "button";
@@ -315,19 +373,26 @@
       const activeBox = $("active-tasks");
       activeBox.innerHTML = "";
       $("active-count").textContent = String(active.length);
+      $("finished-count").textContent = String(past.length);
+      $("download-count").textContent = String(downloads.length);
+      // Заглушка нужна, чтобы список не схлопывался: иначе у «показать/скрыть»
+      // нет видимого эффекта, и непонятно, пусто тут или спрятано.
       if (!active.length) {
-        activeBox.innerHTML = '<div class="task-card__meta">пока пусто</div>';
+        activeBox.appendChild(placeholder("активных задач нет"));
       }
       active.forEach((task) => activeBox.appendChild(taskCard(task)));
 
       const pastBox = $("past-tasks");
       pastBox.innerHTML = "";
+      if (!past.length) {
+        pastBox.appendChild(placeholder("завершённых задач пока нет"));
+      }
       past.slice(0, 30).forEach((task) => pastBox.appendChild(taskCard(task)));
 
       const downloadBox = $("download-list");
       downloadBox.innerHTML = "";
       if (!downloads.length) {
-        downloadBox.innerHTML = '<div class="task-card__meta">ещё ничего не скачано</div>';
+        downloadBox.appendChild(placeholder("ещё ничего не скачано"));
       }
       downloads.slice(0, 12).forEach((item) => {
         const row = document.createElement("div");
@@ -807,11 +872,10 @@
     $("panel-close").addEventListener("click", closePanel);
     $("panel-scrim").addEventListener("click", closePanel);
 
-    $("toggle-archive").addEventListener("click", (event) => {
-      const box = $("past-tasks");
-      box.hidden = !box.hidden;
-      event.target.textContent = box.hidden ? "показать" : "скрыть";
-    });
+    for (const button of document.querySelectorAll("[data-toggle]")) {
+      button.addEventListener("click", () => toggleSection(button.dataset.toggle));
+    }
+    restoreSections();
 
     $("bell").addEventListener("click", () => {
       const tray = $("notification-tray");
