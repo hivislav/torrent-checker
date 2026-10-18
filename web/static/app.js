@@ -1133,14 +1133,7 @@
     });
     input.addEventListener("input", autoGrow);
 
-    $("panel-open").addEventListener("click", () => {
-      $("panel").classList.add("is-open");
-      $("panel-scrim").classList.add("is-visible");
-    });
-    const closePanel = () => {
-      $("panel").classList.remove("is-open");
-      $("panel-scrim").classList.remove("is-visible");
-    };
+    $("panel-open").addEventListener("click", panelOpen);
     $("panel-close").addEventListener("click", closePanel);
     $("panel-scrim").addEventListener("click", closePanel);
 
@@ -1157,12 +1150,8 @@
     setupPullToRefresh();
 
     $("bell").addEventListener("click", () => {
-      const tray = $("notification-tray");
-      tray.hidden = !tray.hidden;
-      if (!tray.hidden) {
-        state.notifications = 0;
-        $("bell-dot").hidden = true;
-      }
+      if ($("notification-tray").hidden) trayOpen();
+      else closeTray();
     });
     $("clear-notifications").addEventListener("click", () => {
       $("notification-list").innerHTML = "";
@@ -1188,11 +1177,78 @@
       if (event.key === "Escape") {
         closeSettings();
         closeDebug();
-        $("notification-tray").hidden = true;
-        closePanel();
+        closeOverlays();
       }
     });
   }
+
+  // ------------------------------------------------------------------
+  // Боковая панель, киножурнал и кнопка «назад» на телефоне.
+  // При открытии панели кладём запись в историю: «назад» закрывает панель,
+  // а не выкидывает со страницы.
+  // ------------------------------------------------------------------
+  let overlayPushed = false;
+
+  function pushOverlay() {
+    if (overlayPushed) return;
+    try {
+      history.pushState({ overlay: true }, "");
+      overlayPushed = true;
+    } catch (_) {
+      overlayPushed = false;
+    }
+  }
+
+  function popOverlay() {
+    if (!overlayPushed) return;
+    overlayPushed = false;
+    history.back();
+  }
+
+  function panelOpen() {
+    $("panel").classList.add("is-open");
+    $("panel-scrim").classList.add("is-visible");
+    pushOverlay();
+  }
+
+  function panelCloseQuiet() {
+    $("panel").classList.remove("is-open");
+    $("panel-scrim").classList.remove("is-visible");
+  }
+
+  function closePanel() {
+    panelCloseQuiet();
+    popOverlay();
+  }
+
+  function trayOpen() {
+    const tray = $("notification-tray");
+    tray.hidden = false;
+    state.notifications = 0;
+    $("bell-dot").hidden = true;
+    pushOverlay();
+  }
+
+  function trayCloseQuiet() {
+    $("notification-tray").hidden = true;
+  }
+
+  function closeTray() {
+    trayCloseQuiet();
+    popOverlay();
+  }
+
+  function closeOverlays() {
+    panelCloseQuiet();
+    trayCloseQuiet();
+    popOverlay();
+  }
+
+  window.addEventListener("popstate", () => {
+    overlayPushed = false;
+    panelCloseQuiet();
+    trayCloseQuiet();
+  });
 
   // ------------------------------------------------------------------
   // Свайп вниз = обновить (телефон). Тянем только когда чат прокручен вверх,

@@ -28,10 +28,6 @@
         <button class="panel__close" id="panel-close" aria-label="Закрыть панель">✕</button>
       </div>
 
-      <button type="button" class="panel__new" id="panel-new-task">
-        <span aria-hidden="true">＋</span> Новая задача
-      </button>
-
       <div class="panel__scroll">
         <!-- Три списка разного смысла: активные задачи, завершённые задачи и
              то, что уже лежит на диске. У каждого — свой счётчик и своя
@@ -81,6 +77,12 @@
             <button class="btn btn--ghost" id="logout">Выйти</button>
           </div>
         </section>
+      </div>
+
+      <div class="panel__foot">
+        <button type="button" class="panel__new" id="panel-new-task">
+          <span aria-hidden="true">＋</span> Новая задача
+        </button>
       </div>
     </aside>
     <div class="panel-scrim" id="panel-scrim"></div>
