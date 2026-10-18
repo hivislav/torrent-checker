@@ -109,6 +109,93 @@ async def test_reset() -> None:
     agent.store.close()
 
 
+async def test_foreign_query() -> None:
+    print("\n== чужой запрос не уточняет старую задачу ==")
+    agent = make_agent("foreign-")
+    task = Task(
+        id="old-task",
+        kind="oneshot",
+        state="awaiting_choice",
+        session_id="s1",
+        user_query="Человек паук",
+        params={"title": "Человек-паук: Новый день", "quality": "1080p"},
+    )
+    check("короткое название — это название", agent._looks_like_title("Извне"))  # noqa: SLF001
+    check("«а можно 4K» — не название", not agent._looks_like_title("а можно 4K"))  # noqa: SLF001
+    check("«Сериал» — не название", not agent._looks_like_title("Сериал"))  # noqa: SLF001
+    check("«нет» — не название", not agent._looks_like_title("нет"))  # noqa: SLF001
+
+    parsed = {"title": "Человек-паук: Новый день", "quality": "1080p"}
+    check("«Извне» не уточняет чужую задачу",
+          not agent._is_refinement("Извне", parsed, task))  # noqa: SLF001
+    check("«а можно 4K» уточняет",
+          agent._is_refinement("а можно 4K", {"quality": "2160p"}, task))  # noqa: SLF001
+    check("то же название — уточнение",
+          agent._is_refinement("Человек-паук: Новый день 4K",
+                               {"quality": "2160p"}, task))  # noqa: SLF001
+
+    # Старая задача не должна считаться текущей.
+    from datetime import datetime, timedelta, timezone
+
+    stale = Task(
+        id="stale-task",
+        kind="oneshot",
+        state="awaiting_choice",
+        session_id="s2",
+        user_query="Человек паук",
+        params={"title": "Человек-паук: Новый день"},
+    )
+    await agent.store.save_task(stale)
+    # save_task ставит updated_at=сейчас; состариваем задачу напрямую в базе.
+    import sqlite3
+
+    old_stamp = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat(timespec="seconds")
+    conn = sqlite3.connect(str(agent.settings.db_path))
+    conn.execute("UPDATE tasks SET updated_at = ? WHERE id = ?", (old_stamp, "stale-task"))
+    conn.commit()
+    conn.close()
+    check("задача двухчасовой давности не активна",
+          await agent._active_task("s2") is None)  # noqa: SLF001
+
+    fresh = Task(
+        id="fresh-task",
+        kind="oneshot",
+        state="awaiting_choice",
+        session_id="s3",
+        user_query="Тед Лассо",
+        params={"title": "Тед Лассо"},
+    )
+    await agent.store.save_task(fresh)
+    check("свежая задача активна", (await agent._active_task("s3")) is not None)  # noqa: SLF001
+
+    # Свежую задачу новый поиск не закрывает, старую — закрывает.
+    await agent._close_stale_tasks("s3", "oneshot", keep_id="other")  # noqa: SLF001
+    still = await agent.store.get_task("fresh-task")
+    check("свежая задача переживает новый поиск", still is not None and still.state == "awaiting_choice",
+          still.state if still else None)
+    await agent._close_stale_tasks("s2", "oneshot", keep_id="other")  # noqa: SLF001
+    gone = await agent.store.get_task("stale-task")
+    check("старая задача закрывается", gone is not None and gone.state == "cancelled",
+          gone.state if gone else None)
+
+    # Кнопки закрытой задачи не должны запускать работу.
+    closed = Task(
+        id="closed-task",
+        kind="oneshot",
+        state="cancelled",
+        session_id="s4",
+        user_query="Человек паук",
+        params={"title": "Человек-паук: Новый день"},
+    )
+    await agent.store.save_task(closed)
+    turn = await agent.handle_action(
+        "s4", "choose", {"task_id": "closed-task", "dimension": "quality", "value": "1080p"}
+    )
+    texts = " ".join(message.text for message in turn.messages)
+    check("закрытая задача не продолжается", "уже закрыта" in texts, texts[:120])
+    agent.store.close()
+
+
 async def test_prompt() -> None:
     print("\n== окно попадает в запрос к модели ==")
     agent = make_agent()
@@ -260,6 +347,7 @@ async def test_live_dialog() -> None:
 async def main() -> int:
     await test_window()
     await test_reset()
+    await test_foreign_query()
     await test_prompt()
     test_refinement_rules()
     await test_merge()

@@ -141,6 +141,20 @@ PARAM_TITLES = {
 }
 
 
+def _parse_iso(value: str | None) -> datetime | None:
+    """«2026-10-18T15:30:42+00:00» → datetime; мусор → None."""
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        stamp = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return stamp
+
+
 def _comma(text: str) -> str:
     """«5.74 ГБ» → «5,74 ГБ»: размеры с трекера приходят с точкой."""
     return str(text).replace(".", ",")
@@ -266,7 +280,19 @@ class Agent:
         active = await self._active_task(session_id, kind=effective_mode)
 
         # Уточнение к текущей задаче — правим её, а не заводим новую.
-        if active is not None and self._is_refinement(text, parsed, active):
+        refined = active is not None and self._is_refinement(text, parsed, active)
+        if active is not None and not refined:
+            # Не уточнение: если модель повторила старое название, берём
+            # название из текста, а не из контекста прошлой задачи.
+            old_title = str((active.params or {}).get("title") or "")
+            if self._looks_like_title(text) and not self._text_about_title(text, old_title):
+                parsed = {**parsed, "title": self._clean_title_text(text)}
+                journal.add(
+                    "agent",
+                    "название взято из нового запроса",
+                    {"было": old_title, "стало": parsed["title"]},
+                )
+        if refined:
             journal.add(
                 "agent",
                 "уточнение к текущей задаче",
@@ -285,6 +311,11 @@ class Agent:
                 await self._remember_many(session_id, turn.messages)
                 return turn
 
+        if not parsed.get("title") and self._looks_like_title(text):
+            # «Извне» без года и качества — это название, пусть модель его
+            # и не выделила: ищем по тому, что человек написал.
+            parsed = {**parsed, "title": self._clean_title_text(text)}
+            journal.add("agent", "название взято из текста запроса", {"название": parsed["title"]})
         journal.add(
             "agent",
             f"запрос пользователя ({'периодически' if effective_mode == 'periodic' else 'разово'})",
@@ -311,13 +342,49 @@ class Agent:
         разные состояния.
         """
         tasks = await self.store.list_tasks(limit=20)
+        ttl = max(1, int(getattr(self.settings, "active_task_ttl_minutes", 30) or 30))
+        deadline = datetime.now(timezone.utc) - timedelta(minutes=ttl)
         for task in tasks:
             if task.session_id != session_id or task.state not in self.RESUME_STATES:
                 continue
             if kind and task.kind != kind:
                 continue
+            # Старая незакрытая задача не должна ловить новые запросы: у неё
+            # уже своя история и свои кнопки.
+            stamp = _parse_iso(task.updated_at) or _parse_iso(task.created_at)
+            if stamp is not None and stamp < deadline:
+                continue
             return task
         return None
+
+    # Слова, которые не могут быть названием: это команды и уточнения.
+    REFINE_STOPWORDS = {
+        "да", "нет", "ок", "окей", "спасибо", "другой", "другое", "другая",
+        "другие", "это", "не", "то", "отмена", "всё", "все", "ещё", "еще",
+        "можно", "а", "и", "или", "ничего", "первый", "второй", "третий",
+    }
+    REFINE_KEYWORDS = (
+        "качеств", "озвучк", "сезон", "серия", "серии", "серий", "год",
+        "сериал", "фильм", "кино", "раздач", "торрент", "скач", "найди",
+        "поищи", "покажи", "хочу", "нужен", "нужна", "надо", "возьми",
+    )
+
+    def _looks_like_title(self, text: str) -> bool:
+        """Текст похож на название, а не на уточнение («4K», «7 серия», «нет»)."""
+        cleaned = re.sub(r"[«»\"'.,!?:;()\[\]]+", " ", str(text or "")).strip()
+        if not cleaned:
+            return False
+        low = cleaned.lower()
+        if re.search(r"\d", low):
+            return False
+        if any(word in low for word in self.REFINE_KEYWORDS):
+            return False
+        tokens = [token for token in low.split() if token]
+        if not tokens or len(tokens) > 6:
+            return False
+        if any(token in self.REFINE_STOPWORDS for token in tokens):
+            return False
+        return any(len(token) > 2 for token in tokens)
 
     def _is_refinement(self, text: str, parsed: dict[str, Any], active: Task) -> bool:
         """Это уточнение к активной задаче, а не новая задача?"""
@@ -327,12 +394,37 @@ class Agent:
         # главный: она склонна считать уточнением любой следующий запрос.
         if new_title and old_title and normalize(new_title) != normalize(old_title):
             return False
-        if parsed.get("refine") is True:
-            return True
+        plain_title = self._looks_like_title(text)
         if not new_title:
-            # «4К», «7 серия», «нет, другой» — без названия это уточнение.
+            # Модель не распознала название, а текст на него похож — это новый
+            # поиск, а не «что поправить» в старой задаче («Извне»).
+            return not plain_title
+        if normalize(new_title) == normalize(old_title) and plain_title:
+            # Модель могла просто повторить текущую задачу (и приписать к ней
+            # параметры из контекста). Если человек написал другое — это новый
+            # поиск: «Извне» после «Человека-паука» ищет «Извне».
+            if not self._text_about_title(text, old_title):
+                return False
+        parsed_params = [
+            key
+            for key in ("original_title", "quality", "voice", "season", "episode_from", "year")
+            if parsed.get(key) not in (None, "", "null")
+        ]
+        if parsed_params:
             return True
         return normalize(new_title) == normalize(old_title)
+
+    @staticmethod
+    def _clean_title_text(text: str) -> str:
+        """Убирает пунктуацию по краям: «Извне!» → «Извне»."""
+        cleaned = re.sub(r"[«»\"'.,!?:;()\[\]]+", " ", str(text or ""))
+        return re.sub(r"\s+", " ", cleaned).strip()
+
+    def _text_about_title(self, text: str, title: str) -> bool:
+        """Текст относится к этому названию? («Тед Лассо» ⊂ «Тед Лассо»)."""
+        wanted = [token for token in str(text or "").lower().split() if token]
+        haystack = normalize(title)
+        return bool(wanted) and all(token in haystack for token in wanted)
 
     async def _refine_task(
         self, task: Task, parsed: dict[str, Any], text: str, turn: Turn
@@ -433,6 +525,23 @@ class Agent:
         task_id = str(payload.get("task_id") or "")
         task = await self.store.get_task(task_id) if task_id else None
         turn.task = task
+
+        CONT_SUFFIXES = (
+            "choose", "start_download", "pick_torrent", "toggle_episode",
+            "download_selected", "download_all", "choose_episode", "confirm_download",
+            "download_new", "periodic_auto", "periodic_notify", "make_periodic",
+        )
+        if task is not None and task.state == "cancelled" and (
+            kind == "choose" or kind in CONT_SUFFIXES
+        ):
+            turn.add(
+                f"Задача «{task.title}» уже закрыта — напишите запрос заново, "
+                "например в поле ввода.",
+                kind="error",
+                task_id=task.id,
+            )
+            await self._remember_many(session_id, turn.messages)
+            return turn
 
         if kind == "cancel" and task is None:
             # Отмена подтверждения (например, удаления) — задачи тут может не быть.
@@ -1009,6 +1118,33 @@ class Agent:
     # ------------------------------------------------------------------
     # Разовая задача
     # ------------------------------------------------------------------
+    async def _close_stale_tasks(
+        self, session_id: str, kind: str, keep_id: str = ""
+    ) -> None:
+        """Закрывает прежние незакрытые задачи того же типа перед новым поиском.
+
+        Иначе старая карточка остаётся «текущей», и её кнопки утаскивают
+        новый запрос в чужую раздачу. Свежие задачи (моложе TTL) не трогаем:
+        человек мог отойти на минуту и вернуться к своей карточке.
+        """
+        ttl = max(1, int(getattr(self.settings, "active_task_ttl_minutes", 30) or 30))
+        deadline = datetime.now(timezone.utc) - timedelta(minutes=ttl)
+        for task in await self.store.list_tasks(limit=50):
+            if task.id == keep_id or task.session_id != session_id:
+                continue
+            if task.kind != kind or task.state not in self.RESUME_STATES:
+                continue
+            stamp = _parse_iso(task.updated_at) or _parse_iso(task.created_at)
+            if stamp is None or stamp >= deadline:
+                continue
+            task.state = "cancelled"
+            task.next_check_at = None
+            await self.store.save_task(task)
+            journal.add(
+                "agent", "закрыл прежнюю задачу перед новой", {"задача": task.id,
+                                                                 "название": task.title},
+            )
+
     async def _start_oneshot(
         self, session_id: str, text: str, parsed: dict[str, Any], turn: Turn
     ) -> None:
@@ -1020,6 +1156,7 @@ class Agent:
             return
 
         task = await self._task_from_params(session_id, text, parsed, kind="oneshot")
+        await self._close_stale_tasks(session_id, "oneshot", keep_id=task.id)
         turn.task = task
         turn.add(
             f"Ищу «{task.title}»"
@@ -1715,6 +1852,17 @@ class Agent:
             turn.add(f"Не смог обратиться к трекеру: {exc}", kind="error", task_id=task.id)
             return
 
+        # Выбрали конкретную раздачу — оставляем только её: поиск по слову
+        # вернёт и «Вторжение извне», и «Голоса извне», а нам нужна одна.
+        chosen = normalize(title)
+        exact = [item for item in torrents if normalize(item.series_title or "") == chosen]
+        if exact:
+            journal.add(
+                "agent",
+                "поиск сужен до выбранной раздачи",
+                {"название": title, "раздач": len(torrents), "осталось": len(exact)},
+            )
+            torrents = exact
         task.options = {
             **(task.options or {}),
             "pool": [t.to_dict() for t in torrents[:80]],
