@@ -150,7 +150,10 @@ async def test_ask_dimension() -> None:
     check("видно количество раздач", "нашлось 3 раздачи" in message.text, message.text[:120])
     check("перечислено, что нашлось", "Новая битва экстрасенсов — 2 раздачи" in message.text,
           message.text[:400])
-    check("сказано про неточное совпадение", "Точного совпадения по названию нет" in message.text,
+    check("сказано, что слова не совпали",
+          "похожие, но не те сериалы" in message.text, message.text[:400])
+    check("подсказки перечислены так же, как на кнопках",
+          "Похоже, вы искали" in message.text and "Экстрасенсы. Реванш" in message.text,
           message.text[:400])
     labels = [action.label for action in message.actions]
     check("качество кнопками", labels[:2] == ["1080p", "720p"], labels)
@@ -173,7 +176,7 @@ async def test_ask_dimension() -> None:
                        series_title="Тед Лассо", seeds=30)],
     )
     text2 = turn2.messages[-1].text
-    check("при точном названии без предупреждения", "Точного совпадения" not in text2, text2[:200])
+    check("при точном названии без предупреждения", "похожие, но не те" not in text2, text2[:200])
 
 
 class ListingMCP:
@@ -261,11 +264,66 @@ async def test_card_without_torrent() -> None:
           [message.text[:60] for message in turn2.messages])
 
 
+async def test_alternatives_and_pack() -> None:
+    print("\n== варианты подписаны, сезон предлагается кнопкой ==")
+    tmp = Path(tempfile.mkdtemp(prefix="pack-"))
+    settings = dataclasses.replace(
+        get_settings(),
+        data_dir=tmp,
+        db_path=tmp / "pack.sqlite3",
+        torrents_dir=tmp / "torrent-files",
+        transmission_download_dir=tmp / "torrents",
+    )
+    agent = Agent(settings)
+    agent.mcp = ListingMCP(["dummy"]) if False else agent.mcp
+    mcp = ListingMCP([{"name": "05.Серия.s03.E05.ts", "size": 6124008256}])
+    agent.mcp = mcp  # type: ignore[assignment]
+
+    episode5 = Torrent(
+        id="2157531", title="Экстрасенсы. Реванш (3 сезон: 5 выпуск из 15) / HDTV (1080p)",
+        size="5.74 ГБ", seeds=251, series_title="Экстрасенсы. Реванш", series_key="ekstrasensyrevansh",
+        qualities=["1080p", "HDTV"], seasons=[3], episodes=[5],
+    )
+    episode4 = Torrent(
+        id="2156772", title="Экстрасенсы. Реванш (3 сезон: 4 выпуск из 15) / HDTV (1080p)",
+        size="5.74 ГБ", seeds=30, series_title="Экстрасенсы. Реванш", series_key="ekstrasensyrevansh",
+        qualities=["1080p", "HDTV"], seasons=[3], episodes=[4],
+    )
+    pack = Torrent(
+        id="2154196", title="Экстрасенсы. Реванш (3 сезон: 1-5 выпуск) / WEB-DL (1080p)",
+        size="16.2 ГБ", seeds=6, series_title="Экстрасенсы. Реванш", series_key="ekstrasensyrevansh",
+        qualities=["1080p", "WEB-DL"], seasons=[3], episodes=[1, 5],
+    )
+    task = Task(
+        id="pack-task", kind="oneshot", state="searching", session_id="checks",
+        user_query="Экстрасенсы реванш", params={"title": "Экстрасенсы. Реванш", "quality": "1080p"},
+    )
+    task.options = {"pool": [episode5.to_dict(), episode4.to_dict(), pack.to_dict()]}
+    await agent.store.save_task(task)
+
+    turn = Turn()
+    await agent._present_candidate(task, [episode5, episode4], turn)
+    message = turn.messages[-1]
+    check("подпись варианта по серии, а не «вариант 2»",
+          "серия 4" in message.text and "5,74 ГБ" in message.text, message.text[-300:])
+    check("весь сезон предложен в тексте",
+          "Весь сезон есть отдельной раздачей" in message.text, message.text[-400:])
+    labels = [action.label for action in message.actions]
+    check("есть кнопка «Скачать весь сезон»",
+          any("весь сезон" in label.lower() for label in labels), labels)
+    pack_action = next(action for action in message.actions if "весь сезон" in action.label.lower())
+    check("кнопка ведёт на раздачу-сезон", pack_action.payload.get("torrent_id") == "2154196",
+          pack_action.payload)
+    check("вопрос про Transmission в конце",
+          message.text.strip().endswith("Ставлю в Transmission?"), message.text[-60:])
+
+
 async def main() -> int:
     test_error_text()
     await test_fetch_torrent()
     await test_ask_dimension()
     await test_card_without_torrent()
+    await test_alternatives_and_pack()
     print("\n=== ИТОГ ===")
     if FAILS:
         print("FAIL:", ", ".join(FAILS))

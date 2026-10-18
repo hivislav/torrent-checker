@@ -141,6 +141,11 @@ PARAM_TITLES = {
 }
 
 
+def _comma(text: str) -> str:
+    """«5.74 ГБ» → «5,74 ГБ»: размеры с трекера приходят с точкой."""
+    return str(text).replace(".", ",")
+
+
 def _plural(count: int, one: str, few: str, many: str) -> str:
     """«1 файл», «2 файла», «5 файлов» — без кривых скобок в интерфейсе."""
     if count % 10 == 1 and count % 100 != 11:
@@ -1270,29 +1275,36 @@ class Agent:
             f"{_plural(count, 'раздача', 'раздачи', 'раздач')}. {title}",
             "",
         ]
-        # Показываем, ЧТО именно нашлось: при кривом названии трекер всё равно
+        # Показываем, ЧТО именно нашлось: при неточном названии трекер всё равно
         # отдаёт похожие сериалы, и без списка непонятно, откуда взялись 41.
         found = found or []
+        suggestions = (task.options or {}).get("suggestions") or []
         shows: dict[str, int] = {}
         for item in found:
             name = (item.series_title or "").strip() or (item.title or "").strip()
             if name:
                 shows[name] = shows.get(name, 0) + 1
         top = sorted(shows.items(), key=lambda pair: -pair[1])[:4]
+        best_found = max(found, key=lambda item: item.seeds, default=None) if found else None
+        # Сравниваем с названием, по которому реально искали (после подсказки),
+        # а не с исходной опечаткой — иначе предупреждение висит и после выбора.
+        weak = bool(suggestions) and best_found is not None and bool(
+            self._missing_tokens(task.title, best_found.title)
+        )
         if top:
-            lines.append("Что нашлось:")
+            if weak:
+                lines.append("⚠ По вашим словам нашлись похожие, но не те сериалы:")
+            else:
+                lines.append("Что нашлось:")
             for name, number in top:
                 lines.append(f"• {name} — {_plural(number, 'раздача', 'раздачи', 'раздач')}")
             lines.append("")
-        original = str(task.user_query or "").split(" | ")[0]
-        best_found = max(found, key=lambda item: item.seeds, default=None) if found else None
-        weak = best_found is not None and bool(self._missing_tokens(original, best_found.title))
         if weak:
-            lines.append(
-                "⚠ Точного совпадения по названию нет — это похожие сериалы. "
-                "Если нужен другой — возьмите его кнопкой ниже или нажмите "
-                "«Отмена» и уточните название."
-            )
+            # Список подсказок — ровно те же названия, что и на кнопках ниже:
+            # иначе «что нашлось» и кнопки спорят друг с другом.
+            lines.append("Похоже, вы искали (кнопки ниже):")
+            for item in suggestions[:3]:
+                lines.append(f"• {item['title']}")
             lines.append("")
         lines.append(f"Доступно с учётом остальных условий: {shown}.")
         text = "\n".join(lines)
@@ -1445,14 +1457,28 @@ class Agent:
         await self.store.save_task(task)
         text = self._confirm_card_text(task, best, plan)
         suggestions = (task.options or {}).get("suggestions") or []
-        # «Совпало не точно» — когда в исходном запросе были слова, которых нет
-        # в найденном названии: значит, поиск нашёл похожее, но не то.
-        original = str(task.user_query or "").split(" | ")[0]
-        weak = bool(suggestions) and bool(self._missing_tokens(original, best.title))
+        # «Совпало не точно» — когда в названии, по которому искали, были слова,
+        # которых нет в найденном: значит, поиск нашёл похожее, но не то.
+        weak = bool(suggestions) and bool(self._missing_tokens(task.title, best.title))
         if weak and suggestions:
             text += "\n\n⚠ Название совпало не точно. Возможно, вы имели в виду:"
             for index, item in enumerate(suggestions[:3], start=1):
                 text += f"\n{index}. {item['title']}"
+        # Раздача целиком (весь сезон) — частое желание: если она есть в пуле,
+        # предлагаем кнопкой и подписываем, что это именно она.
+        whole = self._season_pack(task, best)
+        if whole is not None:
+            line = f"• Весь сезон есть отдельной раздачей:\n    {whole.title}"
+            if whole.size:
+                line += f" — {_comma(whole.size)}"
+            text += f"\n{line}"
+        alternatives = best_list[1:4]
+        if alternatives:
+            text += "\n\nДругие раздачи по этому запросу:"
+            for index, item in enumerate(alternatives, start=2):
+                label = self._short_torrent_label(item)
+                text += f"\n{index}. {item.title}" + (f" — {label}" if label else "")
+        text += "\n\nСтавлю в Transmission?"
         message = turn.add(
             text,
             kind="task",
@@ -1460,6 +1486,16 @@ class Agent:
             payload={"task": task.to_dict(), "plan": plan},
         )
         message.actions = self._start_actions(task, plan)
+        if whole is not None:
+            message.actions.insert(
+                1,
+                Action(
+                    id=f"pick-pack-{whole.id}",
+                    label=f"Скачать весь сезон · {_comma(whole.size)}"[:60],
+                    kind="pick_torrent",
+                    payload={"task_id": task.id, "torrent_id": whole.id},
+                ),
+            )
         if weak:
             for item in suggestions[:3]:
                 message.actions.append(
@@ -1471,12 +1507,13 @@ class Agent:
                         group="Похожие названия",
                     )
                 )
-        if len(best_list) > 1:
-            for index, alternative in enumerate(best_list[1:4], start=2):
+        if alternatives:
+            for index, alternative in enumerate(alternatives, start=2):
+                label = self._short_torrent_label(alternative)
                 message.actions.append(
                     Action(
                         id=f"pick-{alternative.id}",
-                        label=f"Взять вариант {index}",
+                        label=f"{index}. {label}"[:60] if label else f"Вариант {index}",
                         kind="pick_torrent",
                         payload={"task_id": task.id, "torrent_id": alternative.id},
                     )
@@ -2006,11 +2043,14 @@ class Agent:
     async def _download_with_report(
         self, task: Task, torrent: Torrent, turn: Turn, periodic_context: bool = False
     ) -> None:
-        """Шаг 1: скачать .torrent, разобрать файлы и показать полную карточку.
+        """Шаг 1: разобрать файлы и показать полную карточку.
 
         Здесь выясняется, что именно попадёт на диск: одна серия или вся пачка,
         сколько это весит и хватает ли места. Если серия не названа, а в раздаче
         их несколько — предлагаем выбрать кликабельными кнопками.
+
+        Состав берём со страницы трекера (без .torrent): человек может просто
+        смотреть варианты, а дневной лимит тратится только на саму загрузку.
         """
         task.state = "downloading"
         await self.store.save_task(task)
@@ -2020,20 +2060,24 @@ class Agent:
             {"id": torrent.id, "качество": torrent.quality, "озвучка": torrent.voice},
         )
 
-        path, error, reason = await self._fetch_torrent(torrent)
-        if path is None:
-            if reason == "tracker":
-                await self._report_tracker_problem(task, torrent, error, turn)
+        listing = await self._listing_entries(torrent)
+        path: Path | None = None
+        if listing is not None:
+            entries = parse_files(listing)
+        else:
+            path, error, reason = await self._fetch_torrent(torrent)
+            if path is None:
+                if reason == "tracker":
+                    await self._report_tracker_problem(task, torrent, error, turn)
+                    return
+                task.state = "failed"
+                task.last_error = error
+                await self.store.save_task(task)
+                await self._report_storage_problem(
+                    task, torrent, {"error": error, "reason": "disk", "path": None}, turn
+                )
                 return
-            task.state = "failed"
-            task.last_error = error
-            await self.store.save_task(task)
-            await self._report_storage_problem(
-                task, torrent, {"error": error, "reason": "disk", "path": None}, turn
-            )
-            return
-
-        entries = parse_files(file_list(path))
+            entries = parse_files(file_list(path))
         plan = self._plan_files(task, entries)
         task.options = {
             **(task.options or {}),
@@ -2043,7 +2087,7 @@ class Agent:
                 for entry in entries[:400]
             ],
             "plan": plan,
-            "torrent_path": str(path),
+            **({"torrent_path": str(path)} if path is not None else {}),
         }
 
         if plan["kind"] == "choose":
@@ -2220,7 +2264,7 @@ class Agent:
                 episode_text = "серия —"
             lines.append(f"• {season_text}, {episode_text}")
         if torrent.size:
-            lines.append(f"• На трекере: {torrent.size}")
+            lines.append(f"• На трекере: {_comma(torrent.size)}")
 
         names = plan.get("names") or []
         if plan.get("kind") == "single" and len(names) == 1:
@@ -2252,8 +2296,92 @@ class Agent:
         lines.append(f"• Куда: {self.settings.transmission_download_dir}")
 
         lines.append("")
-        lines.append("Ставлю в Transmission?" if fits else "Всё равно поставить в очередь?")
         return "\n".join(lines)
+
+
+    @staticmethod
+    def _plan_from_episodes(entries: list[Any], plan: dict[str, Any]) -> dict[str, Any] | None:
+        """Пересобирает план серий по настоящему .torrent (когда индексы разошлись)."""
+        episodes = sorted({int(item) for item in (plan.get("selected_episodes") or [])})
+        if not episodes:
+            return None
+        season = plan.get("season")
+        wanted: list[int] = []
+        names: list[str] = []
+        size = 0
+        seasons: set[int] = set()
+        for episode in episodes:
+            picked = pick_episode(entries, season=season, episode=episode)
+            if not picked:
+                continue
+            wanted.extend(picked.get("indexes") or [])
+            size += int(picked.get("size") or 0)
+            names.extend(picked.get("names") or [])
+            if picked.get("season") is not None:
+                seasons.add(int(picked["season"]))
+        if not wanted:
+            return None
+        return {
+            **plan,
+            "kind": "episode",
+            "wanted": sorted(set(wanted)),
+            "size": size,
+            "names": names,
+            "season": next(iter(seasons)) if len(seasons) == 1 else season,
+            "selected_episodes": episodes,
+            "total_files": len(entries),
+            "total_size": sum(entry.size for entry in entries),
+        }
+
+    def _season_pack(self, task: Task, best: Torrent) -> Torrent | None:
+        """Раздача «весь сезон» под те же условия поиска, если она есть в пуле.
+
+        Нужна, когда в карточке выбрана одна серия: обычно человек хочет
+        скачать сезон целиком, и это должна быть отдельная кнопка, а не
+        «вариант 4» без подписи.
+        """
+        pool = [Torrent.from_dict(item) for item in (task.options or {}).get("pool", [])]
+        params = task.params or {}
+        want_quality = str(params.get("quality") or best.quality or "")
+        want_season = best.season if best.season is not None else params.get("season")
+        episodes = set(best.episodes or [])
+        series = best.series_key or ""
+        candidates: list[Torrent] = []
+        for item in pool:
+            if item.id == best.id:
+                continue
+            if len(set(item.episodes or [])) < 2:
+                continue
+            if want_quality and item.quality != want_quality:
+                continue
+            if series and item.series_key and item.series_key != series:
+                continue
+            if want_season is not None and item.season is not None:
+                if int(item.season) != int(want_season):
+                    continue
+            if episodes and not episodes.issubset(set(item.episodes or [])):
+                continue
+            candidates.append(item)
+        return max(candidates, key=lambda item: item.seeds, default=None)
+
+    @staticmethod
+    def _short_torrent_label(torrent: Torrent) -> str:
+        """Короткая подпись раздачи для кнопки и списка: «серия 4 · 1080p · 5,7 ГБ»."""
+        bits: list[str] = []
+        episodes = sorted({int(item) for item in (torrent.episodes or [])})
+        season = torrent.season
+        if len(episodes) > 1:
+            bits.append(f"сезон {season}, серии {episodes[0]}–{episodes[-1]}" if season
+                        else f"серии {episodes[0]}–{episodes[-1]}")
+        elif episodes:
+            bits.append(f"серия {episodes[0]}")
+        elif season:
+            bits.append(f"сезон {season}")
+        if torrent.quality:
+            bits.append(torrent.quality)
+        if torrent.size:
+            bits.append(_comma(torrent.size))
+        return " · ".join(bits)
 
     def _start_actions(self, task: Task, plan: dict[str, Any]) -> list[Action]:
         actions = [
@@ -2382,6 +2510,24 @@ class Agent:
             path = fetched
             task.options = {**(task.options or {}), "torrent_path": str(path)}
             await self.store.save_task(task)
+
+        # Список со страницы и настоящий .torrent могут разойтись порядком
+        # файлов. Тогда план по индексам неверен — пересобираем по сериям.
+        if plan.get("total_files"):
+            entries = parse_files(file_list(path))
+            expected = int(plan.get("total_files") or 0)
+            if len(entries) != expected:
+                journal.add(
+                    "agent",
+                    "файлы в .torrent не совпали со списком со страницы",
+                    {"ожидалось": expected, "в торренте": len(entries)},
+                    level="warn",
+                )
+                rebuilt = self._plan_from_episodes(entries, plan)
+                if rebuilt is not None:
+                    plan = rebuilt
+                    task.options = {**(task.options or {}), "plan": plan}
+                    await self.store.save_task(task)
 
         result = await self._finalize_download(task, torrent, path, plan)
         if not result["ok"]:
