@@ -166,6 +166,8 @@ class Agent:
         self._check_locks: dict[str, asyncio.Lock] = {}
         self._running_checks: set[str] = set()
         self.scheduler_task: asyncio.Task | None = None
+        self.progress_task: asyncio.Task | None = None
+        self.progress_tick_seconds = 5
         self.scheduler_tick_seconds = 20
 
     # ------------------------------------------------------------------
@@ -184,9 +186,17 @@ class Agent:
         await self.push.prepare()
         if with_scheduler:
             self.scheduler_task = asyncio.create_task(self._scheduler_loop())
-            log.info("шедулер периодических задач запущен")
+            self.progress_task = asyncio.create_task(self._progress_loop())
+            log.info("шедулер периодических задач и монитор загрузок запущены")
 
     async def stop(self) -> None:
+        if self.progress_task:
+            self.progress_task.cancel()
+            try:
+                await self.progress_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+            self.progress_task = None
         if self.scheduler_task:
             self.scheduler_task.cancel()
             try:
@@ -643,7 +653,13 @@ class Agent:
         return await self.store.history(session_id, limit)
 
     async def downloads(self, limit: int = 50) -> list[dict[str, Any]]:
-        return await self.store.list_downloads(limit)
+        """Скачанное с текущим прогрессом из Transmission."""
+        rows = await self.store.list_downloads(limit)
+        hashes = [str(row.get("transmission_hash") or "") for row in rows]
+        progress = await self.transmission.progress([item for item in hashes if item])
+        for row in rows:
+            row["progress"] = progress.get(str(row.get("transmission_hash") or ""))
+        return rows
 
     async def status(self) -> dict[str, Any]:
         import httpx
@@ -2163,11 +2179,27 @@ class Agent:
                 )
             return
 
+        # Раздача только что встала в очередь: показываем процесс, а не «готово».
+        progress = {}
+        torrent_hash = result.get("transmission_hash") or ""
+        if torrent_hash:
+            task.params["transmission_hash"] = torrent_hash
+            try:
+                progress = (await self.transmission.progress([torrent_hash])).get(torrent_hash) or {}
+            except Exception:  # noqa: BLE001 - прогресс не критичен
+                progress = {}
+        finished = bool(progress.get("done")) or not progress
+        if progress:
+            task.params["progress"] = progress
+            plan = {**plan, "progress": progress}
+            result = {**result, "progress": progress}
         if periodic_context:
             task.state = "monitoring"
             self._schedule_next(task)
-        else:
+        elif finished:
             task.state = "done"
+        else:
+            task.state = "downloading"
         await self.store.save_task(task)
 
         text = self._downloaded_text(torrent, result, plan)
@@ -2221,7 +2253,9 @@ class Agent:
         await self.desktop.send("Торрент скачан", torrent.title[:120])
 
     def _downloaded_text(self, torrent: Torrent, result: dict[str, Any], plan: dict[str, Any]) -> str:
-        lines = [f"Готово: «{torrent.title}»"]
+        progress = result.get("progress") or {}
+        in_progress = bool(progress) and not progress.get("done")
+        lines = [("Качается: " if in_progress else "Готово: ") + f"«{torrent.title}»"]
         picked = [int(item) for item in (plan.get("selected_episodes") or [])]
         if len(picked) > 1:
             season = f"сезон {plan['season']}, " if plan.get("season") else ""
@@ -2324,6 +2358,7 @@ class Agent:
             "path": str(path),
             "transmission": transmission_note,
             "transmission_error": transmission_error,
+            "transmission_hash": transmission_hash,
             "plan": plan,
         }
 
@@ -2619,6 +2654,83 @@ class Agent:
         task.next_check_at = (
             datetime.now(timezone.utc) + timedelta(minutes=interval)
         ).isoformat(timespec="seconds")
+
+    @staticmethod
+    def _progress_text(progress: dict[str, Any]) -> str:
+        """«45,2% · 1,2 МБ/с · осталось 12 мин · 1,1 ГБ из 5,7 ГБ»."""
+        if not progress:
+            return ""
+        bits = [f"{progress.get('percent', 0)}%"]
+        if progress.get("rate_human"):
+            bits.append(str(progress["rate_human"]))
+        if progress.get("eta_human"):
+            bits.append(f"осталось {progress['eta_human']}")
+        if progress.get("downloaded_human") and progress.get("size_human"):
+            bits.append(f"{progress['downloaded_human']} из {progress['size_human']}")
+        return " · ".join(bits)
+
+    async def refresh_progress(self) -> None:
+        """Опрашивает Transmission и обновляет задачи в состоянии «скачивание».
+
+        Transmission не присылает события — только отвечает, поэтому прогресс
+        забираем опросом. Задача остаётся в «скачивании», пока файл не дойдёт до
+        100%, и только потом уходит в завершённые.
+        """
+        tasks = await self.store.list_tasks(limit=200, states=["downloading"])
+        if not tasks:
+            return
+        hashes = [
+            str((task.params or {}).get("transmission_hash") or "")
+            for task in tasks
+            if (task.params or {}).get("transmission_hash")
+        ]
+        progress = await self.transmission.progress([item for item in hashes if item])
+
+        for task in tasks:
+            torrent_hash = str((task.params or {}).get("transmission_hash") or "")
+            state = progress.get(torrent_hash)
+            if state is None:
+                # Раздачи нет в очереди: удалена вручную или Transmission недоступен.
+                task.params.pop("progress", None)
+                task.state = "done"
+                task.last_result = "раздача больше не в очереди"
+                await self.store.save_task(task)
+                continue
+
+            task.params["progress"] = state
+            task.last_result = self._progress_text(state)
+            if state.get("done"):
+                task.state = "done"
+                await self.store.save_task(task)
+                text = (
+                    f"Скачано: «{state.get('name') or task.title}» "
+                    f"({state.get('size_human') or 'размер неизвестен'})"
+                )
+                message = Message(role="agent", text=text, kind="task", task_id=task.id,
+                                  payload={"task": task.to_dict(), "progress": state})
+                await self._remember_many(task.session_id, [message])
+                await self.events.publish(
+                    {
+                        "type": "download_complete",
+                        "task_id": task.id,
+                        "title": state.get("name") or task.title,
+                        "text": text,
+                        "message": message.to_dict(),
+                    }
+                )
+                await self.desktop.send("Скачивание завершено", str(state.get("name") or "")[:120])
+                continue
+            await self.store.save_task(task)
+
+    async def _progress_loop(self) -> None:
+        while True:
+            try:
+                await self.refresh_progress()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - монитор не должен падать
+                log.exception("ошибка при обновлении прогресса")
+            await asyncio.sleep(self.progress_tick_seconds)
 
     async def _scheduler_loop(self) -> None:
         """Независимые проверки: у каждой задачи своя корутина, лимита нет."""

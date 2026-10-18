@@ -387,6 +387,21 @@
     card.appendChild(title);
     card.appendChild(meta);
 
+    const progress = task.params?.progress;
+    if (progress && task.state === "downloading") {
+      const bar = document.createElement("div");
+      bar.className = "progress";
+      const fill = document.createElement("div");
+      fill.className = "progress__bar";
+      fill.style.width = `${Math.max(1, Math.min(100, progress.percent || 0))}%`;
+      bar.appendChild(fill);
+      const label = document.createElement("div");
+      label.className = "progress__label";
+      label.textContent = progressText(progress);
+      card.appendChild(bar);
+      card.appendChild(label);
+    }
+
     if (task.last_result) {
       const line = document.createElement("div");
       line.className = "task-card__meta";
@@ -435,6 +450,27 @@
     }
     card.appendChild(actions);
     return card;
+  }
+
+  function progressText(progress) {
+    if (!progress) return "";
+    const bits = [`${progress.percent ?? 0}%`];
+    if (progress.rate_human) bits.push(progress.rate_human);
+    if (progress.eta_human) bits.push(`осталось ${progress.eta_human}`);
+    if (progress.downloaded_human && progress.size_human) {
+      bits.push(`${progress.downloaded_human} из ${progress.size_human}`);
+    }
+    return bits.join(" · ");
+  }
+
+  function progressBar(progress) {
+    const wrap = document.createElement("div");
+    wrap.className = "progress";
+    const fill = document.createElement("div");
+    fill.className = "progress__bar";
+    fill.style.width = `${Math.max(1, Math.min(100, progress.percent || 0))}%`;
+    wrap.appendChild(fill);
+    return wrap;
   }
 
   function placeholder(text) {
@@ -502,6 +538,15 @@
           .join(" · ");
         row.appendChild(heading);
         if (meta.textContent) row.appendChild(meta);
+        if (item.progress) {
+          row.appendChild(progressBar(item.progress));
+          const label = document.createElement("div");
+          label.className = "progress__label";
+          label.textContent = item.progress.done
+            ? `скачано · ${item.progress.size_human || ""}`
+            : progressText(item.progress);
+          row.appendChild(label);
+        }
 
         const actions = document.createElement("div");
         actions.className = "task-card__actions";
@@ -629,6 +674,8 @@
           renderMessage(data.message);
           pushNotification(data.message);
         }
+        refreshTasks();
+      } else if (data.type === "download_complete" || data.type === "download_progress") {
         refreshTasks();
       } else if (
         data.type === "download_done" ||
@@ -1030,7 +1077,7 @@
     await refreshTasks();
     await refreshStatus();
     connectEvents();
-    setInterval(refreshTasks, 20000);
+    setInterval(refreshTasks, 5000);
     setInterval(refreshStatus, 60000);
   }
 

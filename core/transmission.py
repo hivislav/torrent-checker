@@ -330,6 +330,58 @@ class Transmission:
             )
             raise TransmissionError(self._explain(exc)) from exc
 
+    async def progress(self, hashes: list[str]) -> dict[str, dict[str, Any]]:
+        """Прогресс раздач по хешам: процент, скорость, остаток, статус.
+
+        Transmission RPC не умеет присылать события — только отвечать на запросы,
+        поэтому прогресс приходится опрашивать. Один вызов на все нужные раздачи.
+        """
+        wanted = {item for item in hashes if item}
+        if not wanted:
+            return {}
+
+        def run() -> dict[str, dict[str, Any]]:
+            client = self._get_client()
+            result: dict[str, dict[str, Any]] = {}
+            for torrent in client.get_torrents():
+                torrent_hash = getattr(torrent, "hash_string", "")
+                if torrent_hash not in wanted:
+                    continue
+                percent = float(getattr(torrent, "percent_done", 0.0) or 0.0)
+                eta = getattr(torrent, "eta", None)
+                try:
+                    eta_seconds = int(eta) if eta is not None else None
+                except (TypeError, ValueError):
+                    eta_seconds = None
+                rate = int(getattr(torrent, "rate_download", 0) or 0)
+                # size_when_done — объём ТОЛЬКО выбранных файлов: если качаем одну
+                # серию из пачки, показывать «29 ГБ» неверно.
+                selected = int(getattr(torrent, "size_when_done", 0) or 0)
+                total = selected or int(getattr(torrent, "total_size", 0) or 0)
+                done = int(percent * total)
+                result[torrent_hash] = {
+                    "hash": torrent_hash,
+                    "name": getattr(torrent, "name", ""),
+                    "percent": round(percent * 100, 1),
+                    "done": percent >= 0.999,
+                    "status": str(getattr(torrent, "status", "")),
+                    "rate": rate,
+                    "rate_human": human_bytes(rate) + "/с" if rate else "",
+                    "eta_seconds": eta_seconds if eta_seconds and eta_seconds > 0 else None,
+                    "eta_human": _human_eta(eta_seconds) if eta_seconds and eta_seconds > 0 else "",
+                    "size": total,
+                    "size_human": human_bytes(total),
+                    "downloaded_human": human_bytes(done),
+                    "left_human": human_bytes(max(0, total - done)),
+                }
+            return result
+
+        try:
+            return await asyncio.to_thread(run)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("не удалось получить прогресс: %s", exc)
+            return {}
+
     async def find_by_hash(self, torrent_hash: str) -> dict[str, Any] | None:
         """Раздача в очереди по хешу: имя, файлы, каталог, размер."""
         if not torrent_hash:
