@@ -96,6 +96,50 @@ def total_length(torrent_path: Path) -> int | None:
     return None
 
 
+def file_list(torrent_path: Path) -> list[dict]:
+    """Список файлов раздачи: индекс, имя, размер.
+
+    Индекс — это именно тот `id`, который потом понимает Transmission при
+    выборе файлов (`change_torrent(files_wanted=...)`), поэтому порядок здесь
+    ровно такой, как в .torrent.
+    """
+    path = Path(torrent_path)
+    try:
+        value, _ = _decode(path.read_bytes(), 0)
+    except OSError as exc:
+        raise TorrentMetaError(f"не прочитать {path.name}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise TorrentMetaError("верхний уровень .torrent — не словарь")
+    info = value.get(b"info")
+    if not isinstance(info, dict):
+        raise TorrentMetaError("в .torrent нет словаря info")
+
+    root = info.get(b"name")
+    root_name = root.decode("utf-8", "replace") if isinstance(root, bytes) else ""
+
+    length = info.get(b"length")
+    if isinstance(length, int):
+        return [{"index": 0, "name": root_name or "файл", "size": length}]
+
+    files: list[dict] = []
+    raw_files = info.get(b"files")
+    if isinstance(raw_files, list):
+        for index, item in enumerate(raw_files):
+            if not isinstance(item, dict):
+                continue
+            size = item.get(b"length")
+            parts = item.get(b"path")
+            if not isinstance(parts, list):
+                continue
+            relative = "/".join(
+                part.decode("utf-8", "replace") if isinstance(part, bytes) else str(part)
+                for part in parts
+            )
+            name = f"{root_name}/{relative}" if root_name else relative
+            files.append({"index": index, "name": name, "size": int(size or 0)})
+    return files
+
+
 def count_files(torrent_path: Path) -> int:
     """Сколько файлов внутри раздачи (для человеческого описания)."""
     try:

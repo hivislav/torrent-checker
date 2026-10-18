@@ -248,8 +248,21 @@ class Transmission:
         except Exception as exc:  # noqa: BLE001 - не смертельно: путь передаём явно
             log.warning("не удалось обновить настройки каталога Transmission: %s", exc)
 
-    async def add(self, torrent_path: Path, *, need_bytes: int | None = None) -> dict[str, Any]:
-        """Ставит .torrent в очередь на внешний диск. Бросает NotEnoughSpace/StorageUnavailable."""
+    async def add(
+        self,
+        torrent_path: Path,
+        *,
+        need_bytes: int | None = None,
+        files_wanted: list[int] | None = None,
+    ) -> dict[str, Any]:
+        """Ставит .torrent в очередь на внешний диск.
+
+        `files_wanted` — индексы файлов внутри раздачи (нужно, чтобы качать одну
+        серию, а не весь сезон). Всё остальное помечается как ненужное, поэтому
+        Transmission качает только выбранное, а не «всё, потом отменить».
+
+        Бросает NotEnoughSpace/StorageUnavailable — проверка до постановки.
+        """
         torrent_path = Path(torrent_path)
         if need_bytes is None:
             try:
@@ -265,12 +278,32 @@ class Transmission:
             data = torrent_path.read_bytes()
             # download_dir передаём явно — это и есть гарантия «всегда на EAGET».
             result = client.add_torrent(data, download_dir=str(self.download_dir))
+            torrent_hash = (
+                getattr(result, "hash_string", "") or getattr(result, "hashString", "")
+            )
+            selected: list[int] = []
+            if files_wanted is not None:
+                files = client.get_torrent(torrent_hash).get_files()
+                wanted = {int(index) for index in files_wanted}
+                unwanted = [item.id for item in files if item.id not in wanted]
+                client.change_torrent(
+                    torrent_hash,
+                    files_wanted=sorted(index for index in wanted if index < len(files)),
+                    files_unwanted=unwanted,
+                )
+                selected = sorted(wanted)
+                journal.add(
+                    "transmission",
+                    f"выбраны файлы раздачи: {len(selected)} из {len(files)}",
+                    {"индексы": selected[:20]},
+                )
             return {
                 "ok": True,
                 "name": getattr(result, "name", ""),
-                "hash": getattr(result, "hash_string", "") or getattr(result, "hashString", ""),
+                "hash": torrent_hash,
                 "id": getattr(result, "id", None),
                 "download_dir": str(self.download_dir),
+                "files_selected": selected,
                 "free_after_human": human_bytes(max(0, info.free - (need_bytes or 0))),
             }
 

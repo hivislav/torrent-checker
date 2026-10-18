@@ -32,6 +32,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -39,6 +40,7 @@ from typing import Any
 from core.config import Settings, get_settings
 from core.debuglog import journal
 from core.llm import LLM, LLMError
+from core.torrent_meta import file_list, human_bytes
 from core.matching import (
     QUALITY_LABELS,
     collect_options,
@@ -53,6 +55,13 @@ from core.mcp_client import KinozalMCP, MCPError
 from core.models import Action, Message, Task, Torrent, Turn, new_id, now_iso
 from core.notify import DesktopNotifier, EventBus
 from core.push import WebPush
+from core.episodes import (
+    episode_groups,
+    is_episode_pack,
+    parse_files,
+    pick_episode,
+    pick_new_episodes,
+)
 from core.parsing import parse_torrent
 from core.storage import Store
 from core.storage_target import StorageUnavailable as TargetUnavailable
@@ -106,6 +115,15 @@ kinozal.me, скачивает торрент-файлы и ставит их в
 раздач и не обещай того, чего агент не умеет. Если пользователь просит что-то
 найти, скачать или отслеживать — подскажи нажать кнопку «Разово» или
 «Периодически» под полем ввода и написать запрос."""
+
+
+def _plural(count: int, one: str, few: str, many: str) -> str:
+    """«1 файл», «2 файла», «5 файлов» — без кривых скобок в интерфейсе."""
+    if count % 10 == 1 and count % 100 != 11:
+        return f"{count} {one}"
+    if count % 10 in (2, 3, 4) and count % 100 not in (12, 13, 14):
+        return f"{count} {few}"
+    return f"{count} {many}"
 
 
 class Agent:
@@ -283,7 +301,7 @@ class Agent:
             turn.messages[-1].actions = self._task_actions(task)
             if task.auto_download and task.candidate:
                 torrent = Torrent.from_dict(task.candidate)
-                await self._download_with_report(task, torrent, turn, periodic_context=True)
+                await self._auto_download(task, torrent, turn)
         elif kind == "download_new" and task:
             torrent_id = str(payload.get("torrent_id") or "")
             pool = [Torrent.from_dict(item) for item in (task.options or {}).get("pool", [])]
@@ -291,7 +309,54 @@ class Agent:
             if torrent is None:
                 turn.add("Эта раздача больше не в списке — дождитесь следующей проверки.", kind="error")
             else:
+                # Ручное «скачать» по периодической задаче: показываем полную
+                # карточку и выбор серии — как в разовой задаче.
                 await self._download_with_report(task, torrent, turn, periodic_context=True)
+        elif kind == "start_download" and task:
+            await self._start_download(task, turn,
+                                       periodic_context=task.kind == "periodic")
+        elif kind == "choose_episode" and task:
+            episode = payload.get("episode")
+            season = payload.get("season")
+            task.params["episode_from"] = int(episode) if episode is not None else None
+            if season is not None:
+                task.params["season"] = int(season)
+            entries = self._entries_from_task(task)
+            plan = self._plan_files(task, entries)
+            if plan.get("kind") != "choose":
+                task.options = {**(task.options or {}), "plan": plan}
+                task.state = "awaiting_confirm"
+                await self.store.save_task(task)
+                message = turn.add(
+                    self._confirm_card_text(task, Torrent.from_dict(task.candidate or {}), plan),
+                    kind="task",
+                    task_id=task.id,
+                    payload={"task": task.to_dict(), "plan": plan},
+                )
+                message.actions = self._start_actions(task, plan)
+            else:
+                await self.store.save_task(task)
+                message = turn.add(
+                    self._episode_choice_text(task, plan),
+                    kind="tickets",
+                    task_id=task.id,
+                    payload={"task": task.to_dict(), "episodes": plan["episodes"]},
+                )
+                message.actions = self._episode_actions(task, plan)
+        elif kind == "download_all" and task:
+            entries = self._entries_from_task(task)
+            plan = self._plan_files(task, entries)
+            plan = {**plan, "kind": "all", "wanted": None,
+                    "size": plan.get("total_size"), "episode": None, "names": []}
+            task.options = {**(task.options or {}), "plan": plan}
+            await self.store.save_task(task)
+            message = turn.add(
+                self._confirm_card_text(task, Torrent.from_dict(task.candidate or {}), plan),
+                kind="task",
+                task_id=task.id,
+                payload={"task": task.to_dict(), "plan": plan},
+            )
+            message.actions = self._start_actions(task, plan)
         elif kind == "delete_download":
             torrent_id = str(payload.get("torrent_id") or "")
             turn = await self.request_delete(torrent_id)
@@ -622,7 +687,7 @@ class Agent:
         message.actions = [
             Action(
                 id="confirm-download",
-                label="Скачать и поставить в Transmission",
+                label="Скачать…",
                 kind="confirm_download",
                 payload={"task_id": task.id, "torrent_id": best.id},
                 style="primary",
@@ -847,68 +912,303 @@ class Agent:
     # ------------------------------------------------------------------
     # Скачивание
     # ------------------------------------------------------------------
+    def _entries_from_task(self, task: Task) -> list[Any]:
+        """Файлы раздачи, сохранённые при первом шаге (без повторного разбора)."""
+        raw = (task.options or {}).get("files") or []
+        return parse_files(raw)
+
+    async def _fetch_torrent(self, torrent: Torrent) -> tuple[Path | None, str]:
+        """Сохраняет .torrent на внешний диск. Возвращает (путь, ошибка)."""
+        try:
+            ensure_dir(self.settings.torrents_dir)
+        except TargetUnavailable as exc:
+            journal.add(
+                "agent",
+                "не могу сохранить .torrent: диск недоступен",
+                {"ошибка": str(exc), "папка": str(self.settings.torrents_dir)},
+                level="error",
+            )
+            return None, f"папка для torrent-файлов недоступна: {exc}"
+
+        path = self.settings.torrents_dir / f"{torrent.id}.torrent"
+        if path.exists() and path.stat().st_size > 0:
+            return path, ""  # уже скачан — второй раз не тянем
+
+        result = await self.mcp.download(torrent.id, path)
+        if not result.get("success"):
+            return None, str(result.get("message") or "не удалось скачать torrent-файл")
+        return path, ""
+
     async def _download_with_report(
         self, task: Task, torrent: Torrent, turn: Turn, periodic_context: bool = False
     ) -> None:
+        """Шаг 1: скачать .torrent, разобрать файлы и показать полную карточку.
+
+        Здесь выясняется, что именно попадёт на диск: одна серия или вся пачка,
+        сколько это весит и хватает ли места. Если серия не названа, а в раздаче
+        их несколько — предлагаем выбрать кликабельными кнопками.
+        """
         task.state = "downloading"
         await self.store.save_task(task)
-        journal.add("agent", f"скачиваю: {torrent.title}", {"id": torrent.id, "качество": torrent.quality})
+        journal.add(
+            "agent",
+            f"готовлю скачивание: {torrent.title}",
+            {"id": torrent.id, "качество": torrent.quality, "озвучка": torrent.voice},
+        )
+
+        path, error = await self._fetch_torrent(torrent)
+        if path is None:
+            task.state = "failed"
+            task.last_error = error
+            await self.store.save_task(task)
+            await self._report_storage_problem(
+                task, torrent, {"error": error, "reason": "disk", "path": None}, turn
+            )
+            return
+
+        entries = parse_files(file_list(path))
+        plan = self._plan_files(task, entries)
+        task.options = {
+            **(task.options or {}),
+            "files": [
+                {"index": entry.index, "name": entry.name, "size": entry.size,
+                 "season": entry.season, "episode": entry.episode}
+                for entry in entries[:400]
+            ],
+            "plan": plan,
+            "torrent_path": str(path),
+        }
+
+        if plan["kind"] == "choose":
+            task.state = "awaiting_choice"
+            await self.store.save_task(task)
+            message = turn.add(
+                self._episode_choice_text(task, plan),
+                kind="tickets",
+                task_id=task.id,
+                payload={"task": task.to_dict(), "episodes": plan["episodes"]},
+            )
+            message.actions = self._episode_actions(task, plan)
+            return
+
+        task.state = "awaiting_confirm"
+        await self.store.save_task(task)
+        message = turn.add(
+            self._confirm_card_text(task, torrent, plan),
+            kind="task",
+            task_id=task.id,
+            payload={"task": task.to_dict(), "plan": plan},
+        )
+        message.actions = self._start_actions(task, plan)
+
+    # ------------------------------------------------------------------
+    # Что именно качать
+    # ------------------------------------------------------------------
+    def _plan_files(self, task: Task, entries: list[Any]) -> dict[str, Any]:
+        """Решение «вся раздача / конкретная серия / спросить какую»."""
+        params = task.params or {}
+        season = params.get("season")
         try:
-            result = await self._download(task, torrent)
-        except Exception as exc:  # noqa: BLE001
-            log.exception("скачивание не удалось")
-            await self.store.save_task(task)
-            turn.add(
-                f"Не удалось скачать «{torrent.title}»: {exc}",
-                kind="error",
-                task_id=task.id,
-                payload={"task": task.to_dict()},
-            )
-            return
+            season = int(season) if season not in (None, "") else None
+        except (TypeError, ValueError):
+            season = None
+        episode = params.get("episode_from") or params.get("episode")
+        try:
+            episode = int(episode) if episode not in (None, "") else None
+        except (TypeError, ValueError):
+            episode = None
 
-        if not result["ok"]:
-            if result.get("retryable"):
-                await self._report_storage_problem(task, torrent, result, turn)
-                return
-            turn.add(
-                f"Не удалось скачать «{torrent.title}»: {result['error']}",
-                kind="error",
-                task_id=task.id,
-                payload={"task": task.to_dict()},
-            )
-            return
+        total_size = sum(entry.size for entry in entries)
+        videos = [entry for entry in entries if entry.is_video and not entry.is_junk]
+        groups = episode_groups(entries)
+        pack = len({(group["season"], group["episode"]) for group in groups}) > 1
 
-        if periodic_context:
-            # Периодическая задача продолжает жить после скачивания.
-            task.state = "monitoring"
-            self._schedule_next(task)
-            await self.store.save_task(task)
+        base = {
+            "total_size": total_size,
+            "total_files": len(entries),
+            "season": season,
+            "episode": episode,
+            "episodes": groups,
+            "pack": pack,
+        }
+
+        if episode is not None:
+            picked = pick_episode(entries, season=season, episode=episode)
+            if picked:
+                return {
+                    **base,
+                    "kind": "episode",
+                    "wanted": picked["indexes"],
+                    "size": picked["size"],
+                    "names": picked["names"],
+                    "episode": picked["episode"],
+                    "season": picked["season"] if picked["season"] is not None else season,
+                }
+            if pack:
+                return {**base, "kind": "choose", "reason": "missing_episode"}
+
+        if pack:
+            return {**base, "kind": "choose", "reason": "no_episode"}
+
+        # Одиночный файл или фильм — качаем целиком.
+        wanted = None
+        if videos and len(videos) < len(entries):
+            # Выкидываем .nfo/.jpg/sample, оставляя видео и субтитры рядом с ним.
+            wanted = [entry.index for entry in entries if not entry.is_junk]
+        return {
+            **base,
+            "kind": "single",
+            "wanted": wanted,
+            "size": sum(entry.size for entry in entries if entry.index in (wanted or [entry.index for entry in entries])),
+            "names": [entry.label for entry in entries if entry.index in (wanted or [entry.index for entry in entries])][:10],
+        }
+
+    def _episode_choice_text(self, task: Task, plan: dict[str, Any]) -> str:
+        episodes = plan.get("episodes") or []
+        head = (
+            f"Серии {plan.get('episode')} в этой раздаче нет. Какая нужна?"
+            if plan.get("reason") == "missing_episode"
+            else f"В раздаче {len(episodes)} серий — какую качать?"
+        )
+        seasons = {group.get("season") for group in episodes if group.get("season")}
+        lines = [head]
+        if len(seasons) == 1:
+            lines.append(f"Сезон {seasons.pop()}.")
+        lines.append(f"Вес всей раздачи: {human_bytes(plan.get('total_size'))}.")
+        shown = []
+        for group in episodes[:24]:
+            label = f"серия {group['episode']}"
+            if len(seasons if isinstance(seasons, set) else []) > 1 and group.get("season"):
+                label = f"{group['season']}×{group['episode']}"
+            shown.append(f"{label} — {human_bytes(group['size'])}")
+        lines.append("")
+        lines.append("; ".join(shown))
+        if len(episodes) > 24:
+            lines.append(f"… и ещё {len(episodes) - 24} (номер можно указать в запросе)")
+        lines.append("")
+        lines.append("Выберите серию кнопкой ниже или нажмите «Скачать весь сезон».")
+        return "\n".join(lines)
+
+    def _episode_actions(self, task: Task, plan: dict[str, Any]) -> list[Action]:
+        actions: list[Action] = []
+        for group in (plan.get("episodes") or [])[:24]:
+            episode = group.get("episode")
+            season = group.get("season")
+            label = f"Серия {episode}"
+            if season and plan.get("season") and season != plan.get("season"):
+                label = f"{season}×{episode}"
+            actions.append(
+                Action(
+                    id=f"episode-{season}-{episode}",
+                    label=label,
+                    kind="choose_episode",
+                    payload={"task_id": task.id, "episode": episode, "season": season},
+                )
+            )
+        actions.append(
+            Action(
+                id="download-whole-pack",
+                label="Скачать весь сезон",
+                kind="download_all",
+                payload={"task_id": task.id},
+                style="primary" if not actions else "normal",
+            )
+        )
+        actions.append(
+            Action(
+                id="cancel-pack",
+                label="Отмена",
+                kind="cancel",
+                payload={"task_id": task.id},
+                style="danger",
+            )
+        )
+        return actions
+
+    def _confirm_card_text(self, task: Task, torrent: Torrent, plan: dict[str, Any]) -> str:
+        """Полная информация перед скачиванием: что, сколько и куда."""
+        storage = self.transmission.storage_info()
+        info = storage.to_dict()
+        needed = int(plan.get("size") or plan.get("total_size") or 0)
+        reserve = self.transmission.min_free_bytes()
+        fits = storage.ok and storage.free >= needed + reserve
+
+        lines = [f"Раздача: {torrent.title}", ""]
+        if torrent.qualities:
+            lines.append("• Качество: " + ", ".join(torrent.qualities[:3]))
+        if torrent.voices:
+            lines.append("• Озвучка: " + ", ".join(torrent.voices[:3]))
+        if plan.get("season") or plan.get("episode"):
+            season = plan.get("season")
+            episode = plan.get("episode")
+            season_text = f"Сезон {season}" if season else "Сезон —"
+            episode_text = f"серия {episode}" if episode else "серия —"
+            lines.append(f"• {season_text}, {episode_text}")
+        if torrent.size:
+            lines.append(f"• На трекере: {torrent.size}")
+
+        names = plan.get("names") or []
+        if plan.get("kind") == "single" and len(names) == 1:
+            lines.append(f"• Что качаем: {names[0]}")
+        elif names:
+            lines.append(f"• Что качаем: {_plural(len(names), 'файл', 'файла', 'файлов')}")
+            for name in names[:5]:
+                lines.append(f"    – {name}")
+            if len(names) > 5:
+                lines.append(f"    … и ещё {len(names) - 5}")
         else:
-            task.state = "done"
-            await self.store.save_task(task)
+            lines.append("• Что качаем: вся раздача")
 
-        text = (
-            f"Готово: «{torrent.title}»\n"
-            f"{describe(torrent)}\n"
-            f"Файл: {result['path']}"
-        )
-        if result["transmission"]:
-            text += f"\nTransmission: {result['transmission']}"
-        elif result.get("transmission_error"):
-            text += f"\nTransmission: не принял торрент — {result['transmission_error']}"
+        lines.append("")
+        lines.append(f"• Вес выбранного: {human_bytes(needed)}")
+        if plan.get("total_size") and needed != plan.get("total_size"):
+            lines.append(f"• Вес всей раздачи: {human_bytes(plan.get('total_size'))}")
+        if storage.ok:
+            lines.append(
+                f"• Диск «{info['volume']}»: свободно {info['free_human']} из "
+                f"{info['total_human']} (резерв {human_bytes(reserve)})"
+            )
+            lines.append(
+                "• Места хватает" if fits
+                else f"• ⚠ Места не хватает: нужно {human_bytes(needed + reserve)}"
+            )
+        else:
+            lines.append(f"• ⚠ Внешний диск недоступен: {storage.error}")
+        lines.append(f"• Куда: {self.settings.transmission_download_dir}")
 
-        message = turn.add(text, kind="task", task_id=task.id, payload={"task": task.to_dict()})
-        if task.state == "monitoring":
-            message.actions = self._task_actions(task)
-        await self.events.publish(
-            {
-                "type": "download_done",
-                "task_id": task.id,
-                "title": torrent.title,
-                "torrent_id": torrent.id,
-            }
+        lines.append("")
+        lines.append("Ставлю в Transmission?" if fits else "Всё равно поставить в очередь?")
+        return "\n".join(lines)
+
+    def _start_actions(self, task: Task, plan: dict[str, Any]) -> list[Action]:
+        actions = [
+            Action(
+                id="start-download",
+                label="Поставить в Transmission",
+                kind="start_download",
+                payload={"task_id": task.id},
+                style="primary",
+            )
+        ]
+        if plan.get("kind") == "episode" and plan.get("pack"):
+            actions.append(
+                Action(
+                    id="download-whole-pack",
+                    label="Скачать весь сезон",
+                    kind="download_all",
+                    payload={"task_id": task.id},
+                )
+            )
+        actions.append(
+            Action(
+                id="cancel-download",
+                label="Отмена",
+                kind="cancel",
+                payload={"task_id": task.id},
+                style="danger",
+            )
         )
-        await self.desktop.send("Торрент скачан", torrent.title[:120])
+        return actions
 
     async def _report_storage_problem(
         self, task: Task, torrent: Torrent, result: dict[str, Any], turn: Turn
@@ -981,51 +1281,123 @@ class Agent:
         await self.desktop.send("Нет места на внешнем диске", f"{torrent.title}"[:120])
         await self.push.send("Нет места на внешнем диске", text[:200])
 
-    async def _download(self, task: Task, torrent: Torrent) -> dict[str, Any]:
-        """Качает .torrent через MCP, ставит в Transmission и запоминает факт."""
-        # .torrent-файлы живут на внешнем диске вместе с загрузками, поэтому
-        # сначала проверяем, что он на месте: иначе MCP вернёт невнятный ENOENT.
-        try:
-            ensure_dir(self.settings.torrents_dir)
-        except TargetUnavailable as exc:
-            task.last_error = str(exc)
-            task.state = "failed"
-            await self.store.save_task(task)
-            journal.add(
-                "agent",
-                "не могу сохранить .torrent: диск недоступен",
-                {"ошибка": str(exc), "папка": str(self.settings.torrents_dir)},
-                level="error",
+    # ------------------------------------------------------------------
+    # Финальная постановка в очередь
+    # ------------------------------------------------------------------
+    async def _start_download(self, task: Task, turn: Turn, plan: dict[str, Any] | None = None,
+                              periodic_context: bool = False) -> None:
+        torrent = Torrent.from_dict(task.candidate or {})
+        plan = plan or (task.options or {}).get("plan") or {}
+        path_str = (task.options or {}).get("torrent_path") or ""
+        path = Path(path_str) if path_str else self.settings.torrents_dir / f"{torrent.id}.torrent"
+        if not path.exists():
+            turn.add(
+                "Torrent-файл пропал — начните задачу заново.",
+                kind="error",
+                task_id=task.id,
             )
-            return {
-                "ok": False,
-                "error": f"папка для torrent-файлов недоступна: {exc}",
-                "retryable": True,
-                "reason": "disk",
-                "path": None,
+            return
+
+        result = await self._finalize_download(task, torrent, path, plan)
+        if not result["ok"]:
+            if result.get("retryable"):
+                await self._report_storage_problem(task, torrent, result, turn)
+            else:
+                turn.add(
+                    f"Не удалось поставить «{torrent.title}» в очередь: {result['error']}",
+                    kind="error",
+                    task_id=task.id,
+                    payload={"task": task.to_dict()},
+                )
+            return
+
+        if periodic_context:
+            task.state = "monitoring"
+            self._schedule_next(task)
+        else:
+            task.state = "done"
+        await self.store.save_task(task)
+
+        text = self._downloaded_text(torrent, result, plan)
+        message = turn.add(text, kind="task", task_id=task.id, payload={"task": task.to_dict()})
+        if task.state == "monitoring":
+            message.actions = self._task_actions(task)
+        await self.events.publish(
+            {
+                "type": "download_done",
+                "task_id": task.id,
+                "title": torrent.title,
+                "torrent_id": torrent.id,
             }
+        )
+        await self.desktop.send("Торрент скачан", torrent.title[:120])
 
-        path = self.settings.torrents_dir / f"{torrent.id}.torrent"
-        result = await self.mcp.download(torrent.id, path)
-        if not result.get("success"):
-            task.last_error = str(result.get("message") or "неизвестная ошибка")
-            task.state = "failed"
-            await self.store.save_task(task)
-            return {"ok": False, "error": task.last_error}
+    async def _auto_download(self, task: Task, torrent: Torrent, turn: Turn) -> None:
+        """Скачивание без диалога (периодическая задача в режиме «качать сразу»)."""
+        result = await self._download(task, torrent)
+        if not result["ok"]:
+            if result.get("retryable"):
+                await self._report_storage_problem(task, torrent, result, turn)
+            else:
+                turn.add(
+                    f"Не удалось скачать «{torrent.title}»: {result['error']}",
+                    kind="error",
+                    task_id=task.id,
+                )
+            return
+        task.state = "monitoring" if task.kind == "periodic" else "done"
+        self._schedule_next(task)
+        await self.store.save_task(task)
+        message = turn.add(
+            self._downloaded_text(torrent, result, result.get("plan") or {}),
+            kind="task",
+            task_id=task.id,
+            payload={"task": task.to_dict()},
+        )
+        message.actions = self._task_actions(task)
+        await self.events.publish(
+            {"type": "download_done", "task_id": task.id, "title": torrent.title,
+             "torrent_id": torrent.id}
+        )
+        await self.desktop.send("Торрент скачан", torrent.title[:120])
 
+    def _downloaded_text(self, torrent: Torrent, result: dict[str, Any], plan: dict[str, Any]) -> str:
+        lines = [f"Готово: «{torrent.title}»"]
+        if plan.get("episode"):
+            season = f"сезон {plan['season']}, " if plan.get("season") else ""
+            lines.append(f"Качаю {season}серию {plan['episode']} — {human_bytes(plan.get('size'))}")
+        elif plan.get("size"):
+            lines.append(f"Качаю: {human_bytes(plan.get('size'))}")
+        if result.get("transmission"):
+            lines.append(f"Transmission: {result['transmission']}")
+        elif result.get("transmission_error"):
+            lines.append(f"Transmission: не принял торрент — {result['transmission_error']}")
+        lines.append(f"Torrent-файл: {result['path']}")
+        return "\n".join(lines)
+
+    async def _finalize_download(
+        self, task: Task, torrent: Torrent, path: Path, plan: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Ставит раздачу в очередь (с выбором файлов) и запоминает факт."""
+        wanted = plan.get("wanted")
+        need = plan.get("size") or plan.get("total_size")
+        added: dict[str, Any] = {}
         transmission_note = ""
         transmission_error = ""
         transmission_hash = ""
         try:
-            added = await self.transmission.add(path)
-            transmission_hash = str(added.get("hash") or "")
-            transmission_note = (
-                f"в очереди ({added.get('name') or torrent.title}) → "
-                f"{added.get('download_dir') or self.transmission.download_dir}"
+            added = await self.transmission.add(
+                path,
+                need_bytes=int(need) if need else None,
+                files_wanted=list(wanted) if wanted is not None else None,
             )
+            transmission_hash = str(added.get("hash") or "")
+            selected = len(added.get("files_selected") or [])
+            where = added.get("download_dir") or self.transmission.download_dir
+            transmission_note = f"в очереди ({added.get('name') or torrent.title}) → {where}"
+            if wanted is not None and selected:
+                transmission_note += f", файлов выбрано: {selected}"
         except (NotEnoughSpace, StorageUnavailable) as exc:
-            # Ключевое: раздача НЕ ставится в очередь и НЕ считается скачанной.
-            # Иначе агент «запомнил бы» её и больше не предложил, хотя файла нет.
             task.last_error = str(exc)
             task.state = "failed"
             await self.store.save_task(task)
@@ -1040,12 +1412,31 @@ class Agent:
             transmission_error = str(exc)
             log.warning("Transmission не принял торрент: %s", exc)
 
+        recorded = torrent
+        if plan.get("episode"):
+            # Запоминаем именно ту серию, которую скачали: иначе в памяти
+            # останется пачка «1–10», и следующая проверка решит, что серии
+            # 8–10 уже есть. У Torrent серия — вычисляемое свойство, поэтому
+            # подменяем список серий и сезоны, а не поле episode.
+            try:
+                recorded = replace(
+                    torrent,
+                    episodes=[int(plan["episode"])],
+                    seasons=(
+                        [int(plan["season"])]
+                        if plan.get("season") is not None
+                        else torrent.seasons
+                    ),
+                    episodes_total=torrent.episodes_total,
+                )
+            except Exception:  # noqa: BLE001
+                recorded = torrent
+
         await self.store.record_download(
-            task, torrent, str(path), transmission_hash, torrent_name=added.get("name") or ""
+            task, recorded, str(path), transmission_hash, torrent_name=added.get("name") or ""
         )
         task.last_result = f"скачано: {torrent.title}"
         task.last_error = ""
-        # Помним id в задаче, чтобы не качать одно и то же повторно.
         seen = list(task.params.get("seen_ids") or [])
         if torrent.id not in seen:
             seen.append(torrent.id)
@@ -1055,12 +1446,61 @@ class Agent:
             "path": str(path),
             "transmission": transmission_note,
             "transmission_error": transmission_error,
+            "plan": plan,
         }
+
+    async def _download(self, task: Task, torrent: Torrent) -> dict[str, Any]:
+        """Автоматический путь (периодические задачи): без диалога.
+
+        Если в раздаче пачка серий, качаем только новые относительно уже
+        скачанных — иначе «новая серия» тянула бы весь сезон заново.
+        """
+        path, error = await self._fetch_torrent(torrent)
+        if path is None:
+            task.last_error = error
+            task.state = "failed"
+            await self.store.save_task(task)
+            return {"ok": False, "error": error, "retryable": True, "reason": "disk", "path": None}
+
+        entries = parse_files(file_list(path))
+        plan = self._plan_files(task, entries)
+        if plan["kind"] == "choose":
+            season = plan.get("season")
+            baseline = 0
+            episodes_map = (task.params or {}).get("baseline_episodes") or {}
+            if season is not None:
+                baseline = int(episodes_map.get(str(season)) or 0)
+            if not baseline:
+                baseline = await self._last_episode_for(task)
+            picked = pick_new_episodes(entries, after_episode=baseline, season=season)
+            if picked:
+                plan = {**plan, "kind": "episode", "wanted": picked["indexes"],
+                        "size": picked["size"], "names": picked["names"],
+                        "episode": picked["episode"], "season": season}
+            else:
+                plan = {**plan, "kind": "all", "wanted": None, "size": plan.get("total_size")}
+
+        task.options = {**(task.options or {}), "plan": plan, "torrent_path": str(path)}
+        return await self._finalize_download(task, torrent, path, plan)
+
+    async def _last_episode_for(self, task: Task) -> int:
+        """Максимальная скачанная серия по сериалу задачи."""
+        record = await self.store.list_downloads(limit=200)
+        title = str((task.params or {}).get("title") or "")
+        best = 0
+        for item in record:
+            if title and title.lower() not in str(item.get("title") or "").lower():
+                continue
+            if item.get("episode"):
+                best = max(best, int(item["episode"]))
+        return best
 
     async def _retry_transmission(self, task: Task, turn: Turn) -> None:
         """Повторная попытка постановки уже скачанного .torrent в очередь."""
         torrent = Torrent.from_dict(task.candidate or {})
-        path = self.settings.torrents_dir / f"{torrent.id}.torrent"
+        plan = (task.options or {}).get("plan") or {}
+        path_str = (task.options or {}).get("torrent_path") or ""
+        path = Path(path_str) if path_str else self.settings.torrents_dir / f"{torrent.id}.torrent"
         if not path.exists():
             turn.add(
                 "Файл раздачи не найден — начните задачу заново.",
@@ -1068,8 +1508,13 @@ class Agent:
                 task_id=task.id,
             )
             return
+        wanted = plan.get("wanted")
         try:
-            added = await self.transmission.add(path)
+            added = await self.transmission.add(
+                path,
+                need_bytes=int(plan.get("size") or plan.get("total_size") or 0) or None,
+                files_wanted=list(wanted) if wanted is not None else None,
+            )
         except (NotEnoughSpace, StorageUnavailable) as exc:
             task.state = "failed"
             task.last_error = str(exc)
