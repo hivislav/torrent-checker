@@ -314,6 +314,55 @@ async def test_title_first() -> None:
     check("есть отмена", any(action.kind == "cancel" for action in message.actions), labels)
 
 
+async def test_many_series() -> None:
+    print("\n== в выдаче разные фильмы: спрашиваем раздачу, до 10 вариантов ==")
+    tmp = Path(tempfile.mkdtemp(prefix="many-"))
+    settings = dataclasses.replace(
+        get_settings(),
+        data_dir=tmp,
+        db_path=tmp / "many.sqlite3",
+        torrents_dir=tmp / "torrent-files",
+        transmission_download_dir=tmp / "torrents",
+    )
+    agent = Agent(settings)
+    titles = [
+        "Человек-паук: Новый день", "Человек-Паук", "Marvel Человек-Паук 2",
+        "Человек-паук 3: Враг в отражении", "MARVEL Человек-Паук. Обновлённая версия",
+        "Человек-Паук 2", "MARVEL Человек-Паук: Майлз Моралес", "Новый Человек-паук",
+        "Ваш дружелюбный сосед Человек-паук", "Человек-паук: Нет пути домой",
+        "Человек-паук 4", "Человек-паук 5",
+    ]
+    pool = [
+        Torrent(
+            id=str(100 + index),
+            title=f"{name} (2026) / WEB-DL (1080p)",
+            size="5 ГБ",
+            seeds=10 - index if index < 10 else 1,
+            series_title=name,
+            qualities=["1080p"],
+        ).to_dict()
+        for index, name in enumerate(titles)
+    ]
+    task = Task(
+        id="many-task", kind="oneshot", state="searching", session_id="checks",
+        user_query="Человек паук", params={"title": "Человек паук"},
+    )
+    task.options = {"pool": pool}
+    await agent.store.save_task(task)
+    turn = Turn()
+    await agent._selection_step(task, turn)
+    message = turn.messages[-1]
+    check("спрашиваем, какая раздача нужна", "Какой именно нужен?" in message.text, message.text[:160])
+    check("сказано, что это разные фильмы", "разные фильмы/сериалы" in message.text, message.text[:160])
+    buttons = [action.label for action in message.actions if action.kind == "choose"]
+    check("не больше 10 кнопок", len(buttons) <= 10, len(buttons))
+    check("в тексте ровно столько же строк", message.text.count("• ") == len(buttons),
+          (message.text.count("• "), len(buttons)))
+    check("кнопок качества нет",
+          not any("1080p" in label or "720p" in label for label in buttons), buttons)
+    agent.store.close()
+
+
 async def test_alternatives_and_pack() -> None:
     print("\n== варианты подписаны, сезон предлагается кнопкой ==")
     tmp = Path(tempfile.mkdtemp(prefix="pack-"))
@@ -373,6 +422,7 @@ async def main() -> int:
     await test_fetch_torrent()
     await test_ask_dimension()
     await test_title_first()
+    await test_many_series()
     await test_card_without_torrent()
     await test_alternatives_and_pack()
     print("\n=== ИТОГ ===")

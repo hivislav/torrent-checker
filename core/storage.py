@@ -464,6 +464,35 @@ class Store:
     # ------------------------------------------------------------------
     # настройки
     # ------------------------------------------------------------------
+    async def history_since(
+        self, session_id: str, after_id: int, limit: int = 60
+    ) -> list[dict[str, Any]]:
+        """Сообщения сессии позже указанной метки (для сброшенного окна)."""
+
+        def run(conn: sqlite3.Connection):
+            cursor = conn.execute(
+                "SELECT * FROM messages WHERE session_id = ? AND id > ? "
+                "ORDER BY id DESC LIMIT ?",
+                (session_id, int(after_id), limit),
+            )
+            rows = [dict(row) for row in cursor.fetchall()]
+            rows.reverse()
+            return rows
+
+        return await self._call(run)
+
+    async def last_message_id(self, session_id: str) -> int:
+        """id последнего сообщения сессии — метка «всё, что было раньше, не в окне»."""
+
+        def run(conn: sqlite3.Connection):
+            cursor = conn.execute(
+                "SELECT IFNULL(MAX(id), 0) FROM messages WHERE session_id = ?",
+                (session_id,),
+            )
+            return int(cursor.fetchone()[0])
+
+        return await self._call(run)
+
     async def get_setting(self, key: str, default: str = "") -> str:
         def run(conn: sqlite3.Connection):
             cursor = conn.execute("SELECT value FROM settings WHERE key = ?", (key,))

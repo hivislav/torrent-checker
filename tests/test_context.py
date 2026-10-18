@@ -73,6 +73,42 @@ async def test_window() -> None:
     agent.store.close()
 
 
+async def test_reset() -> None:
+    print("\n== сброс окна после отмены и старта скачивания ==")
+    agent = make_agent("reset-")
+    session = "reset"
+    for index in range(6):
+        role = "user" if index % 2 == 0 else "agent"
+        await agent.store.add_message(session, Message(role=role, text=f"старое {index}"))
+    window = await agent._context_window(session)  # noqa: SLF001
+    check("до сброса окно не пустое", len(window) == 6, len(window))
+
+    await agent.store.add_message(session, Message(role="user", text="новое после сброса"))
+    await agent._reset_context(session)  # noqa: SLF001
+    window = await agent._context_window(session)  # noqa: SLF001
+    check("после сброса окно пустое", window == [], window)
+
+    await agent.store.add_message(session, Message(role="user", text="совсем новое"))
+    window = await agent._context_window(session)  # noqa: SLF001
+    check("новые сообщения в окно попадают", [item["text"] for item in window] == ["совсем новое"], window)
+
+    # Отмена задачи тоже сбрасывает окно (кнопка «Отмена» в картотеке).
+    task = Task(
+        id="reset-task",
+        kind="oneshot",
+        state="awaiting_choice",
+        session_id=session,
+        user_query="Тед Лассо",
+        params={"title": "Тед Лассо"},
+    )
+    await agent.store.save_task(task)
+    await agent.store.add_message(session, Message(role="agent", text="какое качество?"))
+    await agent.cancel_task(task.id)
+    window = await agent._context_window(session)  # noqa: SLF001
+    check("отмена задачи сбрасывает окно", window == [], window)
+    agent.store.close()
+
+
 async def test_prompt() -> None:
     print("\n== окно попадает в запрос к модели ==")
     agent = make_agent()
@@ -169,8 +205,16 @@ async def test_live_dialog() -> None:
     print("\n== живой диалог (через модель) ==")
     import httpx
 
+    import sqlite3
+
     settings = get_settings()
     base = f"https://127.0.0.1:{settings.site_port}"
+    # Тест пишет в живой чат: после прогона убираем и сообщения, и задачу,
+    # иначе человек увидит в «Киножурнале» чужие запросы.
+    conn = sqlite3.connect(str(settings.db_path))
+    start_msg = conn.execute("SELECT IFNULL(MAX(id), 0) FROM messages").fetchone()[0]
+    start_tasks = {row[0] for row in conn.execute("SELECT id FROM tasks")}
+    conn.close()
     try:
         async with httpx.AsyncClient(verify=False, timeout=240) as client:
             login = await client.post(f"{base}/api/login", json={"password": settings.site_password})
@@ -200,10 +244,22 @@ async def test_live_dialog() -> None:
             check("агент сказал, что уточнил", "Уточнил" in texts, texts[:120])
     except Exception as exc:  # noqa: BLE001
         print("  (проверка пропущена:", str(exc)[:80], ")")
+    finally:
+        conn = sqlite3.connect(str(settings.db_path))
+        conn.execute("DELETE FROM messages WHERE id > ?", (start_msg,))
+        conn.execute(
+            "DELETE FROM tasks WHERE id NOT IN ("
+            + ",".join("?" for _ in start_tasks or {""})
+            + ")",
+            tuple(start_tasks or {""}),
+        )
+        conn.commit()
+        conn.close()
 
 
 async def main() -> int:
     await test_window()
+    await test_reset()
     await test_prompt()
     test_refinement_rules()
     await test_merge()

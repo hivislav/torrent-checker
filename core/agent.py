@@ -436,9 +436,11 @@ class Agent:
 
         if kind == "cancel" and task is None:
             # Отмена подтверждения (например, удаления) — задачи тут может не быть.
+            await self._reset_context(session_id)
             turn.add("Отменено, ничего не трогаю.")
         elif kind == "cancel" and task:
             await self.cancel_task(task.id)
+            await self._reset_context(session_id)
             turn.add(
                 f"Задача «{task.title}» отменена.",
                 kind="task",
@@ -653,6 +655,9 @@ class Agent:
         task.state = "cancelled"
         task.next_check_at = None
         await self.store.save_task(task)
+        # Отмена — граница истории: следующий запрос не должен тянуть
+        # в контекст переписку о брошенной задаче.
+        await self._reset_context(task.session_id)
         await self.events.publish(
             {"type": "task_cancelled", "task_id": task.id, "title": task.title}
         )
@@ -777,7 +782,17 @@ class Agent:
         длинные ответы агента, чтобы не жечь токены на простыни карточек.
         """
         limit = limit or self.settings.context_messages
-        rows = await self.store.history(session_id, limit=limit)
+        # После отмены задачи или старта скачивания окно сбрасывается: чат
+        # остаётся на экране, но модель больше не видит прошлую переписку и
+        # не подмешивает её в новый поиск.
+        try:
+            since = int(await self.store.get_setting(f"context_from:{session_id}", "0") or 0)
+        except (TypeError, ValueError):
+            since = 0
+        if since:
+            rows = await self.store.history_since(session_id, since, limit=limit)
+        else:
+            rows = await self.store.history(session_id, limit=limit)
         window: list[dict[str, str]] = []
         for row in rows:
             role = "assistant" if row.get("role") == "agent" else row.get("role")
@@ -790,6 +805,20 @@ class Agent:
                 text = text[:400] + "…"
             window.append({"role": role, "text": text})
         return window
+
+    async def _reset_context(self, session_id: str) -> None:
+        """Обнуляет скользящее окно для новой задачи.
+
+        Сообщения не удаляются (человек видит историю в чате), но модель
+        получает только то, что было после этой метки.
+        """
+        if not session_id:
+            return
+        try:
+            top = await self.store.last_message_id(session_id)
+            await self.store.set_setting(f"context_from:{session_id}", str(top))
+        except Exception as exc:  # noqa: BLE001 - сброс окна не должен ронять ответ
+            log.warning("не удалось сбросить контекст: %s", exc)
 
     def _context_prompt(self, window: list[dict[str, str]], active: Task | None) -> str:
         """Собирает историю и состояние задачи в один текстовый блок для модели."""
@@ -1090,7 +1119,27 @@ class Agent:
         ranked = rank(fresh, params)
         suggestions = (task.options or {}).get("suggestions") or []
         if suggestions and ranked and self._missing_tokens(task.title, ranked[0].title):
-            await self._ask_title(task, suggestions, len(fresh), turn)
+            await self._ask_title(task, suggestions[:10], len(fresh), turn, weak=True)
+            return
+
+        # В выдаче разные фильмы/сериалы — сначала выбираем раздачу. Качество
+        # спрашивать раньше бессмысленно: оно относится к конкретному релизу.
+        groups: dict[str, list[Torrent]] = {}
+        for item in fresh:
+            name = (item.series_title or "").strip() or (item.title or "").strip()
+            key = normalize(name)
+            if key:
+                groups.setdefault(key, []).append(item)
+        if len(groups) > 1:
+            options = [
+                {
+                    "title": (items[0].series_title or items[0].title).strip(),
+                    "torrent_id": items[0].id,
+                    "count": len(items),
+                }
+                for items in sorted(groups.values(), key=lambda chunk: -len(chunk))[:10]
+            ]
+            await self._ask_title(task, options, len(fresh), turn, weak=False)
             return
 
         # Не хватает параметров — предлагаем только то, что реально есть
@@ -1118,31 +1167,42 @@ class Agent:
         await self._present_candidate(task, best_list, turn)
 
     async def _ask_title(
-        self, task: Task, suggestions: list[dict], found_count: int, turn: Turn
+        self,
+        task: Task,
+        suggestions: list[dict],
+        found_count: int,
+        turn: Turn,
+        *,
+        weak: bool = True,
     ) -> None:
-        """Название не совпало — спрашиваем, какой сериал имелся в виду.
+        """Спрашиваем, какая раздача имеется в виду.
 
-        Качество и озвучку спрашивать раньше времени бессмысленно: они
-        относятся к раздачам чужого сериала.
+        Два повода: название не совпало с найденным (`weak=True`) или в выдаче
+        оказались разные фильмы/сериалы. Качество и озвучку спрашивать раньше
+        времени бессмысленно: они относятся к конкретному релизу.
         """
-        lines = [
-            f"По запросу «{task.title}» нашлось "
-            f"{_plural(found_count, 'раздача', 'раздачи', 'раздач')}, но это другие сериалы.",
-            "",
-            "Какой сериал вы имели в виду?",
-            "",
-        ]
-        for item in suggestions[:5]:
-            lines.append(f"• {item['title']}")
+        plural = _plural(found_count, 'раздача', 'раздачи', 'раздач')
+        if weak:
+            head = f"По запросу «{task.title}» нашлось {plural}, но это другие сериалы."
+            question = "Какой сериал вы имели в виду?"
+        else:
+            head = f"По запросу «{task.title}» нашлось {plural} — это разные фильмы/сериалы."
+            question = "Какой именно нужен?"
+        lines = [head, "", question, ""]
+        for item in suggestions[:10]:
+            line = f"• {item['title']}"
+            if item.get("count"):
+                line += f" — {_plural(int(item['count']), 'раздача', 'раздачи', 'раздач')}"
+            lines.append(line)
         lines.append("")
-        lines.append("Кнопка выберет название — и я поищу заново уже по нему.")
+        lines.append("Кнопка выберет раздачу — и я поищу заново уже по ней.")
         message = turn.add(
             "\n".join(lines),
             kind="tickets",
             task_id=task.id,
             payload={"task": task.to_dict(), "suggestions": suggestions},
         )
-        for item in suggestions[:5]:
+        for item in suggestions[:10]:
             message.actions.append(
                 Action(
                     id=f"similar-title-{item['torrent_id']}",
@@ -1175,7 +1235,7 @@ class Agent:
         lines.append("Выберите название кнопкой — поищу заново по нему.")
         message = turn.add("\n".join(lines), kind="tickets", task_id=task.id,
                            payload={"task": task.to_dict(), "suggestions": suggestions})
-        for item in suggestions[:5]:
+        for item in suggestions[:10]:
             message.actions.append(
                 Action(
                     id=f"title-{item['torrent_id']}",
@@ -2549,6 +2609,8 @@ class Agent:
                               periodic_context: bool = False) -> None:
         torrent = Torrent.from_dict(task.candidate or {})
         plan = plan or (task.options or {}).get("plan") or {}
+        # Человек подтвердил скачивание — прошлая переписка больше не нужна.
+        await self._reset_context(task.session_id)
         path_str = (task.options or {}).get("torrent_path") or ""
         path = Path(path_str) if path_str else self.settings.torrents_dir / f"{torrent.id}.torrent"
         if not path.exists():
