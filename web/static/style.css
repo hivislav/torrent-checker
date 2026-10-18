@@ -162,7 +162,7 @@ body {
 
 .panel__title {
   font-family: var(--mono);
-  font-size: 11px;
+  font-size: 12px;
   letter-spacing: .34em;
   text-transform: uppercase;
   color: var(--amber);
@@ -265,7 +265,7 @@ body {
 .task-card--not_found { border-left-color: var(--ink-faint); }
 
 .task-card__title {
-  font-size: 14px;
+  font-size: 15.5px;
   line-height: 1.3;
   margin: 0 0 4px;
   color: var(--ink);
@@ -274,7 +274,7 @@ body {
 
 .task-card__meta {
   font-family: var(--mono);
-  font-size: 10px;
+  font-size: 11px;
   letter-spacing: .06em;
   color: var(--ink-faint);
   display: flex;
@@ -296,7 +296,7 @@ body {
 
 .status-grid {
   font-family: var(--mono);
-  font-size: 10.5px;
+  font-size: 11.5px;
   line-height: 1.7;
   color: var(--ink-faint);
   display: grid;
@@ -321,7 +321,7 @@ body {
 /* ---------- Кнопки ---------- */
 .btn {
   font-family: var(--mono);
-  font-size: 10.5px;
+  font-size: 11.5px;
   letter-spacing: .12em;
   text-transform: uppercase;
   padding: 7px 11px;
@@ -342,7 +342,7 @@ body {
 .btn--primary:hover { filter: brightness(1.08); }
 .btn--danger { border-color: #6b2a20; color: #e0a090; }
 .btn--danger:hover { border-color: var(--red); color: #ffd0c4; }
-.btn--tiny { padding: 4px 8px; font-size: 9.5px; }
+.btn--tiny { padding: 4px 8px; font-size: 10.5px; }
 .btn--ghost { background: transparent; }
 
 .link-btn {
@@ -351,7 +351,7 @@ body {
   border: none;
   color: var(--amber);
   font-family: var(--mono);
-  font-size: 9.5px;
+  font-size: 10.5px;
   letter-spacing: .1em;
   text-transform: lowercase;
   cursor: pointer;
@@ -407,7 +407,7 @@ body {
 
 .marquee__title {
   margin: 0;
-  font-size: 22px;
+  font-size: 24px;
   letter-spacing: .22em;
   text-transform: uppercase;
   color: var(--amber-bright);
@@ -418,7 +418,7 @@ body {
 .marquee__subtitle {
   margin: 2px 0 0;
   font-family: var(--mono);
-  font-size: 9.5px;
+  font-size: 10.5px;
   letter-spacing: .2em;
   text-transform: uppercase;
   color: var(--ink-faint);
@@ -481,7 +481,7 @@ body {
 }
 .notification-tray__list { display: flex; flex-direction: column; gap: 8px; }
 .notification-item {
-  font-size: 12.5px;
+  font-size: 13.5px;
   line-height: 1.45;
   color: var(--ink-dim);
   padding: 8px 10px;
@@ -518,17 +518,17 @@ body {
 }
 .chat__intro-title {
   margin: 0 0 10px;
-  font-size: 18px;
+  font-size: 19.5px;
   color: var(--amber-bright);
   letter-spacing: .04em;
 }
-.chat__intro-text { margin: 0 0 12px; color: var(--ink-dim); font-size: 13.5px; line-height: 1.6; }
+.chat__intro-text { margin: 0 0 12px; color: var(--ink-dim); font-size: 15px; line-height: 1.6; }
 .chat__legend {
   margin: 0;
   padding: 0;
   list-style: none;
   text-align: left;
-  font-size: 12.5px;
+  font-size: 13.5px;
   line-height: 1.6;
   color: var(--ink-faint);
 }
@@ -600,7 +600,7 @@ body {
   align-items: center;
   gap: 10px;
   font-family: var(--mono);
-  font-size: 9px;
+  font-size: 10px;
   letter-spacing: .18em;
   text-transform: uppercase;
   color: var(--ink-faint);
@@ -611,7 +611,7 @@ body {
 .msg__time { margin-left: auto; opacity: .7; }
 
 .msg__text {
-  font-size: 14px;
+  font-size: 15.5px;
   line-height: 1.6;
   color: var(--ink);
   white-space: pre-wrap;
@@ -632,7 +632,7 @@ body {
   gap: 5px;
   align-items: center;
   font-family: var(--mono);
-  font-size: 10px;
+  font-size: 11px;
   letter-spacing: .16em;
   text-transform: uppercase;
   color: var(--ink-faint);
@@ -685,11 +685,11 @@ body {
 .mode-btn__label {
   grid-area: label;
   font-family: var(--mono);
-  font-size: 11px;
+  font-size: 12px;
   letter-spacing: .15em;
   text-transform: uppercase;
 }
-.mode-btn__hint { grid-area: hint; font-size: 10.5px; color: var(--ink-faint); }
+.mode-btn__hint { grid-area: hint; font-size: 11.5px; color: var(--ink-faint); }
 .mode-btn:hover { border-color: var(--line); color: var(--ink); }
 
 .mode-btn.is-active {
@@ -714,7 +714,7 @@ body {
   resize: none;
   padding: 13px 14px;
   font-family: var(--serif);
-  font-size: 14.5px;
+  font-size: 16px;
   line-height: 1.45;
   color: var(--ink);
   background: rgba(0, 0, 0, .42);
@@ -747,7 +747,7 @@ body {
 .composer__hint {
   margin: 8px 0 0;
   font-family: var(--mono);
-  font-size: 9.5px;
+  font-size: 10.5px;
   letter-spacing: .1em;
   color: var(--ink-faint);
   text-transform: uppercase;
@@ -778,17 +778,17 @@ body {
 }
 .modal__title {
   margin: 0 0 8px;
-  font-size: 18px;
+  font-size: 19.5px;
   letter-spacing: .1em;
   color: var(--amber-bright);
   text-transform: uppercase;
 }
-.modal__note { margin: 0 0 14px; font-size: 12.5px; line-height: 1.55; color: var(--ink-faint); }
+.modal__note { margin: 0 0 14px; font-size: 13.5px; line-height: 1.55; color: var(--ink-faint); }
 .field { display: block; margin-bottom: 11px; }
 .field span {
   display: block;
   font-family: var(--mono);
-  font-size: 9.5px;
+  font-size: 10.5px;
   letter-spacing: .16em;
   text-transform: uppercase;
   color: var(--ink-faint);
@@ -798,7 +798,7 @@ body {
   width: 100%;
   padding: 10px 12px;
   font-family: var(--mono);
-  font-size: 13px;
+  font-size: 14.5px;
   color: var(--ink);
   background: rgba(0, 0, 0, .4);
   border: 1px solid var(--line);
@@ -811,7 +811,7 @@ body {
   margin: 14px 0 0;
   padding: 10px;
   font-family: var(--mono);
-  font-size: 10.5px;
+  font-size: 11.5px;
   line-height: 1.5;
   color: var(--ink-dim);
   background: rgba(0, 0, 0, .4);
@@ -861,7 +861,32 @@ body {
 
   .chat { padding: 14px 12px 6px; gap: 13px; }
   .msg { max-width: 100%; }
+
+  /* На телефоне кегль остаётся прежним: тот же текст, но в узкой колонке
+     крупнее читать неудобно — строки становятся слишком короткими. Крупнее
+     он только в полной (настольной) версии. */
   .msg__text { font-size: 13.5px; }
+  .msg__meta { font-size: 9px; }
+  .msg__pending { font-size: 10px; }
+  .panel__title { font-size: 11px; }
+  .task-card__title { font-size: 14px; }
+  .task-card__meta { font-size: 10px; }
+  .btn { font-size: 10.5px; }
+  .btn--tiny { font-size: 9.5px; }
+  .link-btn { font-size: 9.5px; }
+  .notification-item { font-size: 12.5px; }
+  .chat__intro-title { font-size: 18px; }
+  .chat__intro-text { font-size: 13.5px; }
+  .chat__legend { font-size: 12.5px; }
+  .mode-btn__label { font-size: 11px; }
+  .mode-btn__hint { font-size: 10.5px; }
+  .composer__input { font-size: 14.5px; }
+  .modal__title { font-size: 18px; }
+  .modal__note { font-size: 12.5px; }
+  .field span { font-size: 9.5px; }
+  .field input { font-size: 13px; }
+  .modal__result { font-size: 10.5px; }
+  .status-grid { font-size: 10.5px; }
 
   .composer { padding: 10px 12px calc(12px + env(safe-area-inset-bottom)); }
   .composer__modes { max-width: none; }
