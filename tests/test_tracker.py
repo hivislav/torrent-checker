@@ -506,6 +506,67 @@ async def test_periodic_keeps_working() -> None:
     agent.store.close()
 
 
+async def test_narrow_by_words() -> None:
+    print("\n== уточнение словами внутри найденного ==")
+    tmp = Path(tempfile.mkdtemp(prefix="narrow-"))
+    settings = dataclasses.replace(
+        get_settings(),
+        data_dir=tmp,
+        db_path=tmp / "narrow.sqlite3",
+        torrents_dir=tmp / "torrent-files",
+        transmission_download_dir=tmp / "torrents",
+    )
+    agent = Agent(settings)
+    task = Task(
+        id="narrow-task", kind="oneshot", state="awaiting_choice", session_id="checks",
+        user_query="человек паук", params={"title": "Человек-паук"},
+    )
+    pool = [
+        Torrent(id="1", title="Человек-паук: Новый день / Spider-Man: Brand New Day / 2026 / WEB-DL (1080p)",
+                series_title="Человек-паук: Новый день", qualities=["1080p"]),
+        Torrent(id="2", title="Человек-паук: Нет пути домой / Spider-Man: No Way Home / 2021 / BDRip (1080p)",
+                series_title="Человек-паук: Нет пути домой", qualities=["1080p"]),
+    ]
+    task.options = {"pool": [item.to_dict() for item in pool]}
+    await agent.store.save_task(task)
+
+    class CombinedMCP:
+        """Трекер не отдаёт «Возвращение домой» в первой выдаче — только по словам вместе."""
+
+        def __init__(self) -> None:
+            self.downloads = 0
+
+        async def search_pages(self, query: str, pages: int = 1):
+            if query.lower().startswith("человек-паук возвращение"):
+                return [row("2018265",
+                            "Человек-паук: Возвращение домой / Spider-Man: Homecoming / 2017 / "
+                            "РУ / BDRip (1080p)")]
+            return []
+
+        async def file_list(self, torrent_id: str) -> dict:
+            return {"success": True, "files": [
+                {"name": "Spider-Man.Homecoming.2017.BDRip.1080p.mkv", "size": 5 * 1024 ** 3},
+            ]}
+
+        async def download(self, torrent_id: str, path: Path) -> dict:
+            self.downloads += 1
+            return {"success": False, "message": "не сегодня"}
+
+    agent.mcp = CombinedMCP()  # type: ignore[assignment]
+    turn = Turn()
+    ok = await agent._narrow_pool(task, "возвращение", turn)
+    check("сужение по словам сработало", ok, [message.text[:80] for message in turn.messages])
+    check("название сложилось", "возвращение" in task.title.lower(), task.title)
+    text = turn.messages[-1].text if turn.messages else ""
+    check("нашлась именно та раздача", "Возвращение домой" in text or "28" in text, text[:200])
+
+    # Совсем не наше слово — не уточнение, пусть идёт новый поиск.
+    turn2 = Turn()
+    ok2 = await agent._narrow_pool(task, "извне", turn2)
+    check("чужое слово не приклеивается", not ok2, turn2.messages and turn2.messages[-1].text[:80])
+    agent.store.close()
+
+
 async def test_alternatives_and_pack() -> None:
     print("\n== варианты подписаны, сезон предлагается кнопкой ==")
     tmp = Path(tempfile.mkdtemp(prefix="pack-"))
@@ -568,6 +629,7 @@ async def main() -> int:
     await test_many_series()
     await test_lost_aliases()
     await test_periodic_keeps_working()
+    await test_narrow_by_words()
     await test_card_without_torrent()
     await test_alternatives_and_pack()
     print("\n=== ИТОГ ===")

@@ -29,7 +29,12 @@
    поэтому кнопка «показать/скрыть» в архиве выглядела нерабочей. */
 [hidden] { display: none !important; }
 
-html, body {
+html {
+  height: 100%;
+  overflow: hidden;
+}
+
+body {
   margin: 0;
   padding: 0;
   height: 100%;
@@ -148,7 +153,11 @@ body {
   grid-template-columns: 340px 1fr;
   height: 100vh;
   height: 100dvh;
-  position: relative;
+  /* В Safari страница «резинилась» при свайпе по шапке или панели — верхняя
+     панель уезжала из вида. Фиксированный каркас: скроллится только чат. */
+  position: fixed;
+  inset: 0 auto auto 0;
+  width: 100%;
   z-index: 10;
   padding: 0 var(--rail);
   /* Запуск с домашнего экрана (standalone, status bar black-translucent)

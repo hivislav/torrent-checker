@@ -291,6 +291,18 @@ class Agent:
         # Уточнение ищем только среди задач того же типа, что запрошен кнопкой.
         active = await self._active_task(session_id, kind=effective_mode)
 
+        # Дополнение к уточнению: сначала ответили списком названий, потом человек
+        # добавил слово («возвращение»). Ищем внутри уже найденного, а не с нуля.
+        if (
+            active is not None
+            and active.state == "awaiting_choice"
+            and self._is_extra_words(text)
+            and await self._narrow_pool(active, text, turn)
+        ):
+            turn.task = await self.store.get_task(active.id)
+            await self._remember_many(session_id, turn.messages)
+            return turn
+
         # Уточнение к текущей задаче — правим её, а не заводим новую.
         refined = active is not None and self._is_refinement(text, parsed, active)
         if active is not None and not refined:
@@ -432,6 +444,85 @@ class Agent:
         """Убирает пунктуацию по краям: «Извне!» → «Извне»."""
         cleaned = re.sub(r"[«»\"'.,!?:;()\[\]]+", " ", str(text or ""))
         return re.sub(r"\s+", " ", cleaned).strip()
+
+    def _is_extra_words(self, text: str) -> bool:
+        """Похоже на уточняющие слова к названию («возвращение», «нет пути домой»)."""
+        cleaned = self._clean_title_text(text)
+        if not cleaned or re.search(r"\d", cleaned):
+            return False
+        tokens = [token for token in cleaned.lower().split() if token]
+        if not tokens or len(tokens) > 3:
+            return False
+        if any(word in cleaned.lower() for word in self.REFINE_KEYWORDS):
+            return False
+        return any(token not in self.REFINE_STOPWORDS for token in tokens)
+
+    async def _narrow_pool(self, task: Task, text: str, turn: Turn) -> bool:
+        """Сужает найденное по новым словам, не выходя на трекер заново.
+
+        «человек паук» дало 80 раздач с разными фильмами; человек пишет
+        «возвращение» — берём только те, где это слово есть в названии.
+        """
+        pool = [Torrent.from_dict(item) for item in (task.options or {}).get("pool", [])]
+        if not pool:
+            return False
+        tokens = self._significant_tokens(text)
+        if not tokens:
+            return False
+        narrowed = [
+            item
+            for item in pool
+            if all(token in normalize(item.title) for token in tokens)
+        ]
+        old_title = str((task.params or {}).get("title") or task.title)
+        if not narrowed:
+            # В уже найденном такого нет — спрашиваем трекер словами вместе:
+            # «человек паук» + «возвращение» находит «Человек-паук: Возвращение домой».
+            combined_query = f"{old_title} {text}".strip()
+            try:
+                rows = await self.mcp.search_pages(combined_query, pages=1)
+            except MCPError as exc:
+                journal.add(
+                    "agent", "поиск уточнения не удался",
+                    {"запрос": combined_query, "ошибка": str(exc)}, level="warn",
+                )
+                rows = []
+            narrowed = [
+                torrent
+                for torrent in (parse_torrent(raw) for raw in rows)
+                if torrent.id and all(token in normalize(torrent.title) for token in tokens)
+            ]
+            if narrowed:
+                journal.add(
+                    "agent",
+                    "уточнение искали на трекере вместе с названием",
+                    {"запрос": combined_query, "найдено": len(narrowed)},
+                )
+        if not narrowed:
+            return False
+        if narrowed == pool:
+            # Ничего не сузилось — считаем это новым запросом, а не уточнением.
+            return False
+        journal.add(
+            "agent",
+            "сужение по словам запроса",
+            {"добавлено": text, "было": len(pool), "осталось": len(narrowed),
+             "название": old_title},
+        )
+        task.params = {**(task.params or {}), "title": f"{old_title} {text}".strip()}
+        task.options = {**(task.options or {}), "pool": [item.to_dict() for item in narrowed],
+                        "suggestions": []}
+        task.state = "searching"
+        task.user_query = f"{task.user_query} | {text}"[:400]
+        await self.store.save_task(task)
+        turn.add(
+            f"Сузил поиск по «{task.title}»: подходит "
+            f"{_plural(len(narrowed), 'раздача', 'раздачи', 'раздач')}.",
+            kind="text",
+            task_id=task.id,
+        )
+        await self._selection_step(task, turn)
+        return True
 
     def _text_about_title(self, text: str, title: str) -> bool:
         """Текст относится к этому названию? («Тед Лассо» ⊂ «Тед Лассо»)."""
@@ -1235,6 +1326,20 @@ class Agent:
     # ------------------------------------------------------------------
     # Разовая задача
     # ------------------------------------------------------------------
+    async def _same_title_task(self, session_id: str, title: str) -> Task | None:
+        """Незакрытая задача этой сессии с тем же названием (чтобы не плодить дубли)."""
+        wanted = normalize(title)
+        if not wanted:
+            return None
+        for task in await self.store.list_tasks(limit=50):
+            if task.session_id != session_id or task.state not in self.RESUME_STATES:
+                continue
+            if task.kind != "oneshot":
+                continue
+            if normalize(str((task.params or {}).get("title") or "")) == wanted:
+                return task
+        return None
+
     async def _close_stale_tasks(
         self, session_id: str, kind: str, keep_id: str = ""
     ) -> None:
@@ -1272,7 +1377,29 @@ class Agent:
             )
             return
 
-        task = await self._task_from_params(session_id, text, parsed, kind="oneshot")
+        same = await self._same_title_task(session_id, str(parsed.get("title") or ""))
+        if same is not None:
+            journal.add(
+                "agent",
+                "продолжаю прежнюю задачу с тем же названием",
+                {"задача": same.id, "название": same.title},
+            )
+            task = same
+            task.params = {
+                **task.params,
+                **{
+                    key: value
+                    for key, value in parsed.items()
+                    if key in ("title", "original_title", "quality", "voice", "season",
+                               "episode_from", "year", "type", "aliases")
+                    and value not in (None, "", "null", [])
+                },
+            }
+            task.state = "searching"
+            task.user_query = text
+            await self.store.save_task(task)
+        else:
+            task = await self._task_from_params(session_id, text, parsed, kind="oneshot")
         await self._close_stale_tasks(session_id, "oneshot", keep_id=task.id)
         turn.task = task
         turn.add(

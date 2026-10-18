@@ -76,7 +76,11 @@ def run() -> int:
                 """async () => {
                     const data = await (await fetch('/api/tasks')).json();
                     const states = new Set(['awaiting_choice','awaiting_confirm','awaiting_setup','monitoring']);
-                    const ids = (data.tasks || []).filter(t => states.has(t.state)).map(t => t.id);
+                    // Периодические задачи не трогаем: это чужие часовые
+                    // задачи, тест не должен их закрывать.
+                    const ids = (data.tasks || [])
+                      .filter(t => states.has(t.state) && t.kind !== 'periodic')
+                      .map(t => t.id);
                     for (const id of ids) {
                       await fetch(`/api/tasks/${id}/cancel`, {method: 'POST'});
                     }
@@ -307,7 +311,7 @@ def run() -> int:
     placeholders = ",".join("?" for _ in start_tasks) or "''"
     conn.execute(
         f"UPDATE tasks SET state = 'cancelled' "
-        f"WHERE id NOT IN ({placeholders})",
+        f"WHERE id NOT IN ({placeholders}) AND kind <> 'periodic'",
         tuple(start_tasks),
     )
     conn.commit()
