@@ -216,6 +216,8 @@
       if (message.task_id) state.lastTaskId = message.task_id;
     }
     refreshTasks();
+    // Освободилось/занялось место — строка про диск не должна врать.
+    refreshStatus();
   }
 
   // ------------------------------------------------------------------
@@ -435,6 +437,7 @@
           event.target.disabled = true;
           try {
             await api(`/api/tasks/${task.id}/cancel`, { method: "POST" });
+            refreshStatus();
             renderMessage({
               role: "agent",
               text: `Задача «${task.params?.title || task.user_query}» отменена.`,
@@ -582,9 +585,12 @@
   // ------------------------------------------------------------------
   // Статус
   // ------------------------------------------------------------------
+  let statusBusy = false;
   async function refreshStatus() {
+    if (statusBusy) return;   // не плодим параллельные запросы
+    statusBusy = true;
     const box = $("status-grid");
-    box.textContent = "проверяю…";
+    if (!box.children.length) box.textContent = "проверяю…";
     try {
       const status = await api("/api/status");
       const rows = [];
@@ -642,6 +648,8 @@
         .join("");
     } catch (error) {
       box.innerHTML = `<b>статус</b><span class="status-bad">${error.message}</span>`;
+    } finally {
+      statusBusy = false;
     }
   }
 
@@ -686,7 +694,10 @@
           pushNotification(data.message);
         }
         refreshTasks();
-      } else if (data.type === "download_complete" || data.type === "download_progress") {
+      } else if (data.type === "download_complete") {
+        refreshTasks();
+        refreshStatus();
+      } else if (data.type === "download_progress") {
         refreshTasks();
       } else if (
         data.type === "download_done" ||
@@ -694,6 +705,7 @@
         data.type === "task_cancelled"
       ) {
         refreshTasks();
+        refreshStatus();
       }
     };
     source.onerror = () => {
@@ -1089,7 +1101,7 @@
     await refreshStatus();
     connectEvents();
     setInterval(refreshTasks, 5000);
-    setInterval(refreshStatus, 60000);
+    setInterval(refreshStatus, 30000);
   }
 
   document.addEventListener("DOMContentLoaded", init);

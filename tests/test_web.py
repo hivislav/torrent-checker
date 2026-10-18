@@ -85,26 +85,108 @@ def run() -> int:
         print("\n== отправка запроса ==")
         page.click('.mode-btn[data-mode="oneshot"]')
         page.fill("#input", "Тед Лассо 1080p")
+        # В чате уже может быть история: считаем сообщения до отправки и ждём
+        # именно новое, иначе проверка увидит старый ответ.
+        before_agents = page.locator(".msg--agent").count()
         page.click("#send")
-        page.wait_for_selector(".msg--agent", timeout=120000)
-        deadline_ms = 180000
+        page.wait_for_function(
+            "n => document.querySelectorAll('.msg--agent').length > n",
+            arg=before_agents,
+            timeout=120000,
+        )
         page.wait_for_timeout(1500)
-        # Ждём, пока в чате появится либо кнопка подтверждения, либо вопрос о выборе.
-        page.wait_for_selector(".msg__actions .btn", timeout=deadline_ms)
-        texts = page.locator(".msg__text").all_inner_texts()
-        actions = page.locator(".msg__actions .btn").all_inner_texts()
-        check("в ответе есть текст о поиске", any("Ищу" in t or "Нашёл" in t or "По запросу" in t for t in texts), texts[-3:])
+        # Ждём, пока в новом ответе появится либо кнопка подтверждения, либо вопрос.
+        page.wait_for_selector(".msg__actions .btn, .msg--agent .msg__text", timeout=180000)
+        last_agent = page.locator(".msg--agent").last
+        last_text = last_agent.locator(".msg__text").inner_text()
+        actions = last_agent.locator(".msg__actions .btn").all_inner_texts()
+        check("в ответе есть текст о поиске",
+              any(word in last_text for word in ("Ищу", "Нашёл", "По запросу")), last_text[:160])
         check("появились кнопки действий", len(actions) > 0, actions)
         page.screenshot(path=str(SHOTS / "02-answer.png"), animations="disabled")
 
         print("\n== панель задач ==")
-        page.wait_for_timeout(2500)
-        cards = page.locator("#active-tasks .task-card").count()
-        past = page.locator("#past-tasks .task-card").count()
+        # Карточка появляется не мгновенно: агент дописывает задачу, а панель
+        # обновляется раз в 5 секунд.
+        cards = 0
+        for _ in range(30):
+            cards = page.locator("#active-tasks .task-card").count()
+            past = page.locator("#past-tasks .task-card").count()
+            if cards + past > 0:
+                break
+            page.wait_for_timeout(1000)
         check("в картотеке есть карточки", cards + past > 0, f"active={cards} past={past}")
         status = page.locator("#status-grid").inner_text()
         check("статус служб отрисован", "модель" in status, status[:120])
         page.screenshot(path=str(SHOTS / "03-panel.png"), animations="disabled")
+
+        print("\n== удаление обновляет диск без перезагрузки ==")
+        # Раньше строка «диск» в «Служебном» показывала старые цифры до
+        # перезагрузки страницы: статус обновлялся раз в минуту. Проверяем,
+        # что после удаления карточки статус перезапрашивается сразу.
+        import sqlite3
+        import shutil
+
+        test_id = "ui-test-delete"
+        test_name = "ui-test-delete.bin"
+        download_dir = Path(settings.transmission_download_dir)
+        test_dir = download_dir / test_name
+        test_torrent = Path("/tmp") / f"{test_id}.torrent"
+        db_row_added = False
+        try:
+            shutil.rmtree(test_dir, ignore_errors=True)
+            test_dir.mkdir(parents=True)
+            (test_dir / "film.bin").write_bytes(b"\x00" * (8 * 1024 * 1024))
+            test_torrent.write_bytes(b"d4:infod4:name0:e")
+            conn = sqlite3.connect(str(settings.db_path))
+            conn.execute("DELETE FROM downloads WHERE torrent_id = ?", (test_id,))
+            conn.execute(
+                "INSERT INTO downloads (torrent_id, title, name, size, torrent_path, added_at) "
+                "VALUES (?,?,?,?,?, datetime('now'))",
+                (test_id, test_name, test_name, "8 МБ", str(test_torrent)),
+            )
+            conn.commit()
+            conn.close()
+            db_row_added = True
+
+            card = page.locator("#download-list .task-card", has_text=test_name).first
+            card.wait_for(state="visible", timeout=20000)
+            page.evaluate("window.__noReload = 1")
+            status_calls = []
+            page.on("request", lambda req: status_calls.append(req.url)
+                    if "/api/status" in req.url else None)
+            card.locator("button", has_text="Удалить").first.click()
+            # Подтверждение ищем по имени нашей раздачи: в истории чата могут
+            # остаться старые подтверждения с такой же кнопкой.
+            confirm = page.locator("#chat .msg").filter(has_text=test_name).filter(
+                has_text="Удалить навсегда"
+            ).last
+            confirm.wait_for(state="visible", timeout=20000)
+            confirm.locator("button", has_text="Удалить навсегда").first.click()
+            page.wait_for_timeout(1500)
+            page.wait_for_function(
+                """name => [...document.querySelectorAll('#download-list .task-card')]
+                     .every(el => !el.textContent.includes(name))""",
+                arg=test_name,
+                timeout=20000,
+            )
+            check("карточка удалённого исчезла", True)
+            check("статус перезапрошен без перезагрузки", len(status_calls) > 0,
+                  f"запросов /api/status: {len(status_calls)}")
+            check("страница не перезагружалась",
+                  page.evaluate("window.__noReload") == 1)
+            check("файлы удалены с диска", not test_dir.exists())
+        finally:
+            shutil.rmtree(test_dir, ignore_errors=True)
+            test_torrent.unlink(missing_ok=True)
+            if db_row_added:
+                conn = sqlite3.connect(str(settings.db_path))
+                conn.execute("DELETE FROM downloads WHERE torrent_id = ?", (test_id,))
+                # Болтовню про удаление тестовой раздачи в истории чата не оставляем:
+                # её видит человек, открывший сайт.
+                conn.execute("DELETE FROM messages WHERE text LIKE ?", (f"%{test_name}%",))
+                conn.commit()
+                conn.close()
 
         print("\n== секции картотеки ==")
         sections = page.evaluate(
