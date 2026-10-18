@@ -192,6 +192,12 @@ async def test_foreign_query() -> None:
                                {"quality": "2160p"}, task))  # noqa: SLF001
     check("«Сериал» — уточнение типа, а не новый поиск",
           agent._is_refinement("Сериал", {"type": "series"}, task))  # noqa: SLF001
+    check("«Реалити шоу» — тоже уточнение типа",
+          agent._is_refinement("Реалити шоу", {"type": "series"}, task))  # noqa: SLF001
+    check("«реалити шоу» — жанр, а не название",
+          agent._genre_only("Реалити шоу") and not agent._looks_like_title("Реалити шоу"))  # noqa: SLF001
+    check("«Шоу Трумана» — не жанр",
+          not agent._genre_only("Шоу Трумана"))  # noqa: SLF001
 
     # Старая задача не должна считаться текущей.
     from datetime import datetime, timedelta, timezone

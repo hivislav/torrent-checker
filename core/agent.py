@@ -144,6 +144,7 @@ kinozal.me, скачивает торрент-файлы и ставит их в
 
 PARAM_TITLES = {
     "title": "название",
+    "type": "тип",
     "original_title": "оригинальное название",
     "quality": "качество",
     "voice": "озвучка",
@@ -319,9 +320,19 @@ class Agent:
         refined = active is not None and self._is_refinement(text, parsed, active)
         if active is not None and not refined:
             # Не уточнение: если модель повторила старое название, берём
-            # название из текста, а не из контекста прошлой задачи.
+            # название из текста, а не из контекста прошлой задачи. Но если
+            # модель дала СВОЁ исправленное название («Ставка на любов» →
+            # «Ставка на любовь»), её вариант важнее — не затираем.
             old_title = str((active.params or {}).get("title") or "")
-            if self._looks_like_title(text) and not self._text_about_title(text, old_title):
+            model_title = str(parsed.get("title") or "").strip()
+            repeats_old = not model_title or (
+                old_title and normalize(model_title) == normalize(old_title)
+            )
+            if (
+                repeats_old
+                and self._looks_like_title(text)
+                and not self._text_about_title(text, old_title)
+            ):
                 parsed = {**parsed, "title": self._clean_title_text(text)}
                 journal.add(
                     "agent",
@@ -413,7 +424,22 @@ class Agent:
         "качеств", "озвучк", "сезон", "серия", "серии", "серий", "год",
         "сериал", "фильм", "кино", "раздач", "торрент", "скач", "найди",
         "поищи", "покажи", "хочу", "нужен", "нужна", "надо", "возьми",
+        "реалити", "шоу", "ток-шоу", "документал", "мультсериал",
     )
+    # Слова-жанры: «реалити шоу», «сериал», «фильм» — это уточнение типа,
+    # а не новое название. Срабатывают, только если ВСЁ сообщение из них.
+    GENRE_WORDS = {
+        "реалити", "шоу", "ток", "ток-шоу", "тв", "тв-шоу", "сериал", "сериала",
+        "сериалы", "сериалов", "фильм", "фильма", "фильмы", "кино", "мультфильм",
+        "мультсериал", "документальный", "документальное", "документал",
+        "док", "дорама", "дорамы", "аниме",
+    }
+
+    def _genre_only(self, text: str) -> bool:
+        """Сообщение состоит только из слов-жанров («реалити шоу», «сериал»)."""
+        cleaned = self._clean_title_text(text).lower()
+        tokens = [token for token in cleaned.split() if token]
+        return bool(tokens) and all(token in self.GENRE_WORDS for token in tokens)
 
     def _looks_like_title(self, text: str) -> bool:
         """Текст похож на название, а не на уточнение («4K», «7 серия», «нет»)."""
@@ -436,9 +462,16 @@ class Agent:
         """Это уточнение к активной задаче, а не новая задача?"""
         new_title = str(parsed.get("title") or "").strip()
         old_title = str((active.params or {}).get("title") or "").strip()
+        genre_only = self._genre_only(text)
         # Другое явное название — всегда новая задача. Флаг модели здесь не
         # главный: она склонна считать уточнением любой следующий запрос.
-        if new_title and old_title and normalize(new_title) != normalize(old_title):
+        # Но «реалити шоу» названием не считается — это жанр к текущей задаче.
+        if (
+            new_title
+            and old_title
+            and normalize(new_title) != normalize(old_title)
+            and not genre_only
+        ):
             return False
         plain_title = self._looks_like_title(text)
         if not new_title:
@@ -469,6 +502,8 @@ class Agent:
 
     def _is_extra_words(self, text: str) -> bool:
         """Похоже на уточняющие слова к названию («возвращение», «нет пути домой»)."""
+        if self._genre_only(text):
+            return False
         cleaned = self._clean_title_text(text)
         if not cleaned or re.search(r"\d", cleaned):
             return False
@@ -620,11 +655,19 @@ class Agent:
             {"было": before, "стало": merged, "изменено": changed},
         )
 
+        shown = {
+            key: (
+                "сериал" if key == "type" and value == "series"
+                else "фильм" if key == "type" and value == "movie"
+                else value
+            )
+            for key, value in changed.items()
+        }
         pool = [] if title_changed else [Torrent.from_dict(item) for item in (task.options or {}).get("pool", [])]
         if pool:
             # Название не менялось — ищем заново не надо, перебираем то, что уже есть.
             summary = ", ".join(
-                f"{PARAM_TITLES.get(key, key)}: {value}" for key, value in changed.items()
+                f"{PARAM_TITLES.get(key, key)}: {value}" for key, value in shown.items()
             )
             turn.add(f"Уточнил: {summary}. Смотрю по уже найденным раздачам.", kind="text", task_id=task.id)
             task.options = {**(task.options or {}), "pool": [t.to_dict() for t in pool]}
@@ -643,7 +686,7 @@ class Agent:
         task.options = {"pool": [t.to_dict() for t in torrents[:80]], "queries": [task.params.get("title")]}
         await self.store.save_task(task)
         summary = ", ".join(
-            f"{PARAM_TITLES.get(key, key)}: {value}" for key, value in changed.items()
+            f"{PARAM_TITLES.get(key, key)}: {value}" for key, value in shown.items()
         )
         turn.add(f"Уточнил: {summary}. Ищу заново.", kind="text", task_id=task.id)
         await self._selection_step(task, turn)
@@ -1140,9 +1183,9 @@ class Agent:
         # понимаем это сами: на трекере это разные категории.
         lowered = str(text or "").lower()
         if kind_hint not in ("series", "movie"):
-            if re.search(r"\bсериал", lowered):
+            if re.search(r"\bсериал|\bреалити|\bшоу|\bток-шоу|\bмультсериал|\bдокументал", lowered):
                 kind_hint = "series"
-            elif re.search(r"\bфильм|\bкино", lowered):
+            elif re.search(r"\bфильм|\bкино|\bмультфильм", lowered):
                 kind_hint = "movie"
             else:
                 kind_hint = ""
