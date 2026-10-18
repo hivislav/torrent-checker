@@ -432,6 +432,26 @@ body {
 }
 .link-btn:hover { opacity: 1; text-decoration: underline; }
 
+.pull-hint {
+  position: absolute;
+  top: 6px;
+  left: 50%;
+  transform: translateX(-50%) translateY(-120%);
+  padding: 5px 12px;
+  font-size: 11px;
+  letter-spacing: .05em;
+  color: var(--amber-bright);
+  background: rgba(20, 15, 9, .92);
+  border: 1px solid rgba(224, 162, 83, .45);
+  border-radius: 999px;
+  pointer-events: none;
+  transition: transform .18s ease, opacity .18s ease;
+  opacity: 0;
+  z-index: 30;
+}
+.pull-hint.is-visible { transform: translateX(-50%) translateY(0); opacity: 1; }
+.pull-hint.is-busy { opacity: .85; }
+
 /* ---------- Сцена ---------- */
 .stage {
   display: flex;
@@ -793,6 +813,25 @@ body {
   margin-bottom: 10px;
 }
 
+.panel__new {
+  display: block;
+  width: 100%;
+  margin: 10px 0 4px;
+  padding: 11px 14px;
+  font-family: var(--serif);
+  font-size: 13px;
+  letter-spacing: .06em;
+  color: var(--amber-bright);
+  background: rgba(224, 162, 83, .1);
+  border: 1px solid rgba(224, 162, 83, .5);
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background .15s, transform .15s;
+}
+.panel__new:hover { background: rgba(224, 162, 83, .2); }
+.panel__new:active { transform: translateY(1px); }
+.panel__new span[aria-hidden] { font-size: 15px; }
+
 .new-task {
   display: inline-flex;
   align-items: center;
@@ -812,6 +851,11 @@ body {
 .new-task:hover { background: rgba(224, 162, 83, .16); }
 .new-task:active { transform: translateY(1px); }
 .new-task span[aria-hidden] { font-size: 16px; line-height: 1; }
+
+/* В веб-версии кнопка живёт в картотеке; в композере она только на телефоне. */
+@media (min-width: 901px) {
+  .new-task { display: none; }
+}
 
 .composer__modes {
   display: grid;
@@ -1188,7 +1232,8 @@ body {
   .composer { padding: 10px 12px calc(12px + env(safe-area-inset-bottom)); }
   .composer__modes { max-width: none; }
   .new-task__label { display: none; }
-  .new-task { width: 46px; justify-content: center; padding: 0; }
+  .new-task--mobile { display: inline-flex; width: 46px; justify-content: center; padding: 0; }
+  .panel__new { margin-top: 8px; }
   .mode-btn { padding: 8px 10px; }
   .composer__hint { display: none; }
 

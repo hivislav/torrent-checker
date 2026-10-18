@@ -28,6 +28,10 @@
         <button class="panel__close" id="panel-close" aria-label="Закрыть панель">✕</button>
       </div>
 
+      <button type="button" class="panel__new" id="panel-new-task">
+        <span aria-hidden="true">＋</span> Новая задача
+      </button>
+
       <div class="panel__scroll">
         <!-- Три списка разного смысла: активные задачи, завершённые задачи и
              то, что уже лежит на диске. У каждого — свой счётчик и своя
@@ -109,6 +113,8 @@
         <div class="notification-tray__list" id="notification-list"></div>
       </div>
 
+      <div class="pull-hint" id="pull-hint" aria-hidden="true">потяните, чтобы обновить</div>
+
       <div class="chat" id="chat" role="log" aria-live="polite">
         <div class="chat__intro">
           <p class="chat__intro-title">Крутите ручку — я запущу проектор.</p>
@@ -125,7 +131,7 @@
 
       <form class="composer" id="composer">
         <div class="composer__top">
-          <button type="button" class="new-task" id="new-task" title="Начать новую задачу (свой чат и контекст)">
+          <button type="button" class="new-task new-task--mobile" id="new-task" title="Начать новую задачу (свой чат и контекст)">
             <span aria-hidden="true">＋</span>
             <span class="new-task__label">Новая задача</span>
           </button>

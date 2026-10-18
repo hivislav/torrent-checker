@@ -1114,6 +1114,11 @@
     restoreSections();
 
     $("new-task").addEventListener("click", startNewTask);
+    $("panel-new-task").addEventListener("click", () => {
+      startNewTask();
+      closePanel();
+    });
+    setupPullToRefresh();
 
     $("bell").addEventListener("click", () => {
       const tray = $("notification-tray");
@@ -1151,6 +1156,84 @@
         closePanel();
       }
     });
+  }
+
+  // ------------------------------------------------------------------
+  // Свайп вниз = обновить (телефон). Тянем только когда чат прокручен вверх,
+  // чтобы не мешать обычной листовке.
+  async function refreshEverything() {
+    const hint = $("pull-hint");
+    if (hint) {
+      hint.textContent = "обновляю…";
+      hint.classList.add("is-visible", "is-busy");
+    }
+    try {
+      await refreshTasks();
+      if (state.taskId) await openConversation(state.taskId);
+      await refreshStatus();
+    } finally {
+      if (hint) {
+        hint.classList.remove("is-busy");
+        hint.classList.remove("is-visible");
+      }
+    }
+  }
+
+  function setupPullToRefresh() {
+    if (!("ontouchstart" in window)) return;
+    const threshold = 70;
+    let startY = 0;
+    let pulling = false;
+    let armed = false;
+
+    const hint = $("pull-hint");
+
+    chat.addEventListener(
+      "touchstart",
+      (event) => {
+        if (state.busy || event.touches.length !== 1) return;
+        if (chat.scrollTop > 0) return;
+        startY = event.touches[0].clientY;
+        pulling = true;
+        armed = false;
+      },
+      { passive: true }
+    );
+
+    chat.addEventListener(
+      "touchmove",
+      (event) => {
+        if (!pulling) return;
+        const delta = event.touches[0].clientY - startY;
+        if (delta <= 0) {
+          pulling = false;
+          if (hint) hint.classList.remove("is-visible");
+          return;
+        }
+        if (chat.scrollTop > 0) return;
+        if (event.cancelable) event.preventDefault();
+        armed = delta > threshold;
+        if (hint) {
+          hint.textContent = armed ? "отпустите, чтобы обновить" : "потяните, чтобы обновить";
+          hint.classList.add("is-visible");
+        }
+      },
+      { passive: false }
+    );
+
+    const finish = () => {
+      if (!pulling) return;
+      pulling = false;
+      if (armed) {
+        armed = false;
+        refreshEverything();
+      } else if (hint) {
+        hint.classList.remove("is-visible");
+      }
+    };
+
+    chat.addEventListener("touchend", finish, { passive: true });
+    chat.addEventListener("touchcancel", finish, { passive: true });
   }
 
   async function openLatestConversation() {
