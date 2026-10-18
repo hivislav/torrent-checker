@@ -73,24 +73,95 @@
     node.querySelector(".msg__time").textContent = formatTime(message.created_at);
     node.querySelector(".msg__text").textContent = message.text || "";
 
-    const actionsBox = node.querySelector(".msg__actions");
-    for (const action of message.actions || []) {
-      const button = document.createElement("button");
-      button.type = "button";
-      button.className = "btn btn--tiny";
-      if (action.style === "primary") button.classList.add("btn--primary");
-      if (action.style === "danger") button.classList.add("btn--danger");
-      button.textContent = action.label;
-      button.addEventListener("click", () => {
-        if (button.disabled) return;
-        runAction(action, button);
-      });
-      actionsBox.appendChild(button);
-    }
+    renderActions(node.querySelector(".msg__actions"), message.actions || []);
 
     chat.appendChild(node);
     if (scroll) chat.scrollTop = chat.scrollHeight;
     return node;
+  }
+
+  // Кнопки сообщения: сгруппированы по смыслу («Качество», «Озвучка», «Серии»).
+  // Кнопки с multi включаются/выключаются без похода на сервер, а выбранное
+  // уходит одним действием «Скачать выбранные (N)».
+  function renderActions(box, actions) {
+    if (!box || !actions.length) return;
+    box.innerHTML = "";
+    const picked = new Map(); // id -> episode
+
+    const groups = new Map();
+    for (const action of actions) {
+      const key = action.group || "";
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(action);
+    }
+
+    let submitButton = null;
+    const refreshSubmit = () => {
+      if (!submitButton) return;
+      submitButton.textContent = `Скачать выбранные (${picked.size})`;
+      submitButton.disabled = picked.size === 0;
+    };
+
+    for (const [groupName, items] of groups) {
+      const wrap = document.createElement("div");
+      wrap.className = "msg__action-group";
+      if (groupName) {
+        const caption = document.createElement("div");
+        caption.className = "msg__action-caption";
+        caption.textContent = groupName;
+        wrap.appendChild(caption);
+      }
+      const row = document.createElement("div");
+      row.className = "msg__action-row";
+
+      for (const action of items) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "btn btn--tiny";
+        if (action.style === "primary") button.classList.add("btn--primary");
+        if (action.style === "danger") button.classList.add("btn--danger");
+        button.textContent = action.label;
+
+        if (action.multi) {
+          button.classList.add("btn--multi");
+          if (action.selected) {
+            button.classList.add("is-selected");
+            picked.set(action.id, action.payload.episode);
+          }
+          button.addEventListener("click", () => {
+            const on = !button.classList.contains("is-selected");
+            button.classList.toggle("is-selected", on);
+            if (on) picked.set(action.id, action.payload.episode);
+            else picked.delete(action.id);
+            refreshSubmit();
+          });
+          row.appendChild(button);
+          continue;
+        }
+
+        if (action.kind === "download_selected") {
+          submitButton = button;
+          button.addEventListener("click", () => {
+            if (button.disabled) return;
+            const episodes = [...picked.values()].filter((value) => value !== undefined);
+            runAction({ ...action, payload: { ...action.payload, episodes } }, button);
+          });
+          row.appendChild(button);
+          continue;
+        }
+
+        button.addEventListener("click", () => {
+          if (button.disabled) return;
+          runAction(action, button);
+        });
+        row.appendChild(button);
+      }
+
+      wrap.appendChild(row);
+      box.appendChild(wrap);
+    }
+
+    refreshSubmit();
   }
 
   function renderPending() {

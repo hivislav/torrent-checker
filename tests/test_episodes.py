@@ -164,10 +164,105 @@ def test_plan() -> None:
     agent.store.close()
 
 
+def test_selection_options() -> None:
+    print("\n== варианты выбора не врут ==")
+    import dataclasses
+    import tempfile
+
+    from core.agent import Agent
+    from core.config import get_settings
+    from core.models import Task, Torrent
+
+    tmp = Path(tempfile.mkdtemp(prefix="options-"))
+    settings = dataclasses.replace(
+        get_settings(), data_dir=tmp, db_path=tmp / "o.sqlite3", torrents_dir=tmp / "t"
+    )
+    agent = Agent(settings)
+
+    def tor(tid: str, title: str, quality: str, voice: str, season: int) -> Torrent:
+        return Torrent(
+            id=tid,
+            title=title,
+            qualities=[quality],
+            voices=[voice],
+            seasons=[season],
+            episodes=[1, 8],
+            series_key="tedlasso",
+        )
+
+    pool = [
+        tor("1", "Тед Лассо 4 сезон 1080p ДБ", "1080p", "ДБ", 4),
+        tor("2", "Тед Лассо 4 сезон 2160p ДБ", "2160p", "ДБ", 4),
+        tor("3", "Тед Лассо 2 сезон 720p ПМ", "720p", "ПМ", 2),
+    ]
+    options, pool_used = agent._options_under(pool, {"season": 4}, "quality")  # noqa: SLF001
+    print("  качество для 4 сезона:", options["qualities"])
+    check("720p не предлагается, если его нет в сезоне", "720p" not in options["qualities"],
+          options["qualities"])
+    check("предлагается только доступное", set(options["qualities"]) == {"2160p", "1080p"},
+          options["qualities"])
+
+    v_options, _ = agent._options_under(pool, {"season": 4, "quality": "1080p"}, "voice")  # noqa: SLF001
+    check("озвучка считается с учётом качества", v_options["voices"] == ["ДБ"], v_options["voices"])
+
+    # «без учёта качества» расширяет выбор
+    v_any, _ = agent._options_under(pool, {"season": 4}, "voice")  # noqa: SLF001
+    check("без качества озвучек больше", len(v_any["voices"]) >= len(v_options["voices"]),
+          v_any["voices"])
+    agent.store.close()
+
+
+def test_multi_episode_plan() -> None:
+    print("\n== несколько серий одним планом ==")
+    import dataclasses
+    import tempfile
+
+    from core.agent import Agent
+    from core.config import get_settings
+    from core.models import Task, Torrent, Turn
+
+    tmp = Path(tempfile.mkdtemp(prefix="multi-"))
+    settings = dataclasses.replace(
+        get_settings(), data_dir=tmp, db_path=tmp / "m.sqlite3", torrents_dir=tmp / "t"
+    )
+    agent = Agent(settings)
+    task = Task(
+        id="m",
+        kind="oneshot",
+        state="awaiting_choice",
+        session_id="s",
+        user_query="Тед Лассо",
+        params={"title": "Тед Лассо", "season": 4, "quality": "1080p"},
+        candidate=Torrent(id="9", title="Тед Лассо 4 сезон").to_dict(),
+        options={
+            "episode_groups": [
+                {"season": 4, "episode": 1, "indexes": [0], "size": 100, "names": ["e1.mkv"]},
+                {"season": 4, "episode": 3, "indexes": [2], "size": 300, "names": ["e3.mkv"]},
+                {"season": 4, "episode": 5, "indexes": [4], "size": 500, "names": ["e5.mkv"]},
+            ]
+        },
+    )
+    turn = Turn()
+    import asyncio
+
+    asyncio.get_event_loop_policy()
+    asyncio.run(agent._confirm_selected_episodes(task, [1, 5], turn))  # noqa: SLF001
+    plan = (task.options or {}).get("plan") or {}
+    print("  план:", {k: plan.get(k) for k in ("kind", "wanted", "size", "selected_episodes")})
+    check("выбраны файлы 1 и 5 серии", plan.get("wanted") == [0, 4], plan.get("wanted"))
+    check("вес — сумма выбранных", plan.get("size") == 600, plan.get("size"))
+    check("вес всей раздачи рядом", plan.get("total_size") == 900, plan.get("total_size"))
+    labels = [action.label for message in turn.messages for action in message.actions]
+    check("есть кнопка постановки в очередь", "Поставить в Transmission" in labels, labels)
+    agent.store.close()
+
+
 def main() -> int:
     test_detect()
     test_selection()
     test_plan()
+    test_selection_options()
+    test_multi_episode_plan()
     print("\n=== ИТОГ ===")
     if FAILS:
         for name in FAILS:

@@ -648,11 +648,56 @@ body {
 
 .msg__actions {
   display: flex;
-  flex-wrap: wrap;
-  gap: 7px;
-  margin-top: 11px;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 12px;
 }
 .msg__actions:empty { display: none; }
+
+/* Кнопки сгруппированы по смыслу: «Качество», «Озвучка», «Серии» — чтобы было
+   видно, что к чему относится. */
+.msg__action-group { display: flex; flex-direction: column; gap: 6px; }
+
+.msg__action-caption {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: .18em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+
+.msg__action-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+/* Множественный выбор серий: нажатие = выбор, без похода на сервер. */
+.btn--multi {
+  position: relative;
+  padding-left: 22px;
+}
+.btn--multi::before {
+  content: "";
+  position: absolute;
+  left: 8px;
+  top: 50%;
+  width: 9px;
+  height: 9px;
+  margin-top: -4.5px;
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  background: rgba(0, 0, 0, .35);
+}
+.btn--multi.is-selected {
+  border-color: var(--amber);
+  color: var(--amber-bright);
+  background: rgba(224, 162, 83, .16);
+}
+.btn--multi.is-selected::before {
+  background: var(--amber-bright);
+  border-color: var(--amber-bright);
+}
 
 .msg__pending {
   display: inline-flex;
@@ -1060,6 +1105,7 @@ body {
   .notification-tray { right: 12px; left: 12px; width: auto; top: 56px; }
 
   .panel__hint { display: none; }
+  .msg__action-caption { font-size: 9px; }
   /* На узком экране переписка занимает всю ширину, и любые царапины попадут
      на текст — на телефоне их просто нет. */
   .film-scratches { display: none; }

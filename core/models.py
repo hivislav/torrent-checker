@@ -222,6 +222,13 @@ class Action:
     kind: str  # confirm | cancel | choose | create_periodic | download
     payload: dict[str, Any] = field(default_factory=dict)
     style: str = "normal"  # normal | primary | danger
+    # Подпись группы: «Качество», «Озвучка», «Серии» — чтобы в одном сообщении
+    # было видно, что к чему относится.
+    group: str = ""
+    # Множественный выбор: клиент запоминает нажатия и отправляет список.
+    multi: bool = False
+    # Выбрано ли сейчас (для кнопок множественного выбора).
+    selected: bool = False
 
 
 @dataclass
