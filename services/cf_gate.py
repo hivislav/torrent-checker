@@ -39,6 +39,20 @@ from curl_cffi import requests as curl_requests
 from core.config import Settings, get_settings
 from core.debuglog import journal
 
+
+def _readable_url(url: str) -> str:
+    """URL в человеческом виде: кириллица из %D0%94… обратно в буквы."""
+    from urllib.parse import unquote, urlsplit
+
+    try:
+        parts = urlsplit(url)
+        path = unquote(parts.path)
+        query = unquote(parts.query)
+        short = path + (f"?{query}" if query else "")
+        return short if len(short) <= 110 else short[:110] + "…"
+    except ValueError:
+        return url[:110]
+
 log = logging.getLogger("gate")
 
 # Признаки того, что мы упёрлись в challenge, а не получили настоящую страницу.
@@ -494,7 +508,7 @@ class CloudflareGate:
                     self._cookies.update(result.cookies)
                 journal.add(
                     "gate",
-                    f"{method} {url}",
+                    f"{method} {_readable_url(url)}",
                     {
                         "статус": result.status,
                         "через": "браузер" if result.via == "browser" else "curl_cffi",
@@ -507,7 +521,7 @@ class CloudflareGate:
             log.info("challenge на %s (попытка %s), обновляю cf_clearance", url, attempt + 1)
             journal.add(
                 "gate",
-                f"Cloudflare не пустил: {method} {url}",
+                f"Cloudflare не пустил: {method} {_readable_url(url)}",
                 {"статус": result.status, "попытка": attempt + 1},
                 level="warn",
             )
