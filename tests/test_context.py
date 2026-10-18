@@ -430,10 +430,17 @@ async def test_live_dialog() -> None:
         print("  (проверка пропущена:", str(exc)[:80], ")")
     finally:
         conn = sqlite3.connect(str(settings.db_path))
-        conn.execute("DELETE FROM messages WHERE id > ?", (start_msg,))
+        # Убираем только сообщения и задачи, созданные этим прогоном:
+        # чужие переписки и завершённые задачи трогать нельзя.
+        placeholders = ",".join("?" for _ in start_tasks or {""})
+        conn.execute(
+            "DELETE FROM messages WHERE id > ? AND task_id IS NOT NULL "
+            f"AND task_id <> '' AND task_id NOT IN ({placeholders})",
+            (start_msg, *tuple(start_tasks or {""})),
+        )
         conn.execute(
             "DELETE FROM tasks WHERE id NOT IN ("
-            + ",".join("?" for _ in start_tasks or {""})
+            + placeholders
             + ")",
             tuple(start_tasks or {""}),
         )

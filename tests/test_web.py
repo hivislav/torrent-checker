@@ -69,28 +69,6 @@ def run() -> int:
         page.screenshot(path=str(SHOTS / "01-chat.png"), animations="disabled")
 
         play = page
-        # Тест не должен зависеть от прежних прогонов: незакрытая задача заставит
-        # агента считать новый запрос уточнением и не ходить на трекер.
-        try:
-            leftovers = page.evaluate(
-                """async () => {
-                    const data = await (await fetch('/api/tasks')).json();
-                    const states = new Set(['awaiting_choice','awaiting_confirm','awaiting_setup','monitoring']);
-                    // Периодические задачи не трогаем: это чужие часовые
-                    // задачи, тест не должен их закрывать.
-                    const ids = (data.tasks || [])
-                      .filter(t => states.has(t.state) && t.kind !== 'periodic')
-                      .map(t => t.id);
-                    for (const id of ids) {
-                      await fetch(`/api/tasks/${id}/cancel`, {method: 'POST'});
-                    }
-                    return ids.length;
-                }"""
-            )
-            if leftovers:
-                print(f"  (закрыл прежних задач: {leftovers})")
-        except Exception as error:  # noqa: BLE001
-            print("  (не удалось закрыть прежние задачи:", str(error)[:60], ")")
 
         print("\n== отправка запроса ==")
         # Начинаем с чистого чата: иначе сообщение уйдёт в открытую задачу
@@ -311,12 +289,21 @@ def run() -> int:
         "DELETE FROM messages WHERE id > ? AND (text LIKE ? OR text LIKE ?)",
         (start_msg, "%Тед Лассо%", "%ui-test-delete%"),
     )
-    # Задачи, заведённые тестом, не должны висеть в картотеке у человека.
+    # Убираем только то, что завёл сам тест (его запрос — «Тед Лассо…»).
+    # Чужие задачи, включая завершённые и периодические, не трогаем:
+    # иначе у человека пропадает его картотека.
     placeholders = ",".join("?" for _ in start_tasks) or "''"
+    test_tasks = (
+        f"SELECT id FROM tasks WHERE id NOT IN ({placeholders}) "
+        f"AND kind <> 'periodic' AND user_query LIKE ?"
+    )
     conn.execute(
-        f"UPDATE tasks SET state = 'cancelled' "
-        f"WHERE id NOT IN ({placeholders}) AND kind <> 'periodic'",
-        tuple(start_tasks),
+        f"DELETE FROM messages WHERE task_id IN ({test_tasks})",
+        (*start_tasks, "%Тед Лассо%"),
+    )
+    conn.execute(
+        f"DELETE FROM tasks WHERE id IN ({test_tasks})",
+        (*start_tasks, "%Тед Лассо%"),
     )
     conn.commit()
     conn.close()
