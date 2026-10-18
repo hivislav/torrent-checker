@@ -32,6 +32,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -43,6 +44,8 @@ from core.llm import LLM, LLMError
 from core.torrent_meta import file_list, human_bytes
 from core.matching import (
     QUALITY_LABELS,
+    quality_match,
+    voice_match,
     collect_options,
     describe,
     episodes_by_season,
@@ -63,6 +66,7 @@ from core.episodes import (
     pick_new_episodes,
 )
 from core.parsing import normalize, parse_torrent
+from core.suggest import query_variants, similar_titles, similarity
 from core.storage import Store
 from core.storage_target import StorageUnavailable as TargetUnavailable
 from core.storage_target import ensure_target as ensure_dir
@@ -426,6 +430,14 @@ class Agent:
                 task_id=task.id,
                 payload={"task": task.to_dict()},
             )
+        elif kind == "choose" and task and str(payload.get("dimension") or "") == "title":
+            await self._apply_title(task, str(payload.get("value") or ""), turn)
+        elif kind == "noop" and task:
+            turn.add(
+                "Оставил запрос как есть. Если появится — найдётся и так.",
+                kind="text",
+                task_id=task.id,
+            )
         elif kind == "choose" and task:
             dimension = str(payload.get("dimension") or "")
             value = str(payload.get("value") or "")
@@ -781,6 +793,102 @@ class Agent:
             raise MCPError("; ".join(errors[:2]))
         return list(seen.values())
 
+    # Слова запроса, которые не участвуют в сравнении названий: служебные.
+    _STOP_WORDS = {
+        "сезон", "сезоны", "серия", "серии", "выпуск", "выпуски", "фильм", "сериал",
+        "качай", "скачать", "скачай", "проверяй", "следи", "каждый", "каждые",
+        "часов", "часа", "час", "минут", "сутки", "начиная", "нужен", "нужна",
+        "этот", "этом", "только", "появится", "если", "когда", "чтобы", "про",
+    }
+
+    @classmethod
+    def _stop_tokens(cls) -> set[str]:
+        """Служебные слова в обоих видах: как написаны и как нормализованы."""
+        cached = getattr(cls, "_stop_cache", None)
+        if cached is None:
+            cached = set(cls._STOP_WORDS) | {normalize(word) for word in cls._STOP_WORDS}
+            cached |= {"season", "sezon", "series", "episode", "release", "torrent"}
+            cls._stop_cache = cached
+        return cached
+
+    @classmethod
+    def _significant_tokens(cls, text: str) -> list[str]:
+        tokens: list[str] = []
+        stop = cls._stop_tokens()
+        for word in str(text or "").split():
+            token = normalize(word)
+            if len(token) < 4 or word.lower().strip(".,!?()«»") in stop or token in stop:
+                continue
+            if re.fullmatch(r"\d+[a-z]*", token):  # 1080, 2026, 4k
+                continue
+            tokens.append(token)
+        return tokens
+
+    @classmethod
+    def _missing_tokens(cls, original: str, found_title: str) -> list[str]:
+        """Слова из запроса, которых нет в найденном названии.
+
+        Если такие есть, значит поиск нашёл «похожее, но не то»: в запросе было
+        уточнение («… реванш»), которое потерялось.
+        """
+        haystack = normalize(str(found_title))
+        return [token for token in cls._significant_tokens(original) if token not in haystack]
+
+    async def _search_with_suggestions(self, params: dict[str, Any], *, original: str = "", pages: int = 2) -> tuple[list[Torrent], list[dict]]:
+        """Поиск, а если по названию пусто — подбор похожих вариантов.
+
+        Трекер ищет по всем словам запроса: «битва экстрасенсов реванш» даёт
+        ноль, хотя на трекере есть «Экстрасенсы. Реванш». Поэтому при пустом
+        результате пробуем укороченные запросы и подсказываем похожие названия.
+        """
+        title = str(params.get("title") or "")
+        source = str(original or title)
+        torrents = await self._search(params)
+        by_title = filter_candidates(torrents, {"title": title}) if title else []
+        if by_title:
+            # Нашлось — но всё ли из запроса учтено? Если в исходном тексте есть
+            # слово, которого нет в найденном названии, ищем варианты всё равно.
+            best_found = rank(by_title, params)[0]
+            missing = self._missing_tokens(source, best_found.title)
+            if not missing:
+                return torrents, []
+            journal.add(
+                "agent",
+                "в запросе есть слова, которых нет в найденном названии",
+                {"запрос": source, "название": best_found.title, "лишние": missing},
+            )
+
+        seen = {torrent.id for torrent in torrents}
+        extra: list[Torrent] = []
+        for variant in query_variants(source):
+            try:
+                rows = await self.mcp.search_pages(variant, pages=1)
+            except MCPError as exc:
+                log.warning("поиск варианта «%s» не удался: %s", variant, exc)
+                continue
+            for raw in rows:
+                torrent = parse_torrent(raw)
+                if torrent.id and torrent.id not in seen:
+                    seen.add(torrent.id)
+                    extra.append(torrent)
+            if extra:
+                # Дальше уточнять нет смысла: подсказки уже есть.
+                continue
+
+        suggestions = similar_titles(source or title, extra or torrents)
+        journal.add(
+            "agent",
+            "подбор похожих названий",
+            {
+                "запрос": source,
+                "название от модели": title,
+                "варианты": query_variants(source),
+                "найдено раздач": len(extra),
+                "подсказки": [item["title"] for item in suggestions],
+            },
+        )
+        return torrents + extra, suggestions
+
     # ------------------------------------------------------------------
     # Разовая задача
     # ------------------------------------------------------------------
@@ -806,7 +914,9 @@ class Agent:
         )
 
         try:
-            torrents = await self._search(task.params)
+            torrents, suggestions = await self._search_with_suggestions(
+                task.params, original=text
+            )
         except MCPError as exc:
             task.state = "failed"
             task.last_error = str(exc)
@@ -822,6 +932,7 @@ class Agent:
         task.options = {
             "pool": [t.to_dict() for t in torrents[:80]],
             "queries": [task.params.get("title")],
+            "suggestions": suggestions,
         }
         await self.store.save_task(task)
         await self._selection_step(task, turn)
@@ -853,6 +964,10 @@ class Agent:
         )
         by_title = filter_candidates(pool, {"title": params.get("title") or ""})
         if not by_title:
+            suggestions = (task.options or {}).get("suggestions") or []
+            if suggestions:
+                await self._offer_suggestions(task, suggestions, turn)
+                return
             task.state = "not_found"
             await self.store.save_task(task)
             text = await self._not_found_text(task)
@@ -903,6 +1018,53 @@ class Agent:
         best_list = rank(fresh, task.params)
         await self._present_candidate(task, best_list, turn)
 
+    async def _offer_suggestions(self, task: Task, suggestions: list[dict], turn: Turn) -> None:
+        """«Не найдено — возможно, вы имели в виду…» с кнопками."""
+        asked = str((task.params or {}).get("title") or task.title)
+        lines = [f"По запросу «{asked}» на kinozal.me ничего не нашлось.", ""]
+        lines.append("Возможно, вы имели в виду:")
+        for index, item in enumerate(suggestions[:5], start=1):
+            lines.append(f"{index}. {item['title']}")
+        lines.append("")
+        lines.append("Выберите название кнопкой — поищу заново по нему.")
+        message = turn.add("\n".join(lines), kind="tickets", task_id=task.id,
+                           payload={"task": task.to_dict(), "suggestions": suggestions})
+        for item in suggestions[:5]:
+            message.actions.append(
+                Action(
+                    id=f"title-{item['torrent_id']}",
+                    label=item["title"][:60],
+                    kind="choose",
+                    payload={"task_id": task.id, "dimension": "title", "value": item["title"]},
+                    group="Похожие названия",
+                    style="primary" if item is suggestions[0] else "normal",
+                )
+            )
+        message.actions.append(
+            Action(
+                id="keep-typo",
+                label="Искать как написал",
+                kind="noop",
+                payload={"task_id": task.id},
+                group="Действие",
+            )
+        )
+        message.actions.append(
+            Action(
+                id="make-periodic-typo",
+                label="Следить за этим названием",
+                kind="make_periodic",
+                payload={
+                    "task_id": task.id,
+                    "interval_minutes": self.settings.default_interval_minutes,
+                    "auto_download": False,
+                },
+                group="Действие",
+            )
+        )
+        task.state = "awaiting_choice"
+        await self.store.save_task(task)
+
     async def _offer_relaxed(self, task: Task, by_title: list[Torrent], turn: Turn) -> None:
         """Подходящего нет: показываем, что есть, и даём снять лишний фильтр."""
         params = task.params
@@ -926,7 +1088,19 @@ class Agent:
             ]
             return
 
-        lines = [f"Под эти условия ничего не подошло: {self._filters_text(params)}.", ""]
+        # Точная причина: выбранного значения в этих раздачах может не быть вовсе.
+        causes: list[str] = []
+        if params.get("voice") and not any(voice_match(str(params["voice"]), t.voices) for t in by_title):
+            causes.append(f"озвучки «{params['voice']}» в этих раздачах нет")
+        if params.get("quality") and not any(
+            quality_match(str(params["quality"]), t.qualities) for t in by_title
+        ):
+            causes.append(f"качества {self._quality_label(str(params['quality']))} в этих раздачах нет")
+
+        if causes:
+            lines = [f"Не подходит: {self._filters_text(params)}.", "", "• " + "; ".join(causes) + "."]
+        else:
+            lines = [f"Под эти условия ничего не подошло: {self._filters_text(params)}.", ""]
         if q_options["qualities"]:
             lines.append(
                 "• качество: " + ", ".join(self._quality_label(v) for v in q_options["qualities"][:6])
@@ -1089,13 +1263,34 @@ class Agent:
         task.options = {**(task.options or {}), "plan": plan}
         task.state = "awaiting_confirm"
         await self.store.save_task(task)
+        text = self._confirm_card_text(task, best, plan)
+        suggestions = (task.options or {}).get("suggestions") or []
+        # «Совпало не точно» — когда в исходном запросе были слова, которых нет
+        # в найденном названии: значит, поиск нашёл похожее, но не то.
+        original = str(task.user_query or "").split(" | ")[0]
+        weak = bool(suggestions) and bool(self._missing_tokens(original, best.title))
+        if weak and suggestions:
+            text += "\n\n⚠ Название совпало не точно. Возможно, вы имели в виду:"
+            for index, item in enumerate(suggestions[:3], start=1):
+                text += f"\n{index}. {item['title']}"
         message = turn.add(
-            self._confirm_card_text(task, best, plan),
+            text,
             kind="task",
             task_id=task.id,
             payload={"task": task.to_dict(), "plan": plan},
         )
         message.actions = self._start_actions(task, plan)
+        if weak:
+            for item in suggestions[:3]:
+                message.actions.append(
+                    Action(
+                        id=f"confirm-title-{item['torrent_id']}",
+                        label=f"Это «{item['title']}»"[:60],
+                        kind="choose",
+                        payload={"task_id": task.id, "dimension": "title", "value": item["title"]},
+                        group="Похожие названия",
+                    )
+                )
         if len(best_list) > 1:
             for index, alternative in enumerate(best_list[1:4], start=2):
                 message.actions.append(
@@ -1157,6 +1352,41 @@ class Agent:
             payload={"task": task.to_dict(), "plan": plan},
         )
         message.actions = self._start_actions(task, plan)
+
+    async def _apply_title(self, task: Task, title: str, turn: Turn) -> None:
+        """Пользователь выбрал похожее название — ищем заново уже по нему."""
+        title = title.strip()
+        if not title:
+            turn.add("Пустое название — поищите ещё раз.", kind="error", task_id=task.id)
+            return
+        task.params["title"] = title
+        task.params.pop("original_title", None)
+        task.params["seen_ids"] = []
+        task.state = "searching"
+        await self.store.save_task(task)
+        journal.add("agent", "название исправлено по подсказке", {"стало": title})
+
+        try:
+            torrents = await self._search(task.params)
+        except MCPError as exc:
+            task.state = "failed"
+            task.last_error = str(exc)
+            await self.store.save_task(task)
+            turn.add(f"Не смог обратиться к трекеру: {exc}", kind="error", task_id=task.id)
+            return
+
+        task.options = {
+            **(task.options or {}),
+            "pool": [t.to_dict() for t in torrents[:80]],
+            "suggestions": [],
+            "queries": [title],
+        }
+        await self.store.save_task(task)
+        turn.add(f"Ищу «{title}».", kind="text", task_id=task.id)
+        if task.kind == "periodic":
+            await self._present_periodic(task, torrents, turn)
+        else:
+            await self._selection_step(task, turn)
 
     async def _show_episode_picker(
         self,
@@ -1261,6 +1491,7 @@ class Agent:
                     label=self._quality_label(value),
                     kind="choose",
                     payload={"task_id": task.id, "dimension": "quality", "value": value},
+                    group="Качество",
                 )
             )
         for value in options["voices"][:5]:
@@ -1270,6 +1501,7 @@ class Agent:
                     label=value,
                     kind="choose",
                     payload={"task_id": task.id, "dimension": "voice", "value": value},
+                    group="Озвучка",
                 )
             )
         actions.append(
@@ -1286,35 +1518,10 @@ class Agent:
     # ------------------------------------------------------------------
     # Периодическая задача
     # ------------------------------------------------------------------
-    async def _start_periodic(
-        self, session_id: str, text: str, parsed: dict[str, Any], turn: Turn
+    async def _present_periodic(
+        self, task: Task, torrents: list[Torrent], turn: Turn
     ) -> None:
-        if not parsed.get("title"):
-            turn.add("Не понял, за чем следить. Напишите название фильма или сериала.")
-            return
-
-        interval = parsed.get("interval_minutes") or self.settings.default_interval_minutes
-        interval = max(self.settings.min_interval_minutes, int(interval))
-        task = await self._task_from_params(
-            session_id,
-            text,
-            parsed,
-            kind="periodic",
-            interval=interval,
-            auto_download=bool(parsed.get("auto_download")),
-        )
-        turn.task = task
-
-        try:
-            torrents = await self._search(task.params)
-        except MCPError as exc:
-            task.state = "failed"
-            task.last_error = str(exc)
-            await self.store.save_task(task)
-            turn.add(f"Не смог обратиться к трекеру: {exc}", kind="error", task_id=task.id)
-            return
-
-        task.options = {"pool": [t.to_dict() for t in torrents[:80]]}
+        """Карточка периодической задачи: что есть сейчас и что делать с новым."""
         by_title = filter_candidates(torrents, {"title": task.params.get("title") or ""})
         matched = filter_candidates(by_title, task.params)
         best = rank(matched or by_title, task.params)
@@ -1351,6 +1558,11 @@ class Agent:
                 "\n\nСейчас по этим параметрам на трекере ничего нет — задача будет "
                 "молча проверять и сообщит, когда появится."
             )
+            suggestions = (task.options or {}).get("suggestions") or []
+            if suggestions:
+                head += "\n\nВозможно, вы имели в виду:"
+                for index, item in enumerate(suggestions[:5], start=1):
+                    head += f"\n{index}. {item['title']}"
 
         message = turn.add(
             head,
@@ -1358,7 +1570,22 @@ class Agent:
             task_id=task.id,
             payload={"task": task.to_dict(), "torrent": (best[0].to_dict() if best else None)},
         )
-        message.actions = [
+        suggestions = (task.options or {}).get("suggestions") or []
+        original = str(task.user_query or "").split(" | ")[0]
+        if best and suggestions and not self._missing_tokens(original, best[0].title):
+            # Нашлось именно то, что просили — подсказки только помешают.
+            suggestions = []
+        for item in suggestions[:5]:
+            message.actions.append(
+                Action(
+                    id=f"periodic-title-{item['torrent_id']}",
+                    label=f"Это «{item['title']}»"[:60],
+                    kind="choose",
+                    payload={"task_id": task.id, "dimension": "title", "value": item["title"]},
+                    group="Похожие названия",
+                )
+            )
+        message.actions.extend([
             Action(
                 id="periodic-auto",
                 label="Качать сразу и сообщать",
@@ -1379,7 +1606,7 @@ class Agent:
                 payload={"task_id": task.id},
                 style="danger",
             ),
-        ]
+        ])
 
     @staticmethod
     def _record_baseline(task: Task, torrents: list[Torrent]) -> None:
@@ -1397,6 +1624,42 @@ class Agent:
             task.params["baseline_episodes"] = {str(k): v for k, v in by_season.items()}
         if stamps:
             task.params["baseline_ts"] = max(stamps)
+
+    async def _start_periodic(
+        self, session_id: str, text: str, parsed: dict[str, Any], turn: Turn
+    ) -> None:
+        if not parsed.get("title"):
+            turn.add("Не понял, за чем следить. Напишите название фильма или сериала.")
+            return
+
+        interval = parsed.get("interval_minutes") or self.settings.default_interval_minutes
+        interval = max(self.settings.min_interval_minutes, int(interval))
+        task = await self._task_from_params(
+            session_id,
+            text,
+            parsed,
+            kind="periodic",
+            interval=interval,
+            auto_download=bool(parsed.get("auto_download")),
+        )
+        turn.task = task
+
+        try:
+            torrents, suggestions = await self._search_with_suggestions(
+                task.params, original=text
+            )
+        except MCPError as exc:
+            task.state = "failed"
+            task.last_error = str(exc)
+            await self.store.save_task(task)
+            turn.add(f"Не смог обратиться к трекеру: {exc}", kind="error", task_id=task.id)
+            return
+
+        task.options = {
+            "pool": [item.to_dict() for item in torrents[:80]],
+            "suggestions": suggestions,
+        }
+        await self._present_periodic(task, torrents, turn)
 
     async def _monitor_after_creation(self, task: Task, turn: Turn, downloaded_now: bool) -> None:
         task.state = "monitoring"
