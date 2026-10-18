@@ -435,6 +435,77 @@ async def test_lost_aliases() -> None:
     agent.store.close()
 
 
+class FailingMCP:
+    """Заглушка: трекер отвечает ошибкой (исчерпан лимит торрент-файлов)."""
+
+    def __init__(self, message: str) -> None:
+        self.message = message
+
+    async def file_list(self, torrent_id: str) -> dict:
+        raise RuntimeError("нет списка")
+
+    async def download(self, torrent_id: str, path: Path) -> dict:
+        raise MCPError(self.message)
+
+
+async def test_periodic_keeps_working() -> None:
+    print("\n== периодическая задача при сбое трекера остаётся в работе ==")
+    tmp = Path(tempfile.mkdtemp(prefix="periodic-fail-"))
+    settings = dataclasses.replace(
+        get_settings(),
+        data_dir=tmp,
+        db_path=tmp / "periodic.sqlite3",
+        torrents_dir=tmp / "torrent-files",
+        transmission_download_dir=tmp / "torrents",
+    )
+    settings.torrents_dir.mkdir(parents=True, exist_ok=True)
+    agent = Agent(settings)
+    error = "Вам недоступен торрент-файл для скачивания. Вы использовали количество в сутки."
+    agent.mcp = FailingMCP(error)  # type: ignore[assignment]
+
+    periodic = Task(
+        id="periodic-task", kind="periodic", state="monitoring", session_id="checks",
+        user_query="Звезды в джунглях", params={"title": "Звезды в джунглях"},
+        interval_minutes=720, auto_download=True,
+    )
+    await agent.store.save_task(periodic)
+    torrent = Torrent(id="777", title="Звезды в джунглях (3 сезон: 1-3 выпуск)", size="3 ГБ")
+    result = await agent._download(periodic, torrent)
+    check("скачивание не удалось", not result["ok"], result)
+    check("причина «tracker»", result.get("reason") == "tracker", result)
+    check("задача осталась в работе", periodic.state == "monitoring", periodic.state)
+    check("следующая проверка назначена", bool(periodic.next_check_at), periodic.next_check_at)
+    check("ошибка записана", "недоступен" in (periodic.last_error or ""), periodic.last_error)
+
+    # Разовую задачу тот же сбой закрывает — там повторять нечего.
+    oneshot = Task(
+        id="oneshot-task", kind="oneshot", state="searching", session_id="checks",
+        user_query="Звезды в джунглях", params={"title": "Звезды в джунглях"},
+    )
+    await agent.store.save_task(oneshot)
+    turn = Turn()
+    await agent._report_tracker_problem(oneshot, torrent, error, turn)
+    check("разовая задача падает", oneshot.state == "failed", oneshot.state)
+    labels = [action.label for action in turn.messages[-1].actions]
+    check("у разовой кнопка «Повторить»", labels and labels[0] == "Повторить", labels)
+
+    # А периодической объясняем, что она продолжит работу.
+    periodic2 = Task(
+        id="periodic-task-2", kind="periodic", state="monitoring", session_id="checks",
+        user_query="Звезды в джунглях", params={"title": "Звезды в джунглях"},
+        interval_minutes=720, auto_download=True,
+    )
+    await agent.store.save_task(periodic2)
+    turn2 = Turn()
+    await agent._report_tracker_problem(periodic2, torrent, error, turn2)
+    text = turn2.messages[-1].text
+    check("периодической сказано про следующую проверку", "следующая проверка" in text, text[-200:])
+    labels2 = [action.label for action in turn2.messages[-1].actions]
+    check("и предложено проверить сейчас", "Проверить сейчас" in labels2, labels2)
+    check("задача осталась в работе после сообщения", periodic2.state == "monitoring", periodic2.state)
+    agent.store.close()
+
+
 async def test_alternatives_and_pack() -> None:
     print("\n== варианты подписаны, сезон предлагается кнопкой ==")
     tmp = Path(tempfile.mkdtemp(prefix="pack-"))
@@ -496,6 +567,7 @@ async def main() -> int:
     await test_title_first()
     await test_many_series()
     await test_lost_aliases()
+    await test_periodic_keeps_working()
     await test_card_without_torrent()
     await test_alternatives_and_pack()
     print("\n=== ИТОГ ===")

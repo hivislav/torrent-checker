@@ -2394,12 +2394,25 @@ class Agent:
             return None, message, "tracker"
         return path, "", ""
 
+    def _mark_problem(self, task: Task, error: str) -> None:
+        """Запоминает ошибку задачи.
+
+        Периодическая задача при сбое не закрывается: она остаётся в работе
+        и просто пробует снова в свой срок. «Упавшая» задача выпадала в
+        завершённые, и человек терял её из виду.
+        """
+        task.last_error = error
+        if task.kind == "periodic":
+            task.state = "monitoring"
+            self._schedule_next(task)
+        else:
+            task.state = "failed"
+
     async def _report_tracker_problem(
         self, task: Task, torrent: Torrent, error: str, turn: Turn
     ) -> None:
         """Трекер не отдал .torrent: объясняем причину и даём кнопку «Повторить»."""
-        task.state = "failed"
-        task.last_error = error
+        self._mark_problem(task, error)
         await self.store.save_task(task)
         text = (
             "Трекер не выдал torrent-файл, поэтому скачать пока нечего.\n\n"
@@ -2414,23 +2427,49 @@ class Agent:
             )
         if "вход" in lowered or "войдите" in lowered:
             text += "\n\nПохоже, сессия на трекере слетела — стоит заново войти на kinozal.me."
+        if task.kind == "periodic":
+            interval = self._human_interval(
+                task.interval_minutes or self.settings.default_interval_minutes
+            )
+            text += (
+                f"\n\nЗадача продолжает работать: следующая проверка через {interval}, "
+                "и я попробую снова."
+            )
         message = turn.add(text, kind="error", task_id=task.id, payload={"task": task.to_dict()})
-        message.actions = [
-            Action(
-                id="retry-fetch",
-                label="Повторить",
-                kind="confirm_download",
-                payload={"task_id": task.id, "torrent_id": torrent.id},
-                style="primary",
-            ),
-            Action(
-                id="cancel-fetch",
-                label="Отмена",
-                kind="cancel",
-                payload={"task_id": task.id},
-                style="danger",
-            ),
-        ]
+        if task.kind == "periodic":
+            message.actions = [
+                Action(
+                    id="check-now",
+                    label="Проверить сейчас",
+                    kind="check_now",
+                    payload={"task_id": task.id},
+                    style="primary",
+                ),
+                Action(
+                    id="cancel-fetch",
+                    label="Отмена",
+                    kind="cancel",
+                    payload={"task_id": task.id},
+                    style="danger",
+                ),
+            ]
+        else:
+            message.actions = [
+                Action(
+                    id="retry-fetch",
+                    label="Повторить",
+                    kind="confirm_download",
+                    payload={"task_id": task.id, "torrent_id": torrent.id},
+                    style="primary",
+                ),
+                Action(
+                    id="cancel-fetch",
+                    label="Отмена",
+                    kind="cancel",
+                    payload={"task_id": task.id},
+                    style="danger",
+                ),
+            ]
 
     async def _download_with_report(
         self, task: Task, torrent: Torrent, turn: Turn, periodic_context: bool = False
@@ -3057,8 +3096,7 @@ class Agent:
             if wanted is not None and selected:
                 transmission_note += f", файлов выбрано: {selected}"
         except (NotEnoughSpace, StorageUnavailable) as exc:
-            task.last_error = str(exc)
-            task.state = "failed"
+            self._mark_problem(task, str(exc))
             await self.store.save_task(task)
             return {
                 "ok": False,
@@ -3169,8 +3207,7 @@ class Agent:
         """
         path, error, reason = await self._fetch_torrent(torrent, refresh=True)
         if path is None:
-            task.last_error = error
-            task.state = "failed"
+            self._mark_problem(task, error)
             await self.store.save_task(task)
             return {
                 "ok": False,
@@ -3267,8 +3304,7 @@ class Agent:
                 files_wanted=list(wanted) if wanted is not None else None,
             )
         except (NotEnoughSpace, StorageUnavailable) as exc:
-            task.state = "failed"
-            task.last_error = str(exc)
+            self._mark_problem(task, str(exc))
             await self.store.save_task(task)
             await self._report_storage_problem(
                 task,
@@ -3616,6 +3652,10 @@ class Agent:
         lock = self._check_locks.setdefault(task.id, asyncio.Lock())
         async with lock:
             turn = turn or Turn()
+            if task.kind == "periodic" and task.state == "failed":
+                # Возвращаем задачу в работу: сбой трекера — не приговор.
+                task.state = "monitoring"
+                await self.store.save_task(task)
             params = task.params
             task.last_check_at = now_iso()
             task.checks_done += 1

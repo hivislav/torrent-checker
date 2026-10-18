@@ -362,12 +362,52 @@ async def test_plan_for_periodic() -> None:
     check("индексы совпадают", picked["indexes"] == [2, 3, 4], picked["indexes"])
 
 
+async def test_failed_task_keeps_checking() -> None:
+    print("\n== задача со сбоем остаётся в расписании ==")
+    tmp = Path(tempfile.mkdtemp(prefix="periodic-due-"))
+    settings = dataclasses.replace(
+        get_settings(),
+        data_dir=tmp,
+        db_path=tmp / "due.sqlite3",
+        torrents_dir=tmp / "torrent-files",
+        transmission_download_dir=tmp / "torrents",
+    )
+    settings.torrents_dir.mkdir(parents=True, exist_ok=True)
+    agent = Agent(settings)
+    from core.models import Task
+
+    failed = Task(
+        id="failed-periodic", kind="periodic", state="failed", session_id="checks",
+        user_query="Звезды в джунглях", params={"title": "Звезды в джунглях"},
+        interval_minutes=720, auto_download=True,
+        next_check_at="2020-01-01T00:00:00+00:00",
+    )
+    await agent.store.save_task(failed)
+    due = await agent.store.due_periodic()
+    check("упавшая периодическая попадает в расписание",
+          any(task.id == "failed-periodic" for task in due), [task.id for task in due])
+
+    # Проверка возвращает её в работу, даже если трекер снова отвечает ошибкой.
+    class BrokenSearch:
+        async def search_pages(self, query: str, pages: int = 1):
+            from core.mcp_client import MCPError
+
+            raise MCPError("трекер молчит")
+
+    agent.mcp = BrokenSearch()  # type: ignore[assignment]
+    await agent.check_task(failed)
+    check("после проверки состояние снова «в работе»", failed.state == "monitoring", failed.state)
+    check("и следующая проверка назначена", bool(failed.next_check_at), failed.next_check_at)
+    agent.store.close()
+
+
 async def main() -> int:
     await test_auto_download()
     await test_delete_keeps_progress()
     await test_notify_only()
     await test_episode_before_floor()
     await test_plan_for_periodic()
+    await test_failed_task_keeps_checking()
 
     print("\n=== ИТОГ ===")
     if FAILS:

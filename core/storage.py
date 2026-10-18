@@ -215,8 +215,11 @@ class Store:
         stamp = now_iso()
 
         def run(conn: sqlite3.Connection):
+            # «failed» тоже берём: периодическая задача после сбоя трекера
+            # должна продолжить работу, а не остаться в завершённых навсегда.
             cursor = conn.execute(
-                "SELECT * FROM tasks WHERE kind='periodic' AND state='monitoring' "
+                "SELECT * FROM tasks WHERE kind='periodic' "
+                "AND state IN ('monitoring', 'failed') "
                 "AND (next_check_at IS NULL OR next_check_at <= ?) ORDER BY next_check_at",
                 (stamp,),
             )
