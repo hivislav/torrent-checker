@@ -133,6 +133,8 @@ async def test_foreign_query() -> None:
     check("то же название — уточнение",
           agent._is_refinement("Человек-паук: Новый день 4K",
                                {"quality": "2160p"}, task))  # noqa: SLF001
+    check("«Сериал» — уточнение типа, а не новый поиск",
+          agent._is_refinement("Сериал", {"type": "series"}, task))  # noqa: SLF001
 
     # Старая задача не должна считаться текущей.
     from datetime import datetime, timedelta, timezone
