@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="theme-color" content="#150f09">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>Кинозал — агент раздач</title>
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/static/icon-192.png">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <!-- Плёночные дефекты: зерно, царапины, мерцание, винетка -->
+  <div class="film-grain" aria-hidden="true"></div>
+  <div class="film-scratches" aria-hidden="true"></div>
+  <div class="film-flicker" aria-hidden="true"></div>
+  <div class="film-vignette" aria-hidden="true"></div>
+  <div class="film-sprockets film-sprockets--left" aria-hidden="true"></div>
+  <div class="film-sprockets film-sprockets--right" aria-hidden="true"></div>
+
+  <div class="app">
+    <!-- ==================== Панель задач ==================== -->
+    <aside class="panel" id="panel" aria-label="Панель задач">
+      <div class="panel__head">
+        <div class="panel__title">Картотека</div>
+        <button class="panel__close" id="panel-close" aria-label="Закрыть панель">✕</button>
+      </div>
+
+      <div class="panel__scroll">
+        <section class="panel__section">
+          <h2 class="panel__section-title">
+            <span class="reel" aria-hidden="true"></span> В работе
+            <span class="badge" id="active-count">0</span>
+          </h2>
+          <div class="task-list" id="active-tasks"></div>
+        </section>
+
+        <section class="panel__section">
+          <h2 class="panel__section-title">
+            <span class="reel reel--done" aria-hidden="true"></span> Архив
+            <button class="link-btn" id="toggle-archive">показать</button>
+          </h2>
+          <div class="task-list task-list--archive" id="past-tasks" hidden></div>
+        </section>
+
+        <section class="panel__section">
+          <h2 class="panel__section-title">
+            <span class="reel reel--done" aria-hidden="true"></span> Скачано
+          </h2>
+          <div class="task-list" id="download-list"></div>
+        </section>
+
+        <section class="panel__section">
+          <h2 class="panel__section-title">Служебное</h2>
+          <div class="status-grid" id="status-grid">проверяю…</div>
+          <div class="panel__actions">
+            <button class="btn btn--ghost" id="refresh-status">Обновить статус</button>
+            <button class="btn btn--ghost" id="open-settings">Доступы</button>
+            <button class="btn btn--ghost" id="enable-notifications">Включить уведомления</button>
+            <button class="btn btn--ghost" id="logout">Выйти</button>
+          </div>
+        </section>
+      </div>
+    </aside>
+    <div class="panel-scrim" id="panel-scrim"></div>
+
+    <!-- ==================== Основной экран ==================== -->
+    <main class="stage">
+      <header class="marquee">
+        <button class="marquee__menu" id="panel-open" aria-label="Открыть картотеку">☰</button>
+        <div class="marquee__brand">
+          <span class="marquee__lamp" aria-hidden="true"></span>
+          <div>
+            <h1 class="marquee__title">Кинозал</h1>
+            <p class="marquee__subtitle">агент по раздачам · kinozal.me · transmission</p>
+          </div>
+        </div>
+        <div class="marquee__right">
+          <button class="bell" id="bell" aria-label="Уведомления">
+            <span aria-hidden="true">✦</span>
+            <span class="bell__dot" id="bell-dot" hidden></span>
+          </button>
+        </div>
+      </header>
+
+      <div class="notification-tray" id="notification-tray" hidden>
+        <div class="notification-tray__head">
+          <strong>Киножурнал</strong>
+          <button class="link-btn" id="clear-notifications">очистить</button>
+        </div>
+        <div class="notification-tray__list" id="notification-list"></div>
+      </div>
+
+      <div class="chat" id="chat" role="log" aria-live="polite">
+        <div class="chat__intro">
+          <p class="chat__intro-title">Крутите ручку — я запущу проектор.</p>
+          <p class="chat__intro-text">
+            Напишите, что искать: название, качество, озвучку. Например
+            «Тед Лассо 1080p LostFilm». Затем выберите, как работать:
+          </p>
+          <ul class="chat__legend">
+            <li><b>Разово</b> — найду сейчас, покажу раздачу и после подтверждения скачаю.</li>
+            <li><b>Периодически</b> — буду проверять трекер и сообщать о новых сериях.</li>
+          </ul>
+        </div>
+      </div>
+
+      <form class="composer" id="composer">
+        <div class="composer__modes" role="group" aria-label="Режим задачи">
+          <button type="button" class="mode-btn is-active" data-mode="oneshot">
+            <span class="mode-btn__icon" aria-hidden="true">⏱</span>
+            <span class="mode-btn__label">Разово</span>
+            <span class="mode-btn__hint">найти и скачать</span>
+          </button>
+          <button type="button" class="mode-btn" data-mode="periodic">
+            <span class="mode-btn__icon" aria-hidden="true">⟳</span>
+            <span class="mode-btn__label">Периодически</span>
+            <span class="mode-btn__hint">следить за новым</span>
+          </button>
+        </div>
+        <div class="composer__row">
+          <textarea
+            id="input"
+            class="composer__input"
+            rows="1"
+            placeholder="Дюна 2160p, Дубляж…"
+            autocomplete="off"
+          ></textarea>
+          <button class="send" id="send" type="submit" aria-label="Отправить">
+            <span aria-hidden="true">▶</span>
+          </button>
+        </div>
+        <p class="composer__hint" id="composer-hint">
+          Enter — отправить · Shift+Enter — новая строка
+        </p>
+      </form>
+    </main>
+  </div>
+
+  <!-- ==================== Настройки доступов ==================== -->
+  <div class="modal" id="settings-modal" hidden>
+    <div class="modal__box">
+      <h2 class="modal__title">Доступы</h2>
+      <p class="modal__note">
+        Логин и пароль от kinozal.me нужны, чтобы скачивать .torrent-файлы.
+        Пароль RPC Transmission — чтобы ставить загрузки в очередь.
+      </p>
+      <label class="field">
+        <span>kinozal.me — логин</span>
+        <input id="kz-user" type="text" autocomplete="username" placeholder="логин на kinozal.me">
+      </label>
+      <label class="field">
+        <span>kinozal.me — пароль</span>
+        <input id="kz-pass" type="password" autocomplete="current-password" placeholder="••••••">
+      </label>
+      <label class="field">
+        <span>Transmission RPC — логин</span>
+        <input id="tr-user" type="text" autocomplete="off" placeholder="логин RPC">
+      </label>
+      <label class="field">
+        <span>Transmission RPC — пароль</span>
+        <input id="tr-pass" type="password" autocomplete="off" placeholder="••••••">
+      </label>
+      <div class="modal__actions">
+        <button class="btn btn--primary" id="save-settings">Сохранить</button>
+        <button class="btn btn--ghost" id="test-settings">Проверить</button>
+        <button class="btn btn--ghost" id="close-settings">Закрыть</button>
+      </div>
+      <pre class="modal__result" id="settings-result" hidden></pre>
+    </div>
+  </div>
+
+  <template id="message-template">
+    <article class="msg">
+      <div class="msg__filmstrip" aria-hidden="true"></div>
+      <div class="msg__body">
+        <div class="msg__meta"><span class="msg__role"></span><span class="msg__time"></span></div>
+        <div class="msg__text"></div>
+        <div class="msg__actions"></div>
+      </div>
+    </article>
+  </template>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,31 @@
+# Source files (compiled to build/)
+src/
+tsconfig.json
+
+# Development
+.env
+.env.local
+*.tsbuildinfo
+.vscode/
+.idea/
+
+# Test files
+browse_response.html
+details_response.html
+*.torrent
+
+# Python (legacy)
+__pycache__/
+*.py[oc]
+.venv
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Git
+.git
+.gitignore
+.mcp.json
+
+# Don't ignore build/ - we need it in npm package!

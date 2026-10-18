@@ -1,0 +1,31 @@
+# TypeScript/Node
+node_modules/
+build/
+dist/
+*.tsbuildinfo
+
+# Environment
+.env
+.env.local
+
+# Python (legacy)
+__pycache__/
+*.py[oc]
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test files
+browse_response.html
+details_response.html
+*.torrent
+
+.mcp.json

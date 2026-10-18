@@ -1,0 +1,14 @@
+# Данные, секреты и мусор не попадают в репозиторий
+.env
+.venv/
+data/
+npm-cache/
+.npm-cache/
+node_modules/
+mcp/kinozal-mcp/build/
+mcp/kinozal-mcp/.npm-logs/
+.idea/
+mcp/kinozal-mcp/node_modules/
+__pycache__/
+*.pyc
+.DS_Store

@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#150f09">
+  <title>Кинозал — вход</title>
+  <link rel="icon" href="/static/icon-192.png">
+  <link rel="stylesheet" href="/static/style.css">
+  <style>
+    body { display: grid; place-items: center; min-height: 100vh; }
+    .login {
+      width: min(400px, calc(100vw - 40px));
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: linear-gradient(180deg, #261b10, #140f08);
+      box-shadow: var(--shadow);
+      padding: 26px 24px;
+      position: relative;
+      z-index: 20;
+    }
+    .login__title {
+      margin: 0 0 6px;
+      font-size: 24px;
+      letter-spacing: .24em;
+      text-transform: uppercase;
+      color: var(--amber-bright);
+      text-align: center;
+    }
+    .login__sub {
+      margin: 0 0 22px;
+      font-family: var(--mono);
+      font-size: 9.5px;
+      letter-spacing: .2em;
+      text-transform: uppercase;
+      color: var(--ink-faint);
+      text-align: center;
+    }
+    .login__error {
+      margin: 12px 0 0;
+      color: var(--red);
+      font-size: 12.5px;
+      min-height: 18px;
+      text-align: center;
+    }
+    .login .btn { width: 100%; margin-top: 16px; padding: 11px; font-size: 11px; }
+  </style>
+</head>
+<body>
+  <div class="film-grain" aria-hidden="true"></div>
+  <div class="film-scratches" aria-hidden="true"></div>
+  <div class="film-flicker" aria-hidden="true"></div>
+  <div class="film-vignette" aria-hidden="true"></div>
+
+  <form class="login" id="login-form">
+    <h1 class="login__title">Кинозал</h1>
+    <p class="login__sub">агент по раздачам · вход</p>
+    <label class="field">
+      <span>пароль доступа</span>
+      <input type="password" id="password" autocomplete="current-password" autofocus required>
+    </label>
+    <button class="btn btn--primary" type="submit">Войти</button>
+    <p class="login__error" id="error"></p>
+  </form>
+
+  <script>
+    document.getElementById("login-form").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const error = document.getElementById("error");
+      error.textContent = "";
+      try {
+        const response = await fetch("/api/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ password: document.getElementById("password").value }),
+        });
+        if (!response.ok) {
+          const data = await response.json().catch(() => ({}));
+          error.textContent = data.detail || "неверный пароль";
+          return;
+        }
+        window.location.reload();
+      } catch (err) {
+        error.textContent = "сеть недоступна: " + err.message;
+      }
+    });
+  </script>
+</body>
+</html>

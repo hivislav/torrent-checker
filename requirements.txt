@@ -1,0 +1,22 @@
+# --- Ядро ---
+# HTTP-клиент к LLM (DeepSeek) и к локальным сервисам.
+httpx>=0.27
+# MCP-клиент: официальный Python SDK, по нему агент общается с kinozal-mcp (stdio).
+mcp>=1.0
+# Transmission RPC.
+transmission-rpc>=7.0
+
+# --- Обход Cloudflare на kinozal.me ---
+# cf_clearance добывает Chrome через CDP (nodriver), а сами запросы делает curl_cffi
+# с TLS-отпечатком браузера.
+nodriver>=0.38
+curl_cffi>=0.7
+
+# --- Веб-интерфейс ---
+fastapi>=0.115
+uvicorn[standard]>=0.34
+
+# --- Уведомления ---
+# Web Push (VAPID). Необязательны: без них работает центр уведомлений в браузере
+# и системные уведомления macOS.
+pywebpush>=2.0

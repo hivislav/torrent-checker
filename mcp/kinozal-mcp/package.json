@@ -1,0 +1,49 @@
+{
+  "name": "kinozal-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for kinozal.tv torrent tracker",
+  "type": "module",
+  "main": "build/index.js",
+  "bin": {
+    "kinozal-mcp": "build/index.js"
+  },
+  "files": [
+    "build/**/*",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "prepare": "npm run build",
+    "watch": "tsc --watch"
+  },
+  "keywords": [
+    "mcp",
+    "kinozal",
+    "torrent",
+    "model-context-protocol"
+  ],
+  "author": "tokezooo",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tokezooo/kinozal-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/tokezooo/kinozal-mcp/issues"
+  },
+  "homepage": "https://github.com/tokezooo/kinozal-mcp#readme",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "cheerio": "^1.0.0",
+    "dotenv": "^16.4.5",
+    "node-fetch": "^3.3.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.3"
+  }
+}

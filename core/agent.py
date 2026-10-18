@@ -1,0 +1,1231 @@
+"""Агент: мозг без интерфейса.
+
+Всё, что умеет система, живёт здесь и вызывается методами:
+
+    await agent.handle_message(session_id, text, mode)   # разговор
+    await agent.handle_action(session_id, kind, payload) # нажатие кнопки
+    await agent.list_tasks()                             # панель задач
+    await agent.cancel_task(task_id)
+    await agent.history(session_id)
+
+Ни одна строка ниже не знает про FastAPI, HTML или браузер: ответы приходят
+объектами `Turn` с кнопками `Action`. Поэтому тот же агент можно поднять как
+Telegram-бота (веб — просто ещё один адаптер), и это требование задачи —
+«агент независим от UI» — выполняется буквально.
+
+Как устроен разбор запроса:
+
+  текст пользователя
+      │  (LLM: разбор параметров — название, качество, озвучка, сезон, период)
+      ▼
+  MCP kinozal-mcp (поиск по трекеру через шлюз Cloudflare)
+      ▼
+  чистые правила (core/matching.py): фильтр, «что нового», выбор вариантов
+      ▼
+  состояния задачи + кнопки (подтверждение, отмена, выбор качества/озвучки)
+
+LLM привлекается к разбору запроса и к текстам, а выбор раздачи делают правила.
+Так «4к» не превращается в что попало, а повторный запрос даёт тот же результат.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+from core.config import Settings, get_settings
+from core.llm import LLM, LLMError
+from core.matching import (
+    QUALITY_LABELS,
+    collect_options,
+    describe,
+    episodes_by_season,
+    filter_candidates,
+    find_new,
+    is_pack,
+    rank,
+)
+from core.mcp_client import KinozalMCP, MCPError
+from core.models import Action, Message, Task, Torrent, Turn, new_id, now_iso
+from core.notify import DesktopNotifier, EventBus
+from core.push import WebPush
+from core.parsing import parse_torrent
+from core.storage import Store
+from core.transmission import Transmission, TransmissionError
+
+log = logging.getLogger("agent")
+
+# ----------------------------------------------------------------------
+# Промпты
+# ----------------------------------------------------------------------
+PARSE_SYSTEM = """Ты — разборщик запросов торрент-агента. По сообщению пользователя
+верни ТОЛЬКО JSON-объект, без пояснений и без markdown.
+
+Поля JSON:
+{
+  "title": строка — название фильма/сериала, как его назвал пользователь, или null,
+  "original_title": строка — оригинальное (английское) название, если пользователь его написал, иначе null,
+  "quality": строка или null — только если качество названо явно:
+             "2160p" (это же «4к», «4K», «UHD»), "1080p" («fullhd», «1080», «FHD»),
+             "720p" («720», «HD»), "480p", "Blu-Ray", "WEB-DL", "BDRip", "HDRip", "HDTV", "DVDRip",
+  "voice": строка или null — озвучка, как её назвал пользователь: "LostFilm", "Кубик в Кубе",
+           "HDrezka", "ДБ", "ПМ", "ЛМ", "СТ", "Дубляж" и т.п.,
+  "season": целое число или null — номер сезона,
+  "episode_from": целое число или null — с какой серии начинать,
+  "year": целое число (год) или null,
+  "interval_minutes": целое число или null — период проверки в минутах (например «раз в час» = 60),
+  "auto_download": true|false|null — true если просят сразу качать («качай», «скачивай», «сразу качай»),
+                   false если просят только сообщать («сообщай», «только сообщай», «спроси разрешение»),
+                   null если не сказано,
+  "intent": "find" | "monitor" | "question"
+}
+
+Правила:
+- НЕ выдумывай параметры, которых в сообщении нет. Сомневаешься — null.
+- Год, сезон и серию не путай: «4 сезон» — это season, «5 серия» — это episode_from.
+- «Следи», «проверяй», «мониторь», «отслеживай» — это intent = "monitor".
+- Вопрос, приветствие, просьба объяснить — intent = "question".
+- Если пользователь просит найти и скачать — intent = "find"."""
+
+CHAT_SYSTEM = """Ты — помощник локального торрент-агента «Кинозал». Он ищет раздачи на
+kinozal.me, скачивает торрент-файлы и ставит их в Transmission, а также умеет
+следить за новыми сериями.
+
+Отвечай по-русски, коротко и по делу (2–5 предложений). Не выдумывай названия
+раздач и не обещай того, чего агент не умеет. Если пользователь просит что-то
+найти, скачать или отслеживать — подскажи нажать кнопку «Разово» или
+«Периодически» под полем ввода и написать запрос."""
+
+
+class Agent:
+    """Ядро системы. Один на процесс, потокобезопасен на уровне корутин."""
+
+    def __init__(self, settings: Settings | None = None) -> None:
+        self.settings = settings or get_settings()
+        self.store = Store(self.settings.db_path)
+        self.llm = LLM(self.settings)
+        self.mcp = KinozalMCP(self.settings)
+        self.transmission = Transmission(self.settings)
+        self.events = EventBus()
+        self.desktop = DesktopNotifier(enabled=True)
+        self.push = WebPush(store=self.store, data_dir=self.settings.data_dir)
+        self._started = False
+        self._check_locks: dict[str, asyncio.Lock] = {}
+        self._running_checks: set[str] = set()
+        self.scheduler_task: asyncio.Task | None = None
+        self.scheduler_tick_seconds = 20
+
+    # ------------------------------------------------------------------
+    # жизненный цикл
+    # ------------------------------------------------------------------
+    async def start(self, *, with_scheduler: bool = True) -> None:
+        if self._started:
+            return
+        self.settings.torrents_dir.mkdir(parents=True, exist_ok=True)
+        self._started = True
+        try:
+            await self.mcp.start()
+        except MCPError as exc:
+            log.error("MCP недоступен: %s", exc)
+        await self._load_overrides()
+        await self.push.prepare()
+        if with_scheduler:
+            self.scheduler_task = asyncio.create_task(self._scheduler_loop())
+            log.info("шедулер периодических задач запущен")
+
+    async def stop(self) -> None:
+        if self.scheduler_task:
+            self.scheduler_task.cancel()
+            try:
+                await self.scheduler_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+            self.scheduler_task = None
+        await self.mcp.stop()
+        await self.llm.close()
+        self.store.close()
+        self._started = False
+
+    async def _load_overrides(self) -> None:
+        """Пароли, заданные через интерфейс, важнее .env."""
+        kinozal_password = await self.store.get_setting("kinozal_password")
+        if kinozal_password:
+            object.__setattr__(self.settings, "kinozal_password", kinozal_password)
+        email = await self.store.get_setting("kinozal_username")
+        if email:
+            object.__setattr__(self.settings, "kinozal_username", email)
+        tr_password = await self.store.get_setting("transmission_password")
+        tr_user = await self.store.get_setting("transmission_username")
+        if tr_user or tr_password:
+            self.transmission.configure(
+                self.settings.transmission_host,
+                self.settings.transmission_port,
+                tr_user or self.settings.transmission_username,
+                tr_password or self.settings.transmission_password,
+            )
+
+    # ------------------------------------------------------------------
+    # Публичный API (используется веб-слоем и будущим ботом)
+    # ------------------------------------------------------------------
+    async def handle_message(self, session_id: str, text: str, mode: str = "chat") -> Turn:
+        text = (text or "").strip()
+        turn = Turn()
+        if not text:
+            turn.add("Пустой запрос. Напишите, что искать — например «Дюна 1080p».")
+            return turn
+
+        await self._remember(session_id, Message(role="user", text=text, kind="text"))
+
+        try:
+            parsed = await self._parse_query(text)
+        except LLMError as exc:
+            parsed = {}
+            log.warning("разбор запроса не удался: %s", exc)
+
+        intent = str(parsed.get("intent") or "")
+        effective_mode = mode
+        if mode not in ("oneshot", "periodic"):
+            effective_mode = "periodic" if intent == "monitor" else "oneshot"
+            if intent == "question" and not parsed.get("title"):
+                reply = await self._chat_answer(text)
+                turn.add(reply)
+                await self._remember_many(session_id, turn.messages)
+                return turn
+
+        if effective_mode == "periodic":
+            await self._start_periodic(session_id, text, parsed, turn)
+        else:
+            await self._start_oneshot(session_id, text, parsed, turn)
+
+        await self._remember_many(session_id, turn.messages)
+        return turn
+
+    async def handle_action(self, session_id: str, kind: str, payload: dict[str, Any]) -> Turn:
+        turn = Turn()
+        task_id = str(payload.get("task_id") or "")
+        task = await self.store.get_task(task_id) if task_id else None
+        turn.task = task
+
+        if kind == "cancel" and task:
+            await self.cancel_task(task.id)
+            turn.add(
+                f"Задача «{task.title}» отменена.",
+                kind="task",
+                task_id=task.id,
+                payload={"task": task.to_dict()},
+            )
+        elif kind == "choose" and task:
+            dimension = str(payload.get("dimension") or "")
+            value = str(payload.get("value") or "")
+            if dimension and value:
+                task.params[dimension] = value
+                task.state = "searching"
+                await self.store.save_task(task)
+            await self._selection_step(task, turn)
+        elif kind == "confirm_download" and task:
+            torrent = Torrent.from_dict(task.candidate or {})
+            await self._download_with_report(task, torrent, turn)
+        elif kind == "pick_torrent" and task:
+            torrent_id = str(payload.get("torrent_id") or "")
+            pool = [Torrent.from_dict(item) for item in (task.options or {}).get("pool", [])]
+            torrent = next((t for t in pool if t.id == torrent_id), None)
+            if torrent is None:
+                turn.add("Не нашёл эту раздачу — начните заново.", kind="error")
+            else:
+                task.candidate = torrent.to_dict()
+                await self._download_with_report(task, torrent, turn)
+        elif kind == "make_periodic":
+            source = task
+            if source is None:
+                turn.add("Задача не найдена.", kind="error")
+            else:
+                interval = int(payload.get("interval_minutes") or self.settings.default_interval_minutes)
+                periodic = await self._task_from_params(
+                    session_id,
+                    source.user_query,
+                    dict(source.params),
+                    kind="periodic",
+                    interval=interval,
+                    auto_download=bool(payload.get("auto_download", False)),
+                )
+                await self._monitor_after_creation(periodic, turn, downloaded_now=False)
+        elif kind in ("periodic_auto", "periodic_notify") and task:
+            task.auto_download = kind == "periodic_auto"
+            task.state = "monitoring"
+            task.interval_minutes = task.interval_minutes or self.settings.default_interval_minutes
+            self._schedule_next(task)
+            await self.store.save_task(task)
+            turn.add(
+                self._monitoring_text(task),
+                kind="task",
+                task_id=task.id,
+                payload={"task": task.to_dict()},
+            )
+            turn.messages[-1].actions = self._task_actions(task)
+            if task.auto_download and task.candidate:
+                torrent = Torrent.from_dict(task.candidate)
+                await self._download_with_report(task, torrent, turn, periodic_context=True)
+        elif kind == "download_new" and task:
+            torrent_id = str(payload.get("torrent_id") or "")
+            pool = [Torrent.from_dict(item) for item in (task.options or {}).get("pool", [])]
+            torrent = next((t for t in pool if t.id == torrent_id), None)
+            if torrent is None:
+                turn.add("Эта раздача больше не в списке — дождитесь следующей проверки.", kind="error")
+            else:
+                await self._download_with_report(task, torrent, turn, periodic_context=True)
+        elif kind == "check_now" and task:
+            await self.check_task(task, manual=True, turn=turn)
+        elif kind == "forget_downloads":
+            await self.store.set_setting("__noop", "")
+            turn.add("Готово.")
+        else:
+            turn.add("Не понял действие. Попробуйте ещё раз.", kind="error")
+
+        await self._remember_many(session_id, turn.messages)
+        return turn
+
+    # ------------------------------------------------------------------
+    # Задачи: чтение и отмена
+    # ------------------------------------------------------------------
+    async def list_tasks(self, include_finished: bool = True, limit: int = 40) -> list[dict[str, Any]]:
+        tasks = await self.store.list_tasks(limit=limit)
+        if not include_finished:
+            tasks = [task for task in tasks if task.is_active]
+        return [task.to_dict() for task in tasks]
+
+    async def get_task(self, task_id: str) -> Task | None:
+        return await self.store.get_task(task_id)
+
+    async def cancel_task(self, task_id: str) -> Task | None:
+        task = await self.store.get_task(task_id)
+        if task is None:
+            return None
+        task.state = "cancelled"
+        task.next_check_at = None
+        await self.store.save_task(task)
+        await self.events.publish(
+            {"type": "task_cancelled", "task_id": task.id, "title": task.title}
+        )
+        return task
+
+    async def history(self, session_id: str, limit: int = 80) -> list[dict[str, Any]]:
+        return await self.store.history(session_id, limit)
+
+    async def downloads(self, limit: int = 50) -> list[dict[str, Any]]:
+        return await self.store.list_downloads(limit)
+
+    async def status(self) -> dict[str, Any]:
+        import httpx
+
+        gate: dict[str, Any] = {"ok": False, "error": "неизвестно"}
+        try:
+            async with httpx.AsyncClient(timeout=8) as client:
+                response = await client.get(
+                    f"http://{self.settings.gate_host}:{self.settings.gate_port}/status"
+                )
+                gate = {"ok": response.status_code == 200, **response.json()}
+        except Exception as exc:  # noqa: BLE001
+            gate = {"ok": False, "error": str(exc)[:200]}
+
+        transmission = await self.transmission.test_connection()
+        return {
+            "model": {
+                "name": self.settings.llm_model,
+                "configured": bool(self.settings.llm_api_key),
+                "last_error": self.llm.last_error,
+            },
+            "mcp": {"ready": self.mcp.ready},
+            "gate": gate,
+            "transmission": transmission,
+            "tasks": {
+                "active": len(await self.store.list_tasks(limit=500, states=["monitoring"])),
+            },
+            "now": now_iso(),
+        }
+
+    # ------------------------------------------------------------------
+    # Разбор запроса и поиск
+    # ------------------------------------------------------------------
+    async def _parse_query(self, text: str) -> dict[str, Any]:
+        data = await self.llm.ask_json(PARSE_SYSTEM, text)
+        if not isinstance(data, dict):
+            data = {}
+        cleaned: dict[str, Any] = {}
+        for key in ("title", "original_title", "quality", "voice"):
+            value = data.get(key)
+            cleaned[key] = str(value).strip() if value not in (None, "", "null") else None
+        for key in ("season", "episode_from", "year", "interval_minutes"):
+            value = data.get(key)
+            try:
+                cleaned[key] = int(value) if value not in (None, "", "null") else None
+            except (TypeError, ValueError):
+                cleaned[key] = None
+        auto = data.get("auto_download")
+        cleaned["auto_download"] = auto if isinstance(auto, bool) else None
+        cleaned["intent"] = data.get("intent") if isinstance(data.get("intent"), str) else None
+        return cleaned
+
+    async def _chat_answer(self, text: str) -> str:
+        try:
+            return await self.llm.ask_text(CHAT_SYSTEM, text, temperature=0.4, max_tokens=600)
+        except LLMError as exc:
+            return f"Модель сейчас недоступна: {exc}"
+
+    async def _search(self, params: dict[str, Any]) -> list[Torrent]:
+        """Поиск по трекеру: несколько запросов, потому что названия бывают разные."""
+        queries: list[str] = []
+        title = str(params.get("title") or "").strip()
+        original = str(params.get("original_title") or "").strip()
+        year = params.get("year")
+        if title:
+            queries.append(title)
+            if year:
+                queries.append(f"{title} {year}")
+        if original and original.lower() != title.lower():
+            queries.append(original)
+        if not queries:
+            return []
+
+        seen: dict[str, Torrent] = {}
+        errors: list[str] = []
+        for query in dict.fromkeys(queries):
+            try:
+                raw_items = await self.mcp.search_pages(query, pages=2)
+            except MCPError as exc:
+                errors.append(f"{query}: {exc}")
+                continue
+            for raw in raw_items:
+                torrent = parse_torrent(raw)
+                if torrent.id and torrent.id not in seen:
+                    seen[torrent.id] = torrent
+        if not seen and errors:
+            raise MCPError("; ".join(errors[:2]))
+        return list(seen.values())
+
+    # ------------------------------------------------------------------
+    # Разовая задача
+    # ------------------------------------------------------------------
+    async def _start_oneshot(
+        self, session_id: str, text: str, parsed: dict[str, Any], turn: Turn
+    ) -> None:
+        if not parsed.get("title"):
+            turn.add(
+                "Не понял, что искать. Напишите название — например "
+                "«Тед Лассо 1080p LostFilm».",
+            )
+            return
+
+        task = await self._task_from_params(session_id, text, parsed, kind="oneshot")
+        turn.task = task
+        turn.add(
+            f"Ищу «{task.title}»"
+            + (f" ({task.params.get('quality')})" if task.params.get("quality") else "")
+            + (f", озвучка {task.params.get('voice')}" if task.params.get("voice") else "")
+            + "…",
+            kind="text",
+            task_id=task.id,
+        )
+
+        try:
+            torrents = await self._search(task.params)
+        except MCPError as exc:
+            task.state = "failed"
+            task.last_error = str(exc)
+            await self.store.save_task(task)
+            turn.add(
+                f"Не смог обратиться к трекеру: {exc}",
+                kind="error",
+                task_id=task.id,
+                payload={"task": task.to_dict()},
+            )
+            return
+
+        task.options = {
+            "pool": [t.to_dict() for t in torrents[:80]],
+            "queries": [task.params.get("title")],
+        }
+        await self.store.save_task(task)
+        await self._selection_step(task, turn)
+
+    async def _selection_step(self, task: Task, turn: Turn) -> None:
+        """Решает: предложить выбор, подтвердить раздачу или честно сказать «нет»."""
+        pool = [Torrent.from_dict(item) for item in (task.options or {}).get("pool", [])]
+        params = task.params
+
+        by_title = filter_candidates(pool, {"title": params.get("title") or ""})
+        if not by_title:
+            task.state = "not_found"
+            await self.store.save_task(task)
+            text = await self._not_found_text(task)
+            message = turn.add(text, kind="error", task_id=task.id, payload={"task": task.to_dict()})
+            message.actions = [
+                Action(
+                    id="make_periodic",
+                    label="Сделать периодической",
+                    kind="make_periodic",
+                    payload={
+                        "task_id": task.id,
+                        "interval_minutes": self.settings.default_interval_minutes,
+                        "auto_download": False,
+                    },
+                    style="primary",
+                )
+            ]
+            return
+
+        matched = filter_candidates(by_title, params)
+        downloaded = await self.store.downloaded_ids()
+
+        if not matched:
+            # Нашлось, но не подходит под качество/озвучку — показываем, что есть.
+            options = collect_options(by_title)
+            if options["total"] and (params.get("quality") or params.get("voice")):
+                text = self._no_match_text(task, by_title, options)
+                message = turn.add(
+                    text, kind="tickets", task_id=task.id, payload={"task": task.to_dict()}
+                )
+                message.actions = self._option_actions(task, by_title)
+                task.state = "awaiting_choice"
+                await self.store.save_task(task)
+                return
+            task.state = "not_found"
+            await self.store.save_task(task)
+            text = await self._not_found_text(task)
+            message = turn.add(text, kind="error", task_id=task.id, payload={"task": task.to_dict()})
+            message.actions = [
+                Action(
+                    id="make_periodic",
+                    label="Сделать периодической",
+                    kind="make_periodic",
+                    payload={"task_id": task.id, "interval_minutes": 30, "auto_download": False},
+                    style="primary",
+                )
+            ]
+            return
+
+        fresh = [t for t in matched if t.id not in downloaded] or matched
+
+        # Не хватает параметров — предлагаем то, что реально есть на трекере.
+        missing: list[str] = []
+        if not params.get("quality"):
+            missing.append("quality")
+        if not params.get("voice"):
+            missing.append("voice")
+        if missing:
+            options = collect_options(by_title)
+            for dimension in missing:
+                values = options["qualities"] if dimension == "quality" else options["voices"]
+                if len(values) > 1:
+                    text = self._choice_text(task, dimension, values, len(fresh))
+                    message = turn.add(
+                        text,
+                        kind="tickets",
+                        task_id=task.id,
+                        payload={"task": task.to_dict(), "options": options},
+                    )
+                    message.actions = [
+                        Action(
+                            id=f"choose-{dimension}-{index}",
+                            label=self._quality_label(value) if dimension == "quality" else value,
+                            kind="choose",
+                            payload={"task_id": task.id, "dimension": dimension, "value": value},
+                        )
+                        for index, value in enumerate(values[:8])
+                    ]
+                    message.actions.append(
+                        Action(
+                            id="cancel-choose",
+                            label="Отмена",
+                            kind="cancel",
+                            payload={"task_id": task.id},
+                            style="danger",
+                        )
+                    )
+                    task.state = "awaiting_choice"
+                    await self.store.save_task(task)
+                    return
+                if len(values) == 1:
+                    # Один вариант — спрашивать не о чем, фиксируем автоматически.
+                    task.params[dimension] = values[0]
+                    await self.store.save_task(task)
+                    fresh = filter_candidates(by_title, task.params) or fresh
+
+        best_list = rank(fresh, task.params)
+        best = best_list[0]
+        task.candidate = best.to_dict()
+        task.options = {
+            **(task.options or {}),
+            "alternatives": [t.to_dict() for t in best_list[1:4]],
+        }
+        task.state = "awaiting_confirm"
+        await self.store.save_task(task)
+
+        if not params.get("quality") and best.quality:
+            task.params["quality"] = best.quality
+        if not params.get("voice") and best.voices:
+            task.params["voice"] = best.voices[0]
+        await self.store.save_task(task)
+
+        message = turn.add(
+            self._confirm_text(task, best, best_list[1:4]),
+            kind="task",
+            task_id=task.id,
+            payload={"task": task.to_dict(), "torrent": best.to_dict()},
+        )
+        message.actions = [
+            Action(
+                id="confirm-download",
+                label="Скачать и поставить в Transmission",
+                kind="confirm_download",
+                payload={"task_id": task.id, "torrent_id": best.id},
+                style="primary",
+            ),
+            Action(
+                id="cancel-confirm",
+                label="Отмена",
+                kind="cancel",
+                payload={"task_id": task.id},
+                style="danger",
+            ),
+        ]
+        for index, alternative in enumerate(best_list[1:4], start=2):
+            message.actions.append(
+                Action(
+                    id=f"pick-{alternative.id}",
+                    label=f"Взять вариант {index}",
+                    kind="pick_torrent",
+                    payload={"task_id": task.id, "torrent_id": alternative.id},
+                )
+            )
+
+    @staticmethod
+    def _quality_label(value: str) -> str:
+        return QUALITY_LABELS.get(value, value)
+
+    def _option_actions(self, task: Task, by_title: list[Torrent]) -> list[Action]:
+        """Кнопки «что есть на самом деле», когда заданные параметры не совпали."""
+        options = collect_options(by_title)
+        actions: list[Action] = []
+        for value in options["qualities"][:5]:
+            actions.append(
+                Action(
+                    id=f"choose-quality-{value}",
+                    label=self._quality_label(value),
+                    kind="choose",
+                    payload={"task_id": task.id, "dimension": "quality", "value": value},
+                )
+            )
+        for value in options["voices"][:5]:
+            actions.append(
+                Action(
+                    id=f"choose-voice-{value}",
+                    label=value,
+                    kind="choose",
+                    payload={"task_id": task.id, "dimension": "voice", "value": value},
+                )
+            )
+        actions.append(
+            Action(
+                id="cancel-options",
+                label="Отмена",
+                kind="cancel",
+                payload={"task_id": task.id},
+                style="danger",
+            )
+        )
+        return actions
+
+    # ------------------------------------------------------------------
+    # Периодическая задача
+    # ------------------------------------------------------------------
+    async def _start_periodic(
+        self, session_id: str, text: str, parsed: dict[str, Any], turn: Turn
+    ) -> None:
+        if not parsed.get("title"):
+            turn.add("Не понял, за чем следить. Напишите название фильма или сериала.")
+            return
+
+        interval = parsed.get("interval_minutes") or self.settings.default_interval_minutes
+        interval = max(self.settings.min_interval_minutes, int(interval))
+        task = await self._task_from_params(
+            session_id,
+            text,
+            parsed,
+            kind="periodic",
+            interval=interval,
+            auto_download=bool(parsed.get("auto_download")),
+        )
+        turn.task = task
+
+        try:
+            torrents = await self._search(task.params)
+        except MCPError as exc:
+            task.state = "failed"
+            task.last_error = str(exc)
+            await self.store.save_task(task)
+            turn.add(f"Не смог обратиться к трекеру: {exc}", kind="error", task_id=task.id)
+            return
+
+        task.options = {"pool": [t.to_dict() for t in torrents[:80]]}
+        by_title = filter_candidates(torrents, {"title": task.params.get("title") or ""})
+        matched = filter_candidates(by_title, task.params)
+        best = rank(matched or by_title, task.params)
+        # Что уже есть на трекере сейчас — это «норма», а не новость. Иначе
+        # первая же проверка пришлёт уведомление про все 30 раздач сразу.
+        self._record_baseline(task, matched or by_title)
+        task.candidate = best[0].to_dict() if best else None
+        task.state = "awaiting_confirm"
+        await self.store.save_task(task)
+
+        head = (
+            f"Задача «{task.title}» — проверять каждые "
+            f"{self._human_interval(task.interval_minutes)}."
+        )
+        if best:
+            head += f"\n\nСейчас на трекере есть:\n• {describe(best[0])}"
+            if len(best) > 1:
+                head += f"\n• и ещё {len(best) - 1} раздач(и) по этому запросу"
+            if not task.params.get("quality"):
+                options = collect_options(by_title)
+                if options["qualities"]:
+                    head += "\n\nКачество в этих раздачах: " + ", ".join(
+                        self._quality_label(q) for q in options["qualities"][:4]
+                    )
+            if task.auto_download:
+                head += (
+                    "\n\nВы просили скачивать новые серии сразу — подтвердите, "
+                    "и я начну следить и качать."
+                )
+            else:
+                head += "\n\nЧто делаем с новыми сериями?"
+        else:
+            head += (
+                "\n\nСейчас по этим параметрам на трекере ничего нет — задача будет "
+                "молча проверять и сообщит, когда появится."
+            )
+
+        message = turn.add(
+            head,
+            kind="task",
+            task_id=task.id,
+            payload={"task": task.to_dict(), "torrent": (best[0].to_dict() if best else None)},
+        )
+        message.actions = [
+            Action(
+                id="periodic-auto",
+                label="Качать сразу и сообщать",
+                kind="periodic_auto",
+                payload={"task_id": task.id},
+                style="primary",
+            ),
+            Action(
+                id="periodic-notify",
+                label="Только сообщать",
+                kind="periodic_notify",
+                payload={"task_id": task.id},
+            ),
+            Action(
+                id="cancel-periodic",
+                label="Отмена",
+                kind="cancel",
+                payload={"task_id": task.id},
+                style="danger",
+            ),
+        ]
+
+    @staticmethod
+    def _record_baseline(task: Task, torrents: list[Torrent]) -> None:
+        """Запоминает, что уже есть на трекере в момент создания задачи."""
+        ids = [t.id for t in torrents if t.id]
+        stamps = [t.uploaded_ts for t in torrents if t.uploaded_ts]
+        seen = list(task.params.get("seen_ids") or [])
+        for torrent_id in ids:
+            if torrent_id not in seen:
+                seen.append(torrent_id)
+        task.params["seen_ids"] = seen[-400:]
+        by_season = episodes_by_season(torrents)
+        if by_season:
+            # Ключи JSON всегда строки — приводим к ним явно.
+            task.params["baseline_episodes"] = {str(k): v for k, v in by_season.items()}
+        if stamps:
+            task.params["baseline_ts"] = max(stamps)
+
+    async def _monitor_after_creation(self, task: Task, turn: Turn, downloaded_now: bool) -> None:
+        task.state = "monitoring"
+        self._schedule_next(task)
+        await self.store.save_task(task)
+        await self.events.publish(
+            {
+                "type": "task_created",
+                "task_id": task.id,
+                "title": task.title,
+                "interval_minutes": task.interval_minutes,
+            }
+        )
+        message = turn.add(
+            self._monitoring_text(task), kind="task", task_id=task.id, payload={"task": task.to_dict()}
+        )
+        message.actions = self._task_actions(task)
+
+    def _monitoring_text(self, task: Task) -> str:
+        mode = "и сразу качать" if task.auto_download else "и сообщать о находках"
+        return (
+            f"Взял в работу: «{task.title}».\n"
+            f"Буду проверять каждые {self._human_interval(task.interval_minutes)} {mode}.\n"
+            f"{self._filter_text(task)}"
+        )
+
+    def _task_actions(self, task: Task) -> list[Action]:
+        actions: list[Action] = []
+        if task.state == "monitoring":
+            actions.append(
+                Action(
+                    id="check-now",
+                    label="Проверить сейчас",
+                    kind="check_now",
+                    payload={"task_id": task.id},
+                )
+            )
+        actions.append(
+            Action(
+                id="cancel-task",
+                label="Отменить задачу",
+                kind="cancel",
+                payload={"task_id": task.id},
+                style="danger",
+            )
+        )
+        return actions
+
+    # ------------------------------------------------------------------
+    # Скачивание
+    # ------------------------------------------------------------------
+    async def _download_with_report(
+        self, task: Task, torrent: Torrent, turn: Turn, periodic_context: bool = False
+    ) -> None:
+        task.state = "downloading"
+        await self.store.save_task(task)
+        try:
+            result = await self._download(task, torrent)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("скачивание не удалось")
+            await self.store.save_task(task)
+            turn.add(
+                f"Не удалось скачать «{torrent.title}»: {exc}",
+                kind="error",
+                task_id=task.id,
+                payload={"task": task.to_dict()},
+            )
+            return
+
+        if not result["ok"]:
+            turn.add(
+                f"Не удалось скачать «{torrent.title}»: {result['error']}",
+                kind="error",
+                task_id=task.id,
+                payload={"task": task.to_dict()},
+            )
+            return
+
+        if periodic_context:
+            # Периодическая задача продолжает жить после скачивания.
+            task.state = "monitoring"
+            self._schedule_next(task)
+            await self.store.save_task(task)
+        else:
+            task.state = "done"
+            await self.store.save_task(task)
+
+        text = (
+            f"Готово: «{torrent.title}»\n"
+            f"{describe(torrent)}\n"
+            f"Файл: {result['path']}"
+        )
+        if result["transmission"]:
+            text += f"\nTransmission: {result['transmission']}"
+        elif result.get("transmission_error"):
+            text += f"\nTransmission: не принял торрент — {result['transmission_error']}"
+
+        message = turn.add(text, kind="task", task_id=task.id, payload={"task": task.to_dict()})
+        if task.state == "monitoring":
+            message.actions = self._task_actions(task)
+        await self.events.publish(
+            {
+                "type": "download_done",
+                "task_id": task.id,
+                "title": torrent.title,
+                "torrent_id": torrent.id,
+            }
+        )
+        await self.desktop.send("Торрент скачан", torrent.title[:120])
+
+    async def _download(self, task: Task, torrent: Torrent) -> dict[str, Any]:
+        """Качает .torrent через MCP, ставит в Transmission и запоминает факт."""
+        path = self.settings.torrents_dir / f"{torrent.id}.torrent"
+        result = await self.mcp.download(torrent.id, path)
+        if not result.get("success"):
+            task.last_error = str(result.get("message") or "неизвестная ошибка")
+            task.state = "failed"
+            await self.store.save_task(task)
+            return {"ok": False, "error": task.last_error}
+
+        transmission_note = ""
+        transmission_error = ""
+        transmission_hash = ""
+        try:
+            added = await self.transmission.add(path)
+            transmission_hash = str(added.get("hash") or "")
+            transmission_note = f"в очереди ({added.get('name') or torrent.title})"
+        except TransmissionError as exc:
+            transmission_error = str(exc)
+            log.warning("Transmission не принял торрент: %s", exc)
+
+        await self.store.record_download(task, torrent, str(path), transmission_hash)
+        task.last_result = f"скачано: {torrent.title}"
+        task.last_error = ""
+        # Помним id в задаче, чтобы не качать одно и то же повторно.
+        seen = list(task.params.get("seen_ids") or [])
+        if torrent.id not in seen:
+            seen.append(torrent.id)
+        task.params["seen_ids"] = seen[-200:]
+        return {
+            "ok": True,
+            "path": str(path),
+            "transmission": transmission_note,
+            "transmission_error": transmission_error,
+        }
+
+    # ------------------------------------------------------------------
+    # Периодическая проверка (вызывается шедулером)
+    # ------------------------------------------------------------------
+    def _schedule_next(self, task: Task) -> None:
+        interval = task.interval_minutes or self.settings.default_interval_minutes
+        task.next_check_at = (
+            datetime.now(timezone.utc) + timedelta(minutes=interval)
+        ).isoformat(timespec="seconds")
+
+    async def _scheduler_loop(self) -> None:
+        """Независимые проверки: у каждой задачи своя корутина, лимита нет."""
+        while True:
+            try:
+                due = await self.store.due_periodic()
+                for task in due:
+                    if task.id in self._running_checks:
+                        continue
+                    asyncio.create_task(self._run_check_isolated(task))
+                await asyncio.sleep(self.scheduler_tick_seconds)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - шедулер не должен умирать
+                log.exception("ошибка в шедулере")
+                await asyncio.sleep(5)
+
+    async def _run_check_isolated(self, task: Task) -> None:
+        """Одна задача — одна корутина: падение одной не влияет на остальные."""
+        self._running_checks.add(task.id)
+        try:
+            await self.check_task(task)
+        except Exception:  # noqa: BLE001
+            log.exception("проверка задачи %s упала", task.id)
+        finally:
+            self._running_checks.discard(task.id)
+
+    async def check_task(self, task: Task, *, manual: bool = False, turn: Turn | None = None) -> None:
+        lock = self._check_locks.setdefault(task.id, asyncio.Lock())
+        async with lock:
+            turn = turn or Turn()
+            params = task.params
+            task.last_check_at = now_iso()
+            task.checks_done += 1
+            try:
+                torrents = await self._search(params)
+            except MCPError as exc:
+                task.last_error = str(exc)
+                self._schedule_next(task)
+                await self.store.save_task(task)
+                await self.store.add_check(task.id, 0, 0, f"ошибка: {exc}")
+                log.warning("проверка %s: %s", task.id, exc)
+                return
+
+            by_title = filter_candidates(torrents, {"title": params.get("title") or ""})
+            matched = filter_candidates(by_title, params)
+            seen = set(params.get("seen_ids") or [])
+            seen |= await self.store.downloaded_ids()
+
+            pool = matched or by_title
+            series = str(pool[0].series_key) if pool else ""
+            season_episodes: dict[int, int] = {}
+            max_ts = 0.0
+            if series:
+                season_episodes = await self.store.episodes_by_season(series)
+                max_ts = await self.store.last_upload_ts(series)
+            # То, что уже было на трекере при создании задачи, новым не считаем.
+            for season_key, episode in (params.get("baseline_episodes") or {}).items():
+                try:
+                    season_number = int(season_key)
+                    season_episodes[season_number] = max(
+                        season_episodes.get(season_number, 0), int(episode)
+                    )
+                except (TypeError, ValueError):
+                    continue
+            max_ts = max(max_ts, float(params.get("baseline_ts") or 0.0))
+
+            fresh = find_new(
+                matched or by_title,
+                params,
+                known_ids=seen,
+                season_episodes=season_episodes,
+                max_uploaded_ts=max_ts,
+            )
+            task.found_total = len(matched)
+            task.next_check_at = None
+            self._schedule_next(task)
+            await self.store.add_check(
+                task.id, len(matched), len(fresh), ", ".join(t.title for t in fresh[:3])
+            )
+            if not fresh:
+                await self.store.save_task(task)
+                if manual:
+                    turn.add(
+                        f"Проверил «{task.title}»: нового нет "
+                        f"(всего подходящих раздач: {len(matched)}).",
+                        kind="text",
+                        task_id=task.id,
+                    )
+                return
+
+            task.params["seen_ids"] = list(seen | {t.id for t in fresh})[-200:]
+            task.options = {**(task.options or {}), "pool": [t.to_dict() for t in fresh[:20]]}
+            await self.store.save_task(task)
+
+            if task.auto_download:
+                for torrent in fresh[:3]:
+                    await self._download_quiet(task, torrent)
+            else:
+                await self._notify_new(task, fresh)
+
+            if manual:
+                turn.add(
+                    f"Проверил «{task.title}»: нового {len(fresh)}.",
+                    kind="text",
+                    task_id=task.id,
+                )
+
+    async def _download_quiet(self, task: Task, torrent: Torrent) -> None:
+        """Скачивание по периодической задаче: без диалога, с уведомлением."""
+        try:
+            result = await self._download(task, torrent)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("тихое скачивание не удалось")
+            await self._notify_error(task, torrent, str(exc))
+            return
+        if not result["ok"]:
+            await self._notify_error(task, torrent, result["error"])
+            return
+        text = (
+            f"Новая серия по задаче «{task.title}»: скачал и поставил в очередь.\n"
+            f"• {torrent.title}\n{describe(torrent)}"
+        )
+        if result.get("transmission_error"):
+            text += f"\nTransmission: {result['transmission_error']}"
+        message = Message(
+            role="agent", text=text, kind="notice", task_id=task.id,
+            payload={"task": task.to_dict(), "torrent": torrent.to_dict()},
+        )
+        message.actions = self._task_actions(task)
+        await self._remember_many(task.session_id, [message])
+        await self.events.publish(
+            {
+                "type": "notification",
+                "level": "success",
+                "task_id": task.id,
+                "title": "Скачано по задаче",
+                "text": text,
+                "message": message.to_dict(),
+            }
+        )
+        await self.desktop.send("Скачано по задаче", torrent.title[:120])
+        await self.push.send(
+            "Скачано по задаче",
+            f"{task.title}: {torrent.title}"[:200],
+        )
+
+    async def _notify_new(self, task: Task, fresh: list[Torrent]) -> None:
+        lines = [f"По задаче «{task.title}» появилось новое ({len(fresh)}):"]
+        for torrent in fresh[:5]:
+            lines.append(f"• {torrent.title}\n   {describe(torrent)}")
+        text = "\n".join(lines)
+        message = Message(
+            role="agent",
+            text=text,
+            kind="notice",
+            task_id=task.id,
+            payload={"task": task.to_dict(), "torrents": [t.to_dict() for t in fresh[:5]]},
+        )
+        for index, torrent in enumerate(fresh[:3], start=1):
+            message.actions.append(
+                Action(
+                    id=f"download-new-{torrent.id}",
+                    label=f"Скачать {index}",
+                    kind="download_new",
+                    payload={"task_id": task.id, "torrent_id": torrent.id},
+                    style="primary" if index == 1 else "normal",
+                )
+            )
+        message.actions.extend(self._task_actions(task))
+        await self._remember_many(task.session_id, [message])
+        await self.events.publish(
+            {
+                "type": "notification",
+                "level": "info",
+                "task_id": task.id,
+                "title": "Новое по задаче",
+                "text": text,
+                "message": message.to_dict(),
+            }
+        )
+        await self.desktop.send("Новое по задаче", f"{task.title}: {fresh[0].title}"[:200])
+        await self.push.send(
+            "Новое по задаче",
+            f"{task.title}: {fresh[0].title}"[:200],
+        )
+
+    async def _notify_error(self, task: Task, torrent: Torrent, error: str) -> None:
+        text = f"Задача «{task.title}»: не смог скачать «{torrent.title}» — {error}"
+        message = Message(role="agent", text=text, kind="error", task_id=task.id)
+        await self._remember_many(task.session_id, [message])
+        await self.events.publish(
+            {"type": "notification", "level": "error", "task_id": task.id, "title": "Ошибка", "text": text}
+        )
+        await self.push.send("Ошибка в задаче", text[:200])
+
+    # ------------------------------------------------------------------
+    # Вспомогательные тексты
+    # ------------------------------------------------------------------
+    def _filter_text(self, task: Task) -> str:
+        bits = []
+        if task.params.get("quality"):
+            bits.append(f"качество: {self._quality_label(str(task.params['quality']))}")
+        if task.params.get("voice"):
+            bits.append(f"озвучка: {task.params['voice']}")
+        if task.params.get("season"):
+            bits.append(f"сезон: {task.params['season']}")
+        return ("Фильтр — " + ", ".join(bits)) if bits else "Фильтр по качеству и озвучке не задан."
+
+    def _confirm_text(self, task: Task, best: Torrent, alternatives: list[Torrent]) -> str:
+        text = (
+            f"Нашёл подходящую раздачу по запросу «{task.title}»:\n\n"
+            f"• {best.title}\n   {describe(best)}\n\n"
+            "Берём в работу?"
+        )
+        if alternatives:
+            text += "\n\nДругие варианты:"
+            for index, item in enumerate(alternatives, start=2):
+                text += f"\n{index}. {item.title}\n   {describe(item)}"
+        return text
+
+    def _choice_text(self, task: Task, dimension: str, values: list[str], count: int) -> str:
+        shown = ", ".join(self._quality_label(v) if dimension == "quality" else v for v in values[:8])
+        question = (
+            "Какое качество берём?" if dimension == "quality" else "Какую озвучку берём?"
+        )
+        return (
+            f"По запросу «{task.title}» нашлось {count} раздач. "
+            f"{question}\n\nНа трекере есть: {shown}."
+        )
+
+    def _no_match_text(self, task: Task, by_title: list[Torrent], options: dict[str, Any]) -> str:
+        asked = []
+        if task.params.get("quality"):
+            asked.append(f"качество {self._quality_label(str(task.params['quality']))}")
+        if task.params.get("voice"):
+            asked.append(f"озвучка {task.params['voice']}")
+        qualities = ", ".join(self._quality_label(q) for q in options["qualities"][:6]) or "—"
+        voices = ", ".join(options["voices"][:6]) or "—"
+        return (
+            f"По запросу «{task.title}» "
+            + ("с параметрами (" + ", ".join(asked) + ") " if asked else "")
+            + f"ничего не подошло.\n\n"
+            f"Но на трекере есть {options['total']} раздач этого названия:\n"
+            f"• качество: {qualities}\n• озвучка: {voices}\n\n"
+            "Выберите, что взять, или уточните запрос."
+        )
+
+    async def _not_found_text(self, task: Task) -> str:
+        base = (
+            f"По запросу «{task.title}» на kinozal.me ничего не нашлось.\n\n"
+            "Могу сделать задачу периодической: тогда я буду проверять трекер и "
+            "сообщу, как только раздача появится."
+        )
+        try:
+            hint = await self.llm.ask_text(
+                "Ты помощник торрент-агента. Ответь ОДНИМ коротким предложением "
+                "по-русски: что пользователю уточнить в запросе, чтобы поиск на "
+                "трекере удался (год, оригинальное название, сезон). Без вступлений.",
+                f"Запрос: «{task.title}», параметры: {json.dumps(task.params, ensure_ascii=False)}",
+                max_tokens=120,
+            )
+            hint = (hint or "").strip()
+            if hint and len(hint) < 300:
+                return base + "\n\n" + hint
+        except LLMError:
+            pass
+        return base
+
+    @staticmethod
+    def _human_interval(minutes: int | None) -> str:
+        if not minutes:
+            return "не задано"
+        if minutes % 60 == 0 and minutes >= 60:
+            hours = minutes // 60
+            word = "час" if hours == 1 else ("часа" if hours in (2, 3, 4) else "часов")
+            return f"{hours} {word}"
+        word = "минуту" if minutes % 10 == 1 and minutes % 100 != 11 else "минут"
+        if minutes % 10 in (2, 3, 4) and minutes % 100 not in (12, 13, 14):
+            word = "минуты"
+        return f"{minutes} {word}"
+
+    # ------------------------------------------------------------------
+    # создание задачи и работа с историей
+    # ------------------------------------------------------------------
+    async def _task_from_params(
+        self,
+        session_id: str,
+        text: str,
+        params: dict[str, Any],
+        *,
+        kind: str,
+        interval: int | None = None,
+        auto_download: bool = False,
+    ) -> Task:
+        clean = {
+            key: value
+            for key, value in params.items()
+            if key in ("title", "original_title", "quality", "voice", "season", "episode_from", "year")
+            and value not in (None, "", "null")
+        }
+        clean.setdefault("seen_ids", [])
+        task = Task(
+            id=new_id(),
+            kind=kind,
+            state="searching",
+            session_id=session_id,
+            user_query=text,
+            params=clean,
+            interval_minutes=interval,
+            auto_download=auto_download,
+        )
+        if kind == "periodic":
+            self._schedule_next(task)
+        await self.store.save_task(task)
+        return task
+
+    async def _remember(self, session_id: str, message: Message) -> None:
+        await self.store.add_message(session_id, message)
+
+    async def _remember_many(self, session_id: str, messages: list[Message]) -> None:
+        for message in messages:
+            await self.store.add_message(session_id, message)
