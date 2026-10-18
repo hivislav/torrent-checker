@@ -82,11 +82,18 @@ body {
 }
 
 .film-scratches {
+  /* Царапины — часть «плёнки», но поверх текста они читаются как случайная
+     полоса. Поэтому они живут только у краёв экрана (маска вырезает середину):
+     в колонке с перепиской и карточками чистый фон. */
   opacity: .5;
+  /* Линии стоят ровно в «перфорации» по краям (полоса --rail), а маска не
+     выпускает их за её пределы — на текст и карточки они не попадают. */
   background-image:
-    linear-gradient(90deg, transparent 0 22.2%, rgba(255, 235, 200, .05) 22.2% 22.35%, transparent 22.35%),
-    linear-gradient(90deg, transparent 0 68.4%, rgba(255, 235, 200, .045) 68.4% 68.5%, transparent 68.5%),
-    linear-gradient(90deg, transparent 0 84.1%, rgba(255, 235, 200, .035) 84.1% 84.2%, transparent 84.2%);
+    linear-gradient(90deg, transparent 0 0.55%, rgba(255, 235, 200, .07) 0.55% 0.68%, transparent 0.68%),
+    linear-gradient(90deg, transparent 0 98.9%, rgba(255, 235, 200, .06) 98.9% 99.03%, transparent 99.03%),
+    linear-gradient(90deg, transparent 0 99.45%, rgba(255, 235, 200, .05) 99.45% 99.58%, transparent 99.58%);
+  -webkit-mask-image: linear-gradient(90deg, #000 0 1.6%, transparent 2% 98%, #000 98.4% 100%);
+  mask-image: linear-gradient(90deg, #000 0 1.6%, transparent 2% 98%, #000 98.4% 100%);
   animation: scratch-drift 7s ease-in-out infinite alternate;
 }
 
@@ -1053,6 +1060,9 @@ body {
   .notification-tray { right: 12px; left: 12px; width: auto; top: 56px; }
 
   .panel__hint { display: none; }
+  /* На узком экране переписка занимает всю ширину, и любые царапины попадут
+     на текст — на телефоне их просто нет. */
+  .film-scratches { display: none; }
   .modal__box--wide { width: 100%; max-height: 92vh; }
   .debug__pair { grid-template-columns: 1fr; gap: 2px; }
   .debug__note { display: none; }
