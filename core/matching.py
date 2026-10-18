@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import re
 from typing import Any, Iterable
 
 from core.models import Torrent
@@ -74,6 +75,7 @@ def filter_candidates(
     quality = str(params.get("quality") or "").strip()
     voice = str(params.get("voice") or "").strip()
     season = params.get("season")
+    year = params.get("year")
     wanted_type = str(params.get("type") or "").strip().lower()
     skip_ids = skip_ids or set()
 
@@ -99,6 +101,13 @@ def filter_candidates(
             except (TypeError, ValueError):
                 wanted_season = None
             if wanted_season and torrent.seasons and wanted_season not in torrent.seasons:
+                continue
+        if year:
+            try:
+                wanted_year = int(year)
+            except (TypeError, ValueError):
+                wanted_year = None
+            if wanted_year and not _year_matches(torrent.year, wanted_year):
                 continue
         if min_episode:
             span = episode_span(torrent)
@@ -161,6 +170,22 @@ def collect_options(torrents: list[Torrent]) -> dict[str, Any]:
     }
 
 
+def _year_matches(span: str, wanted: int) -> bool:
+    """Подходит ли год под диапазон из названия («2004-2010» → 2006 подходит)."""
+    raw = str(span or "").strip()
+    if not raw:
+        return False
+    found = re.findall(r"((?:19|20)\d{2})(?:\s*[-–]\s*((?:19|20)\d{2}))?", raw)
+    if not found:
+        return False
+    for low, high in found:
+        start = int(low)
+        end = int(high) if high else start
+        if start <= wanted <= end:
+            return True
+    return False
+
+
 def describe(torrent: Torrent) -> str:
     """Строка для карточки раздачи в чате."""
     parts: list[str] = []
@@ -176,6 +201,8 @@ def describe(torrent: Torrent) -> str:
             parts.append(f"серия {torrent.episodes[0]}")
     if torrent.episodes_total:
         parts.append(f"из {torrent.episodes_total}")
+    if torrent.year:
+        parts.append(f"год {torrent.year}")
     if torrent.qualities:
         shown = [q for q in torrent.qualities if q not in ("HDR", "AVC")]
         if shown:

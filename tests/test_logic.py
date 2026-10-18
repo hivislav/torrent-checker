@@ -96,6 +96,15 @@ def test_filtering() -> None:
     options = collect_options(title_only)
     check("варианты качества — разрешения", options["qualities"] == ["2160p", "1080p"],
           options["qualities"])
+    # Год — это параметр: «Дюна 2021» не должна цеплять другие годы.
+    from core.matching import describe
+
+    check("год в строке описания раздачи",
+          "год 2021" in describe(parse_torrent(make("14", "Дюна / Dune / 2021 / ДБ / BDRip"))),
+          describe(parse_torrent(make("14", "Дюна / Dune / 2021 / ДБ / BDRip"))))
+    by_year = filter_candidates(pool, {"title": "Дюна", "year": 2021})
+    check("фильтр по году", [t.id for t in by_year] == ["13"], [t.id for t in by_year])
+
     ranked = rank(found_1080, {"title": "Тед Лассо", "quality": "1080p"})
     check("ранжирование по сидам", ranked[0].id == "10", ranked[0].id)
 

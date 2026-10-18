@@ -1643,6 +1643,7 @@ class Agent:
                     "title": (items[0].series_title or items[0].title).strip(),
                     "torrent_id": items[0].id,
                     "count": len(items),
+                    "years": self._years_text(items),
                 }
                 for items in sorted(groups.values(), key=lambda chunk: -len(chunk))[:10]
             ]
@@ -1698,8 +1699,13 @@ class Agent:
         lines = [head, "", question, ""]
         for item in suggestions[:10]:
             line = f"• {item['title']}"
+            bits: list[str] = []
             if item.get("count"):
-                line += f" — {_plural(int(item['count']), 'раздача', 'раздачи', 'раздач')}"
+                bits.append(_plural(int(item["count"]), "раздача", "раздачи", "раздач"))
+            if item.get("years"):
+                bits.append(str(item["years"]))
+            if bits:
+                line += " — " + ", ".join(bits)
             lines.append(line)
         lines.append("")
         lines.append("Кнопка выберет раздачу — и я поищу заново уже по ней.")
@@ -1917,19 +1923,23 @@ class Agent:
             lines.append("")
         else:
             # Точное совпадение: показываем, какие сериалы реально есть в выдаче.
-            shows: dict[str, tuple[str, int]] = {}
+            shows: dict[str, tuple[str, int, list[Torrent]]] = {}
             for item in found:
                 name = (item.series_title or "").strip() or (item.title or "").strip()
                 key = normalize(name)
                 if not key:
                     continue
-                title_text, number = shows.get(key, (name, 0))
-                shows[key] = (title_text, number + 1)
+                title_text, number, items = shows.get(key, (name, 0, []))
+                shows[key] = (title_text, number + 1, items + [item])
             top = sorted(shows.values(), key=lambda pair: -pair[1])[:4]
             if len(top) > 1:
                 lines.append("Что нашлось:")
-                for name, number in top:
-                    lines.append(f"• {name} — {_plural(number, 'раздача', 'раздачи', 'раздач')}")
+                for name, number, items in top:
+                    years = self._years_text(items)
+                    line = f"• {name} — {_plural(number, 'раздача', 'раздачи', 'раздач')}"
+                    if years:
+                        line += f", {years}"
+                    lines.append(line)
                 lines.append("")
         lines.append(f"Доступно с учётом остальных условий: {shown}.")
         text = "\n".join(lines)
@@ -1977,6 +1987,8 @@ class Agent:
     @staticmethod
     def _filters_text(params: dict[str, Any]) -> str:
         bits = []
+        if params.get("year"):
+            bits.append(f"год {params['year']}")
         if params.get("season"):
             bits.append(f"сезон {params['season']}")
         if params.get("quality"):
@@ -2941,6 +2953,8 @@ class Agent:
             else:
                 episode_text = "серия —"
             lines.append(f"• {season_text}, {episode_text}")
+        if torrent.year:
+            lines.append(f"• Год: {torrent.year}")
         if torrent.size:
             lines.append(f"• На трекере: {_comma(torrent.size)}")
 
@@ -3043,8 +3057,27 @@ class Agent:
         return max(candidates, key=lambda item: item.seeds, default=None)
 
     @staticmethod
+    @staticmethod
+    def _years_text(items: list[Torrent]) -> str:
+        """Годы раздачи: «2021», «2021–2024» или пусто."""
+        years: set[int] = set()
+        for item in items:
+            raw = str(item.year or "").strip()
+            if not raw:
+                continue
+            for low, high in re.findall(r"((?:19|20)\d{2})(?:\s*[-–]\s*((?:19|20)\d{2}))?", raw):
+                start = int(low)
+                years.add(start)
+                if high:
+                    years.add(int(high))
+        if not years:
+            return ""
+        low, high = min(years), max(years)
+        return str(low) if low == high else f"{low}–{high}"
+
+    @staticmethod
     def _short_torrent_label(torrent: Torrent) -> str:
-        """Короткая подпись раздачи для кнопки и списка: «серия 4 · 1080p · 5,7 ГБ»."""
+        """Короткая подпись раздачи для кнопки и списка: «2026 · серия 4 · 1080p · 5,7 ГБ»."""
         bits: list[str] = []
         episodes = sorted({int(item) for item in (torrent.episodes or [])})
         season = torrent.season
@@ -3055,6 +3088,8 @@ class Agent:
             bits.append(f"серия {episodes[0]}")
         elif season:
             bits.append(f"сезон {season}")
+        if torrent.year:
+            bits.append(str(torrent.year))
         if torrent.quality:
             bits.append(torrent.quality)
         if torrent.size:
