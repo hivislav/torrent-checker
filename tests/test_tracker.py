@@ -176,10 +176,96 @@ async def test_ask_dimension() -> None:
     check("при точном названии без предупреждения", "Точного совпадения" not in text2, text2[:200])
 
 
+class ListingMCP:
+    """Заглушка MCP: список файлов со страницы раздачи и счёт вызовов .torrent."""
+
+    def __init__(self, files: list[dict] | None, *, fail_listing: bool = False) -> None:
+        self.files = files
+        self.fail_listing = fail_listing
+        self.downloads = 0
+
+    async def file_list(self, torrent_id: str) -> dict:
+        if self.fail_listing:
+            raise RuntimeError("страница не отдала список")
+        return {"success": True, "files": self.files or []}
+
+    async def download(self, torrent_id: str, path: Path) -> dict:
+        self.downloads += 1
+        return {"success": False, "message": "Вам недоступен торрент-файл"}
+
+
+async def test_card_without_torrent() -> None:
+    print("\n== карточка без траты .torrent ==")
+    tmp = Path(tempfile.mkdtemp(prefix="listing-"))
+    settings = dataclasses.replace(
+        get_settings(),
+        data_dir=tmp,
+        db_path=tmp / "listing.sqlite3",
+        torrents_dir=tmp / "torrent-files",
+        transmission_download_dir=tmp / "torrents",
+    )
+    agent = Agent(settings)
+    task = Task(
+        id="listing-task",
+        kind="oneshot",
+        state="searching",
+        session_id="checks",
+        user_query="Экстрасенсы реванш",
+        params={"title": "Экстрасенсы реванш", "quality": "1080p"},
+    )
+    await agent.store.save_task(task)
+
+    files = [
+        {"name": "05.Экстрасенсы. Реванш.s03.E05.(2026).HDTV.(1080р).ts", "size": 6124008256},
+    ]
+    mcp = ListingMCP(files)
+    agent.mcp = mcp  # type: ignore[assignment]
+    torrent = Torrent(
+        id="2157531",
+        title="Экстрасенсы. Реванш (3 сезон: 5 выпуск из 15) / 2026 / РУ / HDTV (1080p)",
+        size="5.7 ГБ",
+        seeds=248,
+        series_title="Экстрасенсы. Реванш",
+        qualities=["1080p"],
+        seasons=[3],
+        episodes=[5],
+    )
+    turn = Turn()
+    await agent._present_candidate(task, [torrent], turn)
+    message = turn.messages[-1]
+    check("карточка показана", "Раздача:" in message.text, message.text[:100])
+    check("торрент-файл не качался", mcp.downloads == 0, mcp.downloads)
+    check("файл из списка попал в карточку",
+          "05.Экстрасенсы" in message.text, message.text[:300])
+    check("кнопка постановки в очередь есть",
+          any(action.kind == "start_download" for action in message.actions),
+          [action.label for action in message.actions])
+
+    # Страница не отдала список — тогда путь через .torrent (и его ошибка).
+    task2 = Task(
+        id="listing-task-2",
+        kind="oneshot",
+        state="searching",
+        session_id="checks",
+        user_query="Экстрасенсы реванш",
+        params={"title": "Экстрасенсы реванш", "quality": "1080p"},
+    )
+    await agent.store.save_task(task2)
+    mcp2 = ListingMCP(None, fail_listing=True)
+    agent.mcp = mcp2  # type: ignore[assignment]
+    turn2 = Turn()
+    await agent._present_candidate(task2, [torrent], turn2)
+    check("без списка пробует .torrent", mcp2.downloads == 1, mcp2.downloads)
+    check("и объясняет отказ трекера",
+          any("не выдал torrent-файл" in message.text for message in turn2.messages),
+          [message.text[:60] for message in turn2.messages])
+
+
 async def main() -> int:
     test_error_text()
     await test_fetch_torrent()
     await test_ask_dimension()
+    await test_card_without_torrent()
     print("\n=== ИТОГ ===")
     if FAILS:
         print("FAIL:", ", ".join(FAILS))

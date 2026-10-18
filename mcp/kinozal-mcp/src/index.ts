@@ -18,7 +18,14 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { BASE_URL, GATE_URL, searchTorrents, getTorrentDetails, downloadTorrent } from "./kinozal.js";
+import {
+  BASE_URL,
+  GATE_URL,
+  searchTorrents,
+  getTorrentDetails,
+  downloadTorrent,
+  getFileList,
+} from "./kinozal.js";
 
 config();
 
@@ -48,6 +55,18 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "get_torrent_details",
         description: "Подробная информация о раздаче по её id (жанр, качество, аудио, размер, сиды).",
+        inputSchema: {
+          type: "object",
+          properties: { id: { type: "string", description: "id раздачи с kinozal.me" } },
+          required: ["id"],
+        },
+      },
+      {
+        name: "get_file_list",
+        description:
+          "Список файлов раздачи (имена и размеры) со страницы трекера. НЕ скачивает " +
+          ".torrent и не тратит дневной лимит торрент-файлов — этим и отличается от " +
+          "download_torrent.",
         inputSchema: {
           type: "object",
           properties: { id: { type: "string", description: "id раздачи с kinozal.me" } },
@@ -94,6 +113,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const details = await getTorrentDetails(String(args.id));
         return {
           content: [{ type: "text", text: JSON.stringify(details, null, 2) }],
+        };
+      }
+
+      case "get_file_list": {
+        const listing = await getFileList(String(args.id));
+        return {
+          content: [{ type: "text", text: JSON.stringify(listing, null, 2) }],
+          isError: !listing.success,
         };
       }
 

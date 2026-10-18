@@ -1350,13 +1350,44 @@ class Agent:
             bits.append(f"серия {params['episode_from']}")
         return ", ".join(bits) or "без уточнений"
 
+    async def _listing_entries(self, torrent: Torrent) -> list[dict[str, Any]] | None:
+        """Состав раздачи со страницы трекера — без траты дневного лимита.
+
+        На kinozal.me в сутки даётся ограниченное число .torrent-файлов, а состав
+        файлов нужен уже для карточки (видно вес и серии). Страница раздачи
+        отдаёт его отдельным запросом, поэтому лимит тратится только на
+        настоящее скачивание.
+        """
+        try:
+            listing = await self.mcp.file_list(torrent.id)
+        except Exception as exc:  # noqa: BLE001 - без списка просто качаем .torrent
+            journal.add(
+                "agent",
+                "не удалось получить список файлов со страницы раздачи",
+                {"раздача": torrent.id, "ошибка": str(exc)},
+                level="warn",
+            )
+            return None
+        files = listing.get("files") or []
+        if not files:
+            return None
+        return [
+            {
+                "index": index,
+                "name": str(item.get("name") or ""),
+                "size": int(item.get("size") or 0),
+            }
+            for index, item in enumerate(files)
+        ]
+
     async def _present_candidate(
         self, task: Task, best_list: list[Torrent], turn: Turn
     ) -> None:
         """Показывает кандидата: выбор серий или сразу полную карточку.
 
-        .torrent забирается здесь же (он маленький): благодаря этому в карточке
-        видны настоящие файлы и точный вес, а не только строка с трекера.
+        Состав файлов берём со страницы раздачи (лимит .torrent не тратится),
+        и только если страница не отдала список — качаем .torrent. Сам .torrent
+        нужен лишь в момент, когда человек нажал «Скачать».
         """
         best = best_list[0]
         journal.add(
@@ -1371,19 +1402,30 @@ class Agent:
             "alternatives": [t.to_dict() for t in best_list[1:4]],
         }
 
-        path, error, reason = await self._fetch_torrent(best)
-        if path is None:
-            if reason == "tracker":
-                await self._report_tracker_problem(task, best, error, turn)
-            else:
-                await self._report_storage_problem(
-                    task, best, {"error": error, "reason": "disk", "path": None}, turn
-                )
-            return
+        listing = await self._listing_entries(best)
+        if listing is not None:
+            path: Path | None = None
+            entries = parse_files(listing)
+            journal.add(
+                "agent",
+                "состав раздачи взят со страницы трекера",
+                {"раздача": best.id, "файлов": len(entries)},
+            )
+        else:
+            path, error, reason = await self._fetch_torrent(best)
+            if path is None:
+                if reason == "tracker":
+                    await self._report_tracker_problem(task, best, error, turn)
+                else:
+                    await self._report_storage_problem(
+                        task, best, {"error": error, "reason": "disk", "path": None}, turn
+                    )
+                return
+            entries = parse_files(file_list(path))
 
-        entries = parse_files(file_list(path))
         groups = episode_groups(entries)
-        task.options = {**(task.options or {}), "torrent_path": str(path)}
+        if path is not None:
+            task.options = {**(task.options or {}), "torrent_path": str(path)}
 
         # Пачка серий и серия не названа — спрашиваем, какие качать.
         if len(groups) > 1 and not task.params.get("episode_from"):
@@ -1536,10 +1578,14 @@ class Agent:
         task: Task,
         torrent: Torrent,
         groups: list[dict],
-        path: Path,
+        path: Path | None,
         turn: Turn,
     ) -> None:
-        """Список серий кнопками: можно выбрать одну, несколько или все."""
+        """Список серий кнопками: можно выбрать одну, несколько или все.
+
+        `path` может быть None: состав раздачи пришёл со страницы трекера,
+        а .torrent скачается уже после нажатия «Скачать».
+        """
         selected = [int(item) for item in (getattr(task, "options", {}) or {}).get("selected_episodes") or []]
         task.options = {
             **(task.options or {}),
@@ -1553,9 +1599,10 @@ class Agent:
                 }
                 for group in groups
             ],
-            "torrent_path": str(path),
             "selected_episodes": selected,
         }
+        if path is not None:
+            task.options["torrent_path"] = str(path)
         seasons = {group.get("season") for group in groups if group.get("season")}
         head = f"В раздаче {_plural(len(groups), 'серия', 'серии', 'серий')}"
         if len(seasons) == 1:
@@ -2319,12 +2366,22 @@ class Agent:
         path_str = (task.options or {}).get("torrent_path") or ""
         path = Path(path_str) if path_str else self.settings.torrents_dir / f"{torrent.id}.torrent"
         if not path.exists():
-            turn.add(
-                "Torrent-файл пропал — начните задачу заново.",
-                kind="error",
-                task_id=task.id,
-            )
-            return
+            # Карточка показывается без .torrent (чтобы не тратить дневной лимит),
+            # поэтому файл забираем здесь — когда человек действительно качает.
+            fetched, error, reason = await self._fetch_torrent(torrent)
+            if fetched is None:
+                if reason == "tracker":
+                    await self._report_tracker_problem(task, torrent, error, turn)
+                else:
+                    turn.add(
+                        f"Torrent-файл недоступен: {error}",
+                        kind="error",
+                        task_id=task.id,
+                    )
+                return
+            path = fetched
+            task.options = {**(task.options or {}), "torrent_path": str(path)}
+            await self.store.save_task(task)
 
         result = await self._finalize_download(task, torrent, path, plan)
         if not result["ok"]:

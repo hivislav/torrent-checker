@@ -188,6 +188,15 @@ class KinozalMCP:
         data = await self.call("get_torrent_details", {"id": str(torrent_id)})
         return data if isinstance(data, dict) else {}
 
+    async def file_list(self, torrent_id: str) -> dict[str, Any]:
+        """Состав раздачи со страницы трекера — без скачивания .torrent.
+
+        На kinozal.me число .torrent в сутки ограничено, а состав файлов нужен
+        уже на этапе карточки. Этот вызов лимит не тратит.
+        """
+        data = await self.call("get_file_list", {"id": str(torrent_id)})
+        return data if isinstance(data, dict) else {}
+
     async def download(self, torrent_id: str, output_path: Path) -> dict[str, Any]:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         data = await self.call(

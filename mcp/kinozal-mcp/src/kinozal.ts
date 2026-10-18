@@ -64,6 +64,18 @@ interface GateResponse {
 }
 
 /** Запрос через шлюз Cloudflare (единственный способ увидеть страницы kinozal.me). */
+/** Логин в шлюзе: без него трекер отдаёт вместо данных короткую заглушку. */
+async function ensureLogin(): Promise<boolean> {
+  try {
+    const response = await fetch(`${GATE_URL}/login`, { method: "POST" });
+    if (!response.ok) return false;
+    const data = (await response.json()) as { ok?: boolean };
+    return Boolean(data.ok);
+  } catch {
+    return false;
+  }
+}
+
 async function gateFetch(
   path: string,
   options: {
@@ -318,6 +330,96 @@ function extractNotice(buffer: Buffer): string {
     return out.trim().slice(0, 300);
   }
   return "";
+}
+
+export interface TorrentFileEntry {
+  name: string;
+  size: number;
+}
+
+/**
+ * Список файлов раздачи со страницы трекера (AJAX get_srv_details action=2).
+ *
+ * Зачем отдельный инструмент: страница раздачи отдаёт состав файлов без
+ * скачивания .torrent, а каждый .torrent на kinozal.me ограничен дневным
+ * лимитом. Карточку можно показать, не тратя лимит, — лимит уходит только
+ * на реальное скачивание.
+ */
+export async function getFileList(id: string): Promise<{
+  success: boolean;
+  name?: string;
+  infoHash?: string;
+  pieceSize?: string;
+  files?: TorrentFileEntry[];
+  total?: number;
+  message?: string;
+}> {
+  try {
+    // Без входа трекер отдаёт вместо списка короткую заглушку — входим заранее.
+    await ensureLogin();
+    // Страница иногда отдаёт пустышку при частых запросах — пробуем ещё раз.
+    let html = "";
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const response = await gateFetch(
+        `/get_srv_details.php?id=${encodeURIComponent(id)}&action=2`,
+        { binary: true, retries: 1 }
+      );
+      if (response.status === 200 && response.body_b64) {
+        // Этот ответ отдаётся в utf-8 (в отличие от обычных страниц трекера).
+        html = new TextDecoder("utf-8").decode(Buffer.from(response.body_b64, "base64"));
+        if (html.includes("Инфо хеш")) break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 700));
+    }
+    if (!html) {
+      return { success: false, message: "get_srv_details не отдал список файлов" };
+    }
+    const $ = cheerio.load(`<div id="kz-files">${html}</div>`);
+    const text = $.root().text();
+    const hashMatch = text.match(/Инфо хеш:\s*([0-9A-Fa-f]{40})/);
+    const pieceMatch = text.match(/Размер части торрента:\s*([0-9.,]+\s*[КМГкмг]?[Бб])/);
+    const name = $("#kz-files .b").first().text().trim();
+
+    const files: TorrentFileEntry[] = [];
+    $("#kz-files .treeview li").each((_, element) => {
+      const li = $(element);
+      const sizeText = li.find("i").text();
+      const sizeMatch = sizeText.match(/\((\d+)\)/);
+      const cleanName = li.clone().find("i").remove().end().text().trim();
+      if (!cleanName) return;
+      files.push({ name: cleanName, size: sizeMatch ? Number(sizeMatch[1]) : 0 });
+    });
+
+    // Раздача из одного файла: структура другая — <div class="b">имя<i>5.7 ГБ (…)</i></div>.
+    if (!files.length) {
+      $("#kz-files .b").each((_, element) => {
+        const block = $(element);
+        const sizeText = block.find("i").text();
+        const sizeMatch = sizeText.match(/\((\d+)\)/);
+        if (!sizeMatch) return;
+        const cleanName = block.clone().find("i").remove().end().text().trim();
+        if (cleanName) files.push({ name: cleanName, size: Number(sizeMatch[1]) });
+      });
+    }
+
+    const total = files.reduce((sum, item) => sum + item.size, 0);
+    if (!files.length) {
+      return { success: false, message: "трекер не отдал список файлов" };
+    }
+    return {
+      success: true,
+      name,
+      infoHash: hashMatch ? hashMatch[1].toUpperCase() : undefined,
+      pieceSize: pieceMatch ? pieceMatch[1].trim() : undefined,
+      files,
+      total,
+    };
+  } catch (error) {
+    return {
+      success: false,
+      message: `ошибка: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
 }
 
 export { BASE_URL, GATE_URL };
