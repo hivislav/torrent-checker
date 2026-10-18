@@ -32,10 +32,27 @@ class TargetInfo:
     free: int = 0
     total: int = 0
     error: str = ""
+    # Сколько из занятого — наши файлы (загрузки и torrent-файлы). Разница
+    # «занято − наши» обычно и есть корзина диска: удалённые в Finder или
+    # штатным удалением Transmission файлы лежат в .Trashes, пока корзину не
+    # очистят, и место не возвращается.
+    own_bytes: int = 0
+    own_complete: bool = True
 
     @property
     def ok(self) -> bool:
         return self.mounted and self.writable
+
+    @property
+    def used(self) -> int:
+        return max(0, self.total - self.free)
+
+    @property
+    def hidden_bytes(self) -> int:
+        """Занято, но не нашими файлами: чужие данные или корзина диска."""
+        if not self.mounted or not self.own_complete:
+            return 0
+        return max(0, self.used - self.own_bytes)
 
     def to_dict(self) -> dict[str, object]:
         name = self.volume.name or str(self.volume)
@@ -49,6 +66,13 @@ class TargetInfo:
             "free_human": human_bytes(self.free),
             "total": self.total,
             "total_human": human_bytes(self.total),
+            "used": self.used,
+            "used_human": human_bytes(self.used),
+            "own_bytes": self.own_bytes,
+            "own_human": human_bytes(self.own_bytes),
+            "own_complete": self.own_complete,
+            "hidden_bytes": self.hidden_bytes,
+            "hidden_human": human_bytes(self.hidden_bytes),
             "error": self.error,
         }
 
@@ -89,6 +113,34 @@ def can_write(path: Path) -> bool:
     except OSError:
         pass
     return True
+
+
+def dir_size(path: Path | str, budget_sec: float = 1.5) -> tuple[int, bool]:
+    """Размер каталога с ограничением по времени.
+
+    Возвращает (байты, удалось ли досчитать). Обходить 200 ГБ ради строчки в
+    интерфейсе нельзя, поэтому при выходе за бюджет возвращаем неполное значение
+    и честно помечаем его как приблизительное.
+    """
+    import time
+
+    total = 0
+    deadline = time.monotonic() + budget_sec
+    root = Path(path)
+    if not root.exists():
+        return 0, True
+    try:
+        for base, _dirs, files in os.walk(root):
+            for name in files:
+                try:
+                    total += os.path.getsize(os.path.join(base, name))
+                except OSError:
+                    continue
+            if time.monotonic() > deadline:
+                return total, False
+    except OSError:
+        return total, False
+    return total, True
 
 
 def target_info(path: Path | str) -> TargetInfo:

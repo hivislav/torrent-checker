@@ -567,9 +567,20 @@ class Agent:
             gate = {"ok": False, "error": str(exc)[:200]}
 
         transmission = await self.transmission.test_connection()
-        from core.storage_target import target_info
+        from core.storage_target import dir_size, target_info
+        from core.torrent_meta import human_bytes as human_size
 
-        storage = self.transmission.storage_info().to_dict()
+        storage_info = self.transmission.storage_info()
+        # Сколько из занятого — реально наши файлы. Разница — чужие данные или
+        # корзина диска, и это единственный способ объяснить «диск пуст, но
+        # место занято».
+        own_downloads, done_downloads = dir_size(self.settings.transmission_download_dir)
+        own_torrents, done_torrents = dir_size(self.settings.torrents_dir)
+        storage_info.own_bytes = own_downloads + own_torrents
+        storage_info.own_complete = done_downloads and done_torrents
+        storage = storage_info.to_dict()
+        storage["downloads_size_human"] = human_size(own_downloads)
+        storage["torrents_size_human"] = human_size(own_torrents)
         torrents = target_info(self.settings.torrents_dir).to_dict()
         return {
             "model": {

@@ -159,6 +159,25 @@ def test_torrent_files_dir() -> None:
         check("отказ без диска для torrent-файлов", "не подключён" in str(exc), str(exc))
 
 
+def test_used_and_own_space() -> None:
+    print("\n== занято / наши файлы / скрытое ==")
+    from core.storage_target import dir_size, target_info
+
+    tmp = Path(tempfile.mkdtemp(prefix="space-"))
+    (tmp / "big.bin").write_bytes(b"x" * 4096)
+    size, complete = dir_size(tmp)
+    check("размер каталога считается", size == 4096 and complete, (size, complete))
+
+    info = target_info(tmp)
+    info.own_bytes = 4096
+    info.own_complete = True
+    data = info.to_dict()
+    check("в данных есть «занято»", "used" in data and data["used"] >= 0, data.get("used"))
+    check("в данных есть «наши файлы»", data.get("own_bytes") == 4096, data.get("own_bytes"))
+    check("скрытое = занято − наши", data.get("hidden_bytes") == max(0, info.used - 4096),
+          (data.get("hidden_bytes"), info.used))
+
+
 def test_missing_disk(tmp: Path) -> None:
     print("\n== диск не подключён ==")
     settings = dataclasses.replace(
@@ -317,6 +336,7 @@ async def main() -> int:
     test_sizes(tmp)
     test_space_rules(tmp)
     test_torrent_files_dir()
+    test_used_and_own_space()
     test_missing_disk(tmp)
     await test_real_add(tmp)
     await test_agent_refuses_without_torrent_dir()

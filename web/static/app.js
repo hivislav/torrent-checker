@@ -466,11 +466,26 @@
       if (status.storage) {
         const disk = status.storage;
         rows.push([
-          `диск ${disk.volume || "?"}`,
+          "диск",
           disk.ok
-            ? `${mark(true)} свободно ${disk.free_human} из ${disk.total_human}`
+            ? `<b>${disk.volume || "?"}</b> · свободно ${disk.free_human} из ${disk.total_human}`
             : `<span class="status-bad">${(disk.error || "нет доступа").slice(0, 80)}</span>`,
         ]);
+        if (disk.ok) {
+          // «Диск пуст, а место занято» — самая частая причина вопросов.
+          // Показываем занятое и отдельно наши файлы, чтобы разница была видна.
+          rows.push([
+            "занято",
+            `${disk.used_human} · наши файлы ${disk.own_human}` +
+              (disk.own_complete ? "" : " (≈)"),
+          ]);
+          if ((disk.hidden_bytes || 0) > 1024 ** 3) {
+            rows.push([
+              "не наши файлы",
+              `<span class="status-warn" title="Занято ${disk.used_human}, из них наши загрузки и torrent-файлы — ${disk.own_human}. Остальное — другие файлы на диске или его корзина (.Trashes): место вернётся после «Очистить корзину» в Finder.">${disk.hidden_human}</span> — чужие данные или корзина диска`,
+            ]);
+          }
+        }
       }
       rows.push(["в работе", String(status.tasks.active)]);
       box.innerHTML = rows
