@@ -554,7 +554,21 @@ class Agent:
                     task_id=task.id,
                 )
             else:
-                await self._confirm_selected_episodes(task, episodes, turn)
+                plan = self._build_episodes_plan(task, episodes)
+                if plan is None:
+                    turn.add(
+                        "Не нашёл файлов этих серий в раздаче — выберите заново.",
+                        kind="error",
+                        task_id=task.id,
+                    )
+                else:
+                    task.options = {
+                        **(task.options or {}),
+                        "plan": plan,
+                        "selected_episodes": episodes,
+                    }
+                    await self.store.save_task(task)
+                    await self._start_download(task, turn)
         elif kind == "download_all" and task:
             entries = self._entries_from_task(task)
             plan = self._plan_files(task, entries)
@@ -1302,10 +1316,8 @@ class Agent:
                     )
                 )
 
-    async def _confirm_selected_episodes(
-        self, task: Task, episodes: list[int], turn: Turn
-    ) -> None:
-        """Собирает план по выбранным сериям и показывает полную карточку."""
+    def _build_episodes_plan(self, task: Task, episodes: list[int]) -> dict | None:
+        """План по выбранным сериям: файлы, вес, номера."""
         groups = (task.options or {}).get("episode_groups") or []
         wanted: list[int] = []
         size = 0
@@ -1320,28 +1332,35 @@ class Agent:
             if group.get("season") is not None:
                 seasons.add(int(group["season"]))
         if not wanted:
+            return None
+        total_size = sum(int(group.get("size") or 0) for group in groups)
+        season = sorted(seasons)[0] if len(seasons) == 1 else None
+        return {
+            "kind": "episode",
+            "wanted": sorted(set(wanted)),
+            "size": size,
+            "names": names,
+            "season": season,
+            "episode": max(episodes),
+            "selected_episodes": sorted(episodes),
+            "episodes": [{"season": season, "episode": item} for item in sorted(episodes)],
+            "total_size": total_size,
+            "pack": True,
+            "total_files": len(wanted),
+        }
+
+    async def _confirm_selected_episodes(
+        self, task: Task, episodes: list[int], turn: Turn
+    ) -> None:
+        """Полная карточка по выбранным сериям (для альтернатив и проверок)."""
+        plan = self._build_episodes_plan(task, episodes)
+        if plan is None:
             turn.add(
                 "Не нашёл файлов этих серий в раздаче — попробуйте выбрать заново.",
                 kind="error",
                 task_id=task.id,
             )
             return
-
-        total_size = sum(int(group.get("size") or 0) for group in groups)
-        plan = {
-            "kind": "episode",
-            "wanted": sorted(set(wanted)),
-            "size": size,
-            "names": names,
-            "season": sorted(seasons)[0] if len(seasons) == 1 else None,
-            "episode": max(episodes),
-            "selected_episodes": episodes,
-            "episodes": [{"season": sorted(seasons)[0] if len(seasons) == 1 else None,
-                          "episode": item} for item in episodes],
-            "total_size": total_size,
-            "pack": True,
-            "total_files": len(wanted),
-        }
         task.options = {**(task.options or {}), "plan": plan, "selected_episodes": episodes}
         task.state = "awaiting_confirm"
         await self.store.save_task(task)
@@ -1418,12 +1437,22 @@ class Agent:
         if len(seasons) == 1:
             head += f" (сезон {seasons.pop()})"
         head += " — что качаем?"
+        storage = self.transmission.storage_info()
+        info = storage.to_dict()
         lines = [
             head,
             "",
             "• Весь сезон — " + human_bytes(sum(int(group.get("size") or 0) for group in groups)),
-            "• Можно выбрать несколько серий: отметьте кнопками и нажмите «Скачать выбранные».",
         ]
+        if storage.ok:
+            lines.append(
+                f"• Диск «{info['volume']}»: свободно {info['free_human']} "
+                f"из {info['total_human']} (резерв {human_bytes(self.transmission.min_free_bytes())})"
+            )
+        else:
+            lines.append(f"• ⚠ Внешний диск недоступен: {storage.error}")
+        lines.append("• Отметьте серии кнопками (можно несколько) — сумма посчитается сама.")
+        lines.append("• Куда: " + str(self.settings.transmission_download_dir))
         message = turn.add("\n".join(lines), kind="tickets", task_id=task.id,
                            payload={"task": task.to_dict(), "torrent": torrent.to_dict()})
         for group in groups[:24]:
@@ -1438,6 +1467,7 @@ class Agent:
                         "task_id": task.id,
                         "episode": episode,
                         "season": group.get("season"),
+                        "size": int(group.get("size") or 0),
                     },
                     group="Серии",
                     multi=True,

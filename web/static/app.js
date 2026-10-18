@@ -87,6 +87,7 @@
     if (!box || !actions.length) return;
     box.innerHTML = "";
     const picked = new Map(); // id -> episode
+    const sizes = new Map(); // id -> размер в байтах
 
     const groups = new Map();
     for (const action of actions) {
@@ -96,9 +97,24 @@
     }
 
     let submitButton = null;
+    const humanSize = (bytes) => {
+      if (!bytes) return "";
+      const units = ["Б", "КБ", "МБ", "ГБ", "ТБ"];
+      let value = bytes;
+      let index = 0;
+      while (value >= 1024 && index < units.length - 1) {
+        value /= 1024;
+        index += 1;
+      }
+      const text = index === 0 ? String(value) : value.toFixed(1).replace(".", ",");
+      return `${text} ${units[index]}`;
+    };
     const refreshSubmit = () => {
       if (!submitButton) return;
-      submitButton.textContent = `Скачать выбранные (${picked.size})`;
+      let total = 0;
+      for (const id of picked.keys()) total += sizes.get(id) || 0;
+      const sizeText = total ? ` · ${humanSize(total)}` : "";
+      submitButton.textContent = `Скачать выбранные (${picked.size}${sizeText})`;
       submitButton.disabled = picked.size === 0;
     };
 
@@ -127,12 +143,18 @@
           if (action.selected) {
             button.classList.add("is-selected");
             picked.set(action.id, action.payload.episode);
+            sizes.set(action.id, action.payload.size || 0);
           }
           button.addEventListener("click", () => {
             const on = !button.classList.contains("is-selected");
             button.classList.toggle("is-selected", on);
-            if (on) picked.set(action.id, action.payload.episode);
-            else picked.delete(action.id);
+            if (on) {
+              picked.set(action.id, action.payload.episode);
+              sizes.set(action.id, action.payload.size || 0);
+            } else {
+              picked.delete(action.id);
+              sizes.delete(action.id);
+            }
             refreshSubmit();
           });
           row.appendChild(button);
