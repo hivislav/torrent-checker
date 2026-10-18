@@ -2404,6 +2404,9 @@ class Agent:
         self._record_baseline(task, matched or by_title)
         task.candidate = best[0].to_dict() if best else None
         task.state = "awaiting_confirm"
+        if not best:
+            # Уже сказали «ничего нет» — не повторяем это на первой же проверке.
+            task.notify_last = now_iso()
         await self.store.save_task(task)
 
         head = (
@@ -2430,7 +2433,7 @@ class Agent:
         else:
             head += (
                 "\n\nСейчас по этим параметрам на трекере ничего нет — задача будет "
-                "молча проверять и сообщит, когда появится."
+                "проверять по расписанию и сообщит, когда появится."
             )
             suggestions = (task.options or {}).get("suggestions") or []
             if suggestions:
@@ -3969,6 +3972,10 @@ class Agent:
             )
             if not fresh:
                 await self.store.save_task(task)
+                if not matched:
+                    # Совсем ничего нет (сериал ещё не вышел) — раз в сутки
+                    # сообщаем, что мониторинг продолжается.
+                    await self._notify_nothing(task, manual=manual)
                 if manual:
                     turn.add(
                         f"Проверил «{task.title}»: нового нет "
@@ -4032,6 +4039,44 @@ class Agent:
         await self.push.send(
             "Скачано по задаче",
             f"{task.title}: {torrent.title}"[:200],
+        )
+
+    async def _notify_nothing(self, task: Task, *, manual: bool = False) -> None:
+        """По задаче на трекере вообще пусто — сообщаем не чаще раза в сутки.
+
+        Иначе человек думает, что задача перестала работать: раз в сутки
+        приходит тихое «пока ничего нет, продолжаю следить».
+        """
+        if task.kind != "periodic":
+            return
+        now = datetime.now(timezone.utc)
+        last = _parse_iso(task.notify_last)
+        if not manual and last is not None and (now - last) < timedelta(hours=24):
+            return
+        task.notify_last = now.isoformat(timespec="seconds")
+        await self.store.save_task(task)
+        interval = self._human_interval(
+            task.interval_minutes or self.settings.default_interval_minutes
+        )
+        text = (
+            f"По задаче «{task.title}» на трекере пока ничего нет.\n"
+            f"Продолжаю следить {interval} — сообщу, как только появится."
+        )
+        message = Message(
+            role="agent", text=text, kind="notice", task_id=task.id,
+            payload={"task": task.to_dict()},
+        )
+        message.actions = self._task_actions(task)
+        await self._remember_many(task.session_id, [message])
+        await self.events.publish(
+            {
+                "type": "notification",
+                "level": "info",
+                "task_id": task.id,
+                "title": "Ничего не найдено",
+                "text": text,
+                "message": message.to_dict(),
+            }
         )
 
     async def _notify_new(self, task: Task, fresh: list[Torrent]) -> None:

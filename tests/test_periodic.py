@@ -401,6 +401,86 @@ async def test_failed_task_keeps_checking() -> None:
     agent.store.close()
 
 
+async def test_nothing_at_all() -> None:
+    print("\n== сериал ещё не вышел: ничего нет, но задача живёт ==")
+    tmp = Path(tempfile.mkdtemp(prefix="periodic-empty-"))
+    settings = dataclasses.replace(
+        get_settings(),
+        data_dir=tmp,
+        db_path=tmp / "empty.sqlite3",
+        torrents_dir=tmp / "torrent-files",
+        transmission_download_dir=tmp / "torrents",
+    )
+    settings.torrents_dir.mkdir(parents=True, exist_ok=True)
+    agent = Agent(settings)
+
+    class EmptyMCP:
+        async def search_pages(self, query: str, pages: int = 1) -> list[dict]:
+            return []
+
+        async def download(self, torrent_id: str, path: Path) -> dict:  # noqa: ARG002
+            return {"success": False, "message": "пусто"}
+
+    agent.mcp = EmptyMCP()  # type: ignore[assignment]
+    agent.transmission = SimpleNamespace(  # type: ignore[assignment]
+        storage_info=lambda: SimpleNamespace(ok=False, error="нет диска", to_dict=lambda: {}),
+    )
+
+    from core.models import Turn
+
+    turn = Turn()
+    await agent._start_periodic(  # noqa: SLF001
+        "checks",
+        "Новый сериал 2027",
+        {"title": "Новый сериал 2027", "interval_minutes": 60, "auto_download": True},
+        turn,
+    )
+    task = turn.task
+    check("задача создана", task is not None, task)
+    text = " ".join(message.text for message in turn.messages)
+    check("сказано, что на трекере пусто", "ничего нет" in text, text[:200])
+    check("задача ждёт выбора режима", task.state == "awaiting_confirm", task.state)
+    labels = [action.label for action in turn.messages[-1].actions]
+    check("можно включить автокачку", "Качать сразу и сообщать" in labels, labels)
+
+    # подтверждаем автокачку — задача уходит в мониторинг
+    confirm = await agent.handle_action(
+        "checks", "periodic_auto", {"task_id": task.id}
+    )
+    task = await agent.store.get_task(task.id)
+    check("задача в работе", task.state == "monitoring", task.state)
+    check("следующая проверка назначена", bool(task.next_check_at), task.next_check_at)
+    check("ответ про режим", any("Взял в работу" in m.text for m in confirm.messages),
+          [m.text[:40] for m in confirm.messages])
+
+    # плановая проверка при пустой выдаче: без спама, но задача жива
+    await agent.check_task(task)
+    task = await agent.store.get_task(task.id)
+    check("после проверки всё ещё в работе", task.state == "monitoring", task.state)
+    messages_now = await agent.history_for_task(task.id)
+    check("повторно «ничего нет» не пришло (не чаще раза в сутки)",
+          sum(1 for m in messages_now if "пока ничего нет" in m["text"]) == 0,
+          [m["text"][:40] for m in messages_now])
+
+    # через сутки — сообщаем, что продолжаем следить
+    from datetime import datetime, timedelta, timezone
+    import sqlite3
+
+    old = (datetime.now(timezone.utc) - timedelta(hours=30)).isoformat(timespec="seconds")
+    conn = sqlite3.connect(str(settings.db_path))
+    conn.execute("UPDATE tasks SET notify_last = ? WHERE id = ?", (old, task.id))
+    conn.commit()
+    conn.close()
+    task = await agent.store.get_task(task.id)  # перечитываем метку из базы
+    await agent.check_task(task)
+    task = await agent.store.get_task(task.id)
+    messages_now = await agent.history_for_task(task.id)
+    notices = [m["text"] for m in messages_now if "пока ничего нет" in m["text"]]
+    check("раз в сутки сказано, что ничего нет", len(notices) == 1, notices)
+    check("и задача продолжает работать", task.state == "monitoring", task.state)
+    agent.store.close()
+
+
 async def main() -> int:
     await test_auto_download()
     await test_delete_keeps_progress()
@@ -408,6 +488,7 @@ async def main() -> int:
     await test_episode_before_floor()
     await test_plan_for_periodic()
     await test_failed_task_keeps_checking()
+    await test_nothing_at_all()
 
     print("\n=== ИТОГ ===")
     if FAILS:
