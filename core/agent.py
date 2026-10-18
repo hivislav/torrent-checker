@@ -62,7 +62,7 @@ from core.episodes import (
     pick_episode,
     pick_new_episodes,
 )
-from core.parsing import parse_torrent
+from core.parsing import normalize, parse_torrent
 from core.storage import Store
 from core.storage_target import StorageUnavailable as TargetUnavailable
 from core.storage_target import ensure_target as ensure_dir
@@ -100,7 +100,16 @@ PARSE_SYSTEM = """Ты — разборщик запросов торрент-а
   "intent": "find" | "monitor" | "question"
 }
 
+Дополнительно поле:
+  "refine": true|false — true, если сообщение является уточнением к предыдущему
+            запросу в этом же диалоге («нет, я про 4 сезон», «а если 4К?»,
+            «второй вариант», «не то, нужен другой фильм»), а не новой задачей.
+
 Правила:
+- Тебе дана история переписки. Текущее сообщение может быть уточнением:
+  тогда заполняй только то, что уточняется, а остальные поля оставляй null —
+  агент сам объединит их с прошлым запросом.
+- «Не то», «другой», «этот», «второй», «первый» — это уточнение (refine = true).
 - НЕ выдумывай параметры, которых в сообщении нет. Сомневаешься — null.
 - Год, сезон и серию не путай: «4 сезон» — это season, «5 серия» — это episode_from.
 - «Следи», «проверяй», «мониторь», «отслеживай» — это intent = "monitor".
@@ -115,6 +124,17 @@ kinozal.me, скачивает торрент-файлы и ставит их в
 раздач и не обещай того, чего агент не умеет. Если пользователь просит что-то
 найти, скачать или отслеживать — подскажи нажать кнопку «Разово» или
 «Периодически» под полем ввода и написать запрос."""
+
+
+PARAM_TITLES = {
+    "title": "название",
+    "original_title": "оригинальное название",
+    "quality": "качество",
+    "voice": "озвучка",
+    "season": "сезон",
+    "episode_from": "серия",
+    "year": "год",
+}
 
 
 def _plural(count: int, one: str, few: str, many: str) -> str:
@@ -205,18 +225,38 @@ class Agent:
 
         await self._remember(session_id, Message(role="user", text=text, kind="text"))
 
+        # Контекст: последние сообщения переписки и незакрытая задача. Без этого
+        # уточнение «нет, я про 4 сезон» начинало бы новый поиск с нуля.
+        window = await self._context_window(session_id, limit=self.settings.context_messages + 1)
+        if window and window[-1].get("text") == text:
+            window = window[:-1]  # само текущее сообщение в истории не нужно
+        window = window[-self.settings.context_messages :]
+        active = await self._active_task(session_id)
+
         try:
-            parsed = await self._parse_query(text)
+            parsed = await self._parse_query(text, window, active)
         except LLMError as exc:
             parsed = {}
             log.warning("разбор запроса не удался: %s", exc)
 
         intent = str(parsed.get("intent") or "")
+
+        # Уточнение к текущей задаче — правим её, а не заводим новую.
+        if active is not None and self._is_refinement(text, parsed, active):
+            journal.add(
+                "agent",
+                "уточнение к текущей задаче",
+                {"текст": text, "было": active.params, "разобрано": parsed},
+            )
+            await self._refine_task(active, parsed, text, turn)
+            turn.task = await self.store.get_task(active.id)
+            await self._remember_many(session_id, turn.messages)
+            return turn
         effective_mode = mode
         if mode not in ("oneshot", "periodic"):
             effective_mode = "periodic" if intent == "monitor" else "oneshot"
             if intent == "question" and not parsed.get("title"):
-                reply = await self._chat_answer(text)
+                reply = await self._chat_answer(text, window)
                 turn.add(reply)
                 await self._remember_many(session_id, turn.messages)
                 return turn
@@ -233,6 +273,113 @@ class Agent:
 
         await self._remember_many(session_id, turn.messages)
         return turn
+
+    # ------------------------------------------------------------------
+    # Контекст переписки и уточнения
+    # ------------------------------------------------------------------
+    RESUME_STATES = ("awaiting_choice", "awaiting_confirm", "not_found", "awaiting_setup")
+
+    async def _active_task(self, session_id: str) -> Task | None:
+        """Незакрытая задача этой сессии — к ней относятся уточнения."""
+        tasks = await self.store.list_tasks(limit=20)
+        for task in tasks:
+            if task.session_id == session_id and task.state in self.RESUME_STATES:
+                return task
+        return None
+
+    def _is_refinement(self, text: str, parsed: dict[str, Any], active: Task) -> bool:
+        """Это уточнение к активной задаче, а не новая задача?"""
+        if parsed.get("refine") is True:
+            return True
+        new_title = str(parsed.get("title") or "").strip()
+        if not new_title:
+            # «4К», «7 серия», «нет, другой» — без названия это уточнение.
+            return True
+        old_title = str((active.params or {}).get("title") or "").strip()
+        if normalize(new_title) == normalize(old_title):
+            return True
+        return False
+
+    async def _refine_task(
+        self, task: Task, parsed: dict[str, Any], text: str, turn: Turn
+    ) -> None:
+        """Применяет уточнение к задаче и продолжает с того же места."""
+        before = dict(task.params or {})
+        merged = dict(before)
+        changed: dict[str, Any] = {}
+        for key in ("title", "original_title", "quality", "voice", "season", "episode_from", "year"):
+            value = parsed.get(key)
+            if value in (None, "", "null"):
+                continue
+            if merged.get(key) != value:
+                merged[key] = value
+                changed[key] = value
+
+        if not changed and parsed.get("title"):
+            # Пользователь повторил тот же запрос — просто продолжаем с того же
+            # места (переспрашивать «что поправить» тут неуместно).
+            await self._selection_step(task, turn)
+            return
+
+        if not changed:
+            # Уточнили, но ничего нового не поняли — показываем, что можно менять.
+            pool = [Torrent.from_dict(item) for item in (task.options or {}).get("pool", [])]
+            options = collect_options(pool) if pool else {"qualities": [], "voices": [], "total": 0}
+            text_out = (
+                "Уточните, пожалуйста, что поправить: название, качество, озвучку "
+                "или серию. Можно написать словами («нужен 4K», «только LostFilm»)."
+            )
+            if options.get("qualities") or options.get("voices"):
+                text_out += "\n\nДоступно по этой раздаче:"
+                if options.get("qualities"):
+                    text_out += "\n• качество: " + ", ".join(
+                        self._quality_label(item) for item in options["qualities"][:6]
+                    )
+                if options.get("voices"):
+                    text_out += "\n• озвучка: " + ", ".join(options["voices"][:6])
+            message = turn.add(text_out, kind="tickets", task_id=task.id,
+                               payload={"task": task.to_dict()})
+            message.actions = self._option_actions(task, pool) if pool else []
+            return
+
+        title_changed = "title" in changed or "original_title" in changed
+        task.params = merged
+        task.user_query = f"{task.user_query} | {text}"[:400]
+        task.state = "searching"
+        await self.store.save_task(task)
+        journal.add(
+            "agent",
+            "уточнение применено",
+            {"было": before, "стало": merged, "изменено": changed},
+        )
+
+        pool = [] if title_changed else [Torrent.from_dict(item) for item in (task.options or {}).get("pool", [])]
+        if pool:
+            # Название не менялось — ищем заново не надо, перебираем то, что уже есть.
+            summary = ", ".join(
+                f"{PARAM_TITLES.get(key, key)}: {value}" for key, value in changed.items()
+            )
+            turn.add(f"Уточнил: {summary}. Смотрю по уже найденным раздачам.", kind="text", task_id=task.id)
+            task.options = {**(task.options or {}), "pool": [t.to_dict() for t in pool]}
+            await self._selection_step(task, turn)
+            return
+
+        # Название изменилось — нужен новый поиск.
+        try:
+            torrents = await self._search(task.params)
+        except MCPError as exc:
+            task.state = "failed"
+            task.last_error = str(exc)
+            await self.store.save_task(task)
+            turn.add(f"Не смог обратиться к трекеру: {exc}", kind="error", task_id=task.id)
+            return
+        task.options = {"pool": [t.to_dict() for t in torrents[:80]], "queries": [task.params.get("title")]}
+        await self.store.save_task(task)
+        summary = ", ".join(
+            f"{PARAM_TITLES.get(key, key)}: {value}" for key, value in changed.items()
+        )
+        turn.add(f"Уточнил: {summary}. Ищу заново.", kind="text", task_id=task.id)
+        await self._selection_step(task, turn)
 
     async def handle_action(self, session_id: str, kind: str, payload: dict[str, Any]) -> Turn:
         turn = Turn()
@@ -444,8 +591,56 @@ class Agent:
     # ------------------------------------------------------------------
     # Разбор запроса и поиск
     # ------------------------------------------------------------------
-    async def _parse_query(self, text: str) -> dict[str, Any]:
-        data = await self.llm.ask_json(PARSE_SYSTEM, text)
+    async def _context_window(self, session_id: str, limit: int | None = None) -> list[dict[str, str]]:
+        """Последние сообщения переписки — скользящее окно для модели.
+
+        Нужно, чтобы уточнения вида «нет, я про 4 сезон» относились к той же
+        задаче, а не начинали разговор с чистого листа. Окно ограничено
+        настройкой CONTEXT_MESSAGES (по умолчанию 20 сообщений) и обрезает
+        длинные ответы агента, чтобы не жечь токены на простыни карточек.
+        """
+        limit = limit or self.settings.context_messages
+        rows = await self.store.history(session_id, limit=limit)
+        window: list[dict[str, str]] = []
+        for row in rows:
+            role = "assistant" if row.get("role") == "agent" else row.get("role")
+            if role not in ("user", "assistant"):
+                continue
+            text = str(row.get("text") or "").strip()
+            if not text:
+                continue
+            if len(text) > 400:
+                text = text[:400] + "…"
+            window.append({"role": role, "text": text})
+        return window
+
+    def _context_prompt(self, window: list[dict[str, str]], active: Task | None) -> str:
+        """Собирает историю и состояние задачи в один текстовый блок для модели."""
+        parts: list[str] = []
+        if active is not None:
+            params = ", ".join(
+                f"{key}={value}"
+                for key, value in (active.params or {}).items()
+                if key in ("title", "quality", "voice", "season", "episode_from", "year")
+                and value not in (None, "", [])
+            )
+            parts.append(
+                f"Текущая задача: «{active.title}», состояние {active.state}, "
+                f"параметры: {params or 'не заданы'}."
+            )
+        if window:
+            parts.append("История переписки (последние сообщения):")
+            for item in window:
+                who = "пользователь" if item["role"] == "user" else "агент"
+                parts.append(f"{who}: {item['text']}")
+        parts.append("Текущее сообщение пользователя — ниже.")
+        return "\n".join(parts)
+
+    async def _parse_query(
+        self, text: str, window: list[dict[str, str]] | None = None, active: Task | None = None
+    ) -> dict[str, Any]:
+        context = self._context_prompt(window or [], active)
+        data = await self.llm.ask_json(PARSE_SYSTEM, f"{context}\n\nСообщение: {text}")
         if not isinstance(data, dict):
             data = {}
         cleaned: dict[str, Any] = {}
@@ -461,11 +656,20 @@ class Agent:
         auto = data.get("auto_download")
         cleaned["auto_download"] = auto if isinstance(auto, bool) else None
         cleaned["intent"] = data.get("intent") if isinstance(data.get("intent"), str) else None
+        refine = data.get("refine")
+        cleaned["refine"] = refine if isinstance(refine, bool) else None
         return cleaned
 
-    async def _chat_answer(self, text: str) -> str:
+    async def _chat_answer(self, text: str, window: list[dict[str, str]] | None = None) -> str:
+        prompt = text
+        if window:
+            history = "\n".join(
+                ("пользователь" if item["role"] == "user" else "агент") + ": " + item["text"]
+                for item in window[-10:]
+            )
+            prompt = f"Предыдущие сообщения:\n{history}\n\nТекущий вопрос: {text}"
         try:
-            return await self.llm.ask_text(CHAT_SYSTEM, text, temperature=0.4, max_tokens=600)
+            return await self.llm.ask_text(CHAT_SYSTEM, prompt, temperature=0.4, max_tokens=600)
         except LLMError as exc:
             return f"Модель сейчас недоступна: {exc}"
 

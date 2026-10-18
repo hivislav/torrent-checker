@@ -97,6 +97,11 @@ class Settings:
     gate_headless: bool
     gate_profile_dir: Path
 
+    # --- контекст переписки ---
+    # Сколько последних сообщений видит модель при разборе запроса. Больше —
+    # точнее уточнения («нет, я про 4 сезон»), но дороже по токенам.
+    context_messages: int
+
     # --- прочее ---
     torrents_dir: Path
     db_path: Path
@@ -176,6 +181,7 @@ def get_settings() -> Settings:
         # путает их с данными раздач.
         torrents_dir=resolve(get("TORRENTS_DIR", "/Volumes/EAGET/torrent-files")),
         db_path=resolve(get("DB_PATH", str(data_dir / "agent.sqlite3"))),
+        context_messages=_as_int(get("CONTEXT_MESSAGES"), 20),
         default_interval_minutes=_as_int(get("DEFAULT_INTERVAL_MINUTES"), 30),
         min_interval_minutes=_as_int(get("MIN_INTERVAL_MINUTES"), 5),
         extra=env,
