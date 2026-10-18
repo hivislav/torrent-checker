@@ -136,6 +136,41 @@ def test_plan() -> None:
     check("нет такой серии — предлагает выбрать", missing["kind"] == "choose", missing["kind"])
     check("причина — отсутствие серии", missing.get("reason") == "missing_episode", missing.get("reason"))
 
+    # Коллекция фильмов: файлы пронумерованы («01.Пила…», «02.Пила…»), но это
+    # не серии — раздача качается целиком.
+    collection_entries = parse_files(
+        [
+            {"index": index, "name": name, "size": 9 << 30}
+            for index, name in enumerate(
+                [
+                    "01.Пила.Игра.на.выживание.Saw.2004.DC.BDRip-HEVC.1080p.mkv",
+                    "02.Пила.2.Saw.II.2005.DC.BDRip-HEVC.1080p.mkv",
+                    "03.Пила.3.Saw.III.2006.DC.BDRip-HEVC.1080p.mkv",
+                ]
+            )
+        ]
+    )
+    collection = Torrent(
+        id="9",
+        title="Пила (Коллекция 10 фильмов) / Saw (Collection) / 2004-2023 / ДБ / BDRip (1080p)",
+        year="2004-2023",
+    )
+    collection_plan = agent._plan_files(task(title="Пила", type="movie"), collection_entries, collection)  # noqa: SLF001
+    check("коллекция фильмов — не выбор серий",
+          collection_plan["kind"] == "single", collection_plan["kind"])
+    check("в плане все файлы коллекции",
+          len(collection_plan["names"]) == 3, collection_plan["names"])
+
+    real_pack = Torrent(
+        id="10",
+        title="Тед Лассо (4 сезон: 1-10 серии из 10) / Ted Lasso / 2026 / WEB-DL (1080p)",
+        seasons=[4],
+        episodes=[1, 10],
+    )
+    series_plan = agent._plan_files(task(title="Тед Лассо"), entries, real_pack)  # noqa: SLF001
+    check("настоящий сериал по-прежнему предлагает серии",
+          series_plan["kind"] == "choose", series_plan["kind"])
+
     movie_plan = agent._plan_files(task(title="Дюна"), movie)  # noqa: SLF001
     check("фильм качаем целиком", movie_plan["kind"] == "single", movie_plan["kind"])
     check("вес фильма посчитан", movie_plan["size"] == 8 << 30, movie_plan["size"])

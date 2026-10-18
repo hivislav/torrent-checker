@@ -2076,12 +2076,21 @@ class Agent:
         if path is not None:
             task.options = {**(task.options or {}), "torrent_path": str(path)}
 
+        # Сериал определяем по названию раздачи: у коллекции фильмов файлы тоже
+        # нумеруются («Пила 1», «Пила 2»), но это не серии.
+        wanted_type = str(task.params.get("type") or "").lower()
+        is_series = bool(best.seasons or best.episodes)
+        if wanted_type == "movie":
+            is_series = False
+        elif wanted_type == "series":
+            is_series = True
+
         # Пачка серий и серия не названа — спрашиваем, какие качать.
-        if len(groups) > 1 and not task.params.get("episode_from"):
+        if is_series and len(groups) > 1 and not task.params.get("episode_from"):
             await self._show_episode_picker(task, best, groups, path, turn)
             return
 
-        plan = self._plan_files(task, entries)
+        plan = self._plan_files(task, entries, best)
         if plan.get("kind") == "choose":
             await self._show_episode_picker(task, best, groups, path, turn)
             return
@@ -2768,7 +2777,7 @@ class Agent:
                 )
                 return
             entries = parse_files(file_list(path))
-        plan = self._plan_files(task, entries)
+        plan = self._plan_files(task, entries, torrent)
         task.options = {
             **(task.options or {}),
             "files": [
@@ -2805,7 +2814,9 @@ class Agent:
     # ------------------------------------------------------------------
     # Что именно качать
     # ------------------------------------------------------------------
-    def _plan_files(self, task: Task, entries: list[Any]) -> dict[str, Any]:
+    def _plan_files(
+        self, task: Task, entries: list[Any], torrent: Torrent | None = None
+    ) -> dict[str, Any]:
         """Решение «вся раздача / конкретная серия / спросить какую»."""
         params = task.params or {}
         season = params.get("season")
@@ -2823,6 +2834,19 @@ class Agent:
         videos = [entry for entry in entries if entry.is_video and not entry.is_junk]
         groups = episode_groups(entries)
         pack = len({(group["season"], group["episode"]) for group in groups}) > 1
+        # Сериал определяем по названию раздачи, а не по именам файлов: в
+        # коллекции фильмов файлы тоже нумеруются («Пила 1…», «Пила 2…»), и
+        # раньше такая коллекция превращалась в «список серий».
+        wanted_type = str(params.get("type") or "").lower()
+        is_series = True
+        if torrent is not None:
+            is_series = bool(torrent.seasons or torrent.episodes)
+        if wanted_type == "movie":
+            is_series = False
+        if wanted_type == "series":
+            is_series = True
+        if not is_series:
+            pack = False
 
         base = {
             "total_size": total_size,
@@ -3500,7 +3524,7 @@ class Agent:
             }
 
         entries = parse_files(file_list(path))
-        plan = self._plan_files(task, entries)
+        plan = self._plan_files(task, entries, torrent)
 
         params = task.params or {}
         try:
