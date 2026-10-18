@@ -23,6 +23,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from core.agent import Agent
+from core.debuglog import configure as configure_journal
+from core.debuglog import install_logging_bridge, journal
 from core.config import get_settings
 from core.models import Message
 
@@ -76,6 +78,12 @@ async def current_session(request: Request) -> str:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    # Журнал отладки общий для процессов: шлюз пишет в тот же файл, поэтому его
+    # события видны в интерфейсе наравне с вызовами модели и MCP.
+    configure_journal(settings.data_dir / "debug.jsonl")
+    # Предупреждения и ошибки логов попадают в тот же журнал, что и вызовы
+    # модели/MCP — так на одном экране видно всю картину.
+    install_logging_bridge()
     await agent.start()
     log.info("агент запущен, данные в %s", settings.data_dir)
     yield
@@ -182,6 +190,26 @@ async def cancel_task(task_id: str, session: str = Depends(current_session)) -> 
 @app.get("/api/downloads")
 async def downloads(limit: int = 50, session: str = Depends(current_session)) -> dict[str, Any]:
     return {"downloads": await agent.downloads(limit)}
+
+
+@app.get("/api/debug")
+async def debug_events(
+    limit: int = 200,
+    category: str = "all",
+    after: int | None = None,
+    session: str = Depends(current_session),
+) -> dict[str, Any]:
+    """Журнал отладки: вызовы модели, ответы MCP, шлюз, Transmission."""
+    return {
+        "events": journal.query(limit=min(limit, 400), category=category, after=after),
+        "categories": journal.categories(),
+    }
+
+
+@app.delete("/api/debug")
+async def debug_clear(session: str = Depends(current_session)) -> dict[str, Any]:
+    journal.clear()
+    return {"ok": True}
 
 
 @app.get("/api/status")

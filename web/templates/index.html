@@ -57,6 +57,7 @@
           <div class="status-grid" id="status-grid">проверяю…</div>
           <div class="panel__actions">
             <button class="btn btn--ghost" id="refresh-status">Обновить статус</button>
+            <button class="btn btn--ghost" id="open-debug">Журнал отладки</button>
             <button class="btn btn--ghost" id="open-settings">Доступы</button>
             <button class="btn btn--ghost" id="enable-notifications">Включить уведомления</button>
             <button class="btn btn--ghost" id="logout">Выйти</button>
@@ -169,6 +170,28 @@
         <button class="btn btn--ghost" id="close-settings">Закрыть</button>
       </div>
       <pre class="modal__result" id="settings-result" hidden></pre>
+    </div>
+  </div>
+
+  <!-- ==================== Журнал отладки ==================== -->
+  <div class="modal" id="debug-modal" hidden>
+    <div class="modal__box modal__box--wide">
+      <div class="debug__head">
+        <h2 class="modal__title">Журнал отладки</h2>
+        <div class="debug__tools">
+          <button class="btn btn--ghost btn--tiny" id="debug-refresh">Обновить</button>
+          <button class="btn btn--ghost btn--tiny" id="debug-copy">Скопировать</button>
+          <button class="btn btn--ghost btn--tiny" id="debug-clear">Очистить</button>
+          <button class="btn btn--ghost btn--tiny" id="debug-close">Закрыть</button>
+        </div>
+      </div>
+      <p class="debug__note">
+        Что агент спросил у модели, что ответил трекер, как прошёл шлюз Cloudflare
+        и что принял Transmission. Секретов и ключей здесь нет.
+      </p>
+      <div class="debug__filters" id="debug-filters"></div>
+      <div class="debug__list" id="debug-list"></div>
+      <p class="debug__empty" id="debug-empty">Событий пока нет — отправьте запрос в чат.</p>
     </div>
   </div>
 

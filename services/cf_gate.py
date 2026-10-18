@@ -37,6 +37,7 @@ import nodriver as uc
 from curl_cffi import requests as curl_requests
 
 from core.config import Settings, get_settings
+from core.debuglog import journal
 
 log = logging.getLogger("gate")
 
@@ -483,6 +484,7 @@ class CloudflareGate:
     ) -> FetchResult:
         """GET/POST к kinozal.me с автоматическим прохождением challenge."""
         await self.ensure_clearance()
+        started = time.perf_counter()
         last: FetchResult | None = None
         for attempt in range(retries + 1):
             result = await self._curl(url, method, data, headers, timeout)
@@ -490,9 +492,25 @@ class CloudflareGate:
                 self._remember_cookies(result)
                 if result.cookies:
                     self._cookies.update(result.cookies)
+                journal.add(
+                    "gate",
+                    f"{method} {url}",
+                    {
+                        "статус": result.status,
+                        "через": "браузер" if result.via == "browser" else "curl_cffi",
+                        "байт": len(result.body),
+                    },
+                    duration_ms=(time.perf_counter() - started) * 1000,
+                )
                 return result
             last = result
             log.info("challenge на %s (попытка %s), обновляю cf_clearance", url, attempt + 1)
+            journal.add(
+                "gate",
+                f"Cloudflare не пустил: {method} {url}",
+                {"статус": result.status, "попытка": attempt + 1},
+                level="warn",
+            )
             await self.refresh_clearance(url)
         if browser_fallback:
             result = await self._browser_fetch(url, method, data, headers)
@@ -648,10 +666,19 @@ class CloudflareGate:
                         if "Выход" in html and "takelogin" not in (tab.url or ""):
                             await self.export_cookies()
                             log.info("вход выполнен")
+                            journal.add(
+                                "gate",
+                                "вход на kinozal.me выполнен (браузер)",
+                                {"cookies": sorted(self._cookies)},
+                            )
                             return dict(self._cookies)
                         # Сайт сам говорит, что не так — не крутим Cloudflare зря.
                         problem = self._login_error(html)
                         if problem:
+                            journal.add(
+                                "gate", "вход на kinozal.me отклонён", {"ответ сайта": problem},
+                                level="error",
+                            )
                             raise LoginFailed(problem)
                         if "__cf_chl" in (tab.url or ""):
                             continue
@@ -695,6 +722,9 @@ class CloudflareGate:
             return None
         if "pass" in self._cookies or "uid" in self._cookies:
             log.info("вход выполнен прямым POST-запросом")
+            journal.add(
+                "gate", "вход на kinozal.me выполнен (POST)", {"cookies": sorted(self._cookies)}
+            )
             return dict(self._cookies)
         # Иногда сессию выставляет браузер (когда запрос ушёл через него).
         await self.export_cookies()

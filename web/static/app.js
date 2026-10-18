@@ -548,6 +548,160 @@
   }
 
   // ------------------------------------------------------------------
+  // Журнал отладки
+  // ------------------------------------------------------------------
+  const debugState = { open: false, filter: "all", last: null, events: [] };
+
+  const CATEGORY_TITLES = {
+    all: "всё",
+    llm: "модель",
+    mcp: "трекер",
+    gate: "шлюз",
+    transmission: "transmission",
+    agent: "агент",
+    log: "логи",
+  };
+
+  function debugRow(item) {
+    const wrap = document.createElement("article");
+    wrap.className = `debug__item debug__item--${item.category} debug__item--${item.level}`;
+
+    const row = document.createElement("div");
+    row.className = "debug__row";
+
+    const time = document.createElement("span");
+    time.className = "debug__time";
+    time.textContent = item.time;
+
+    const cat = document.createElement("span");
+    cat.className = "debug__cat";
+    cat.textContent = item.category;
+
+    const title = document.createElement("span");
+    title.className = "debug__title";
+    title.textContent = item.title;
+
+    row.append(time, cat, title);
+
+    if (item.duration_ms !== null && item.duration_ms !== undefined) {
+      const ms = document.createElement("span");
+      ms.className = "debug__ms";
+      ms.textContent = item.duration_ms >= 1000
+        ? `${(item.duration_ms / 1000).toFixed(1)} с`
+        : `${Math.round(item.duration_ms)} мс`;
+      row.appendChild(ms);
+    }
+
+    const detail = document.createElement("div");
+    detail.className = "debug__detail";
+    detail.hidden = true;
+    const entries = Object.entries(item.detail || {});
+    if (!entries.length) {
+      detail.hidden = false;
+      const empty = document.createElement("div");
+      empty.className = "debug__pair";
+      empty.textContent = "подробностей нет";
+      detail.appendChild(empty);
+    }
+    for (const [key, value] of entries) {
+      if (value === null || value === undefined || value === "" ) continue;
+      const pair = document.createElement("div");
+      pair.className = "debug__pair";
+      const name = document.createElement("span");
+      name.className = "debug__key";
+      name.textContent = key;
+      const val = document.createElement("span");
+      val.className = "debug__value";
+      val.textContent = typeof value === "object" ? JSON.stringify(value, null, 1) : String(value);
+      pair.append(name, val);
+      detail.appendChild(pair);
+    }
+
+    row.addEventListener("click", () => {
+      detail.hidden = !detail.hidden;
+    });
+
+    wrap.append(row, detail);
+    return wrap;
+  }
+
+  function renderDebugFilters(categories) {
+    const box = $("debug-filters");
+    const known = ["all", "llm", "mcp", "gate", "transmission", "agent", "log"];
+    const extra = categories.filter((name) => !known.includes(name));
+    box.innerHTML = "";
+    for (const name of [...known, ...extra]) {
+      const chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "chip" + (debugState.filter === name ? " is-active" : "");
+      chip.textContent = CATEGORY_TITLES[name] || name;
+      chip.addEventListener("click", () => {
+        debugState.filter = name;
+        loadDebug();
+      });
+      box.appendChild(chip);
+    }
+  }
+
+  async function loadDebug() {
+    try {
+      const data = await api(`/api/debug?limit=200&category=${encodeURIComponent(debugState.filter)}`);
+      debugState.events = data.events || [];
+      renderDebugFilters(data.categories || []);
+      const list = $("debug-list");
+      list.innerHTML = "";
+      // Новые — сверху: свежие события важнее старых.
+      [...debugState.events].reverse().forEach((item) => list.appendChild(debugRow(item)));
+      $("debug-empty").hidden = debugState.events.length > 0;
+    } catch (error) {
+      $("debug-empty").hidden = false;
+      $("debug-empty").textContent = `не удалось прочитать журнал: ${error.message}`;
+    }
+  }
+
+  function openDebug() {
+    debugState.open = true;
+    $("debug-modal").hidden = false;
+    loadDebug();
+    if (debugState.timer) clearInterval(debugState.timer);
+    debugState.timer = setInterval(() => {
+      if (debugState.open && !$("debug-modal").hidden) loadDebug();
+    }, 4000);
+  }
+
+  function closeDebug() {
+    debugState.open = false;
+    $("debug-modal").hidden = true;
+    if (debugState.timer) clearInterval(debugState.timer);
+    debugState.timer = null;
+  }
+
+  async function clearDebug() {
+    await api("/api/debug", { method: "DELETE" });
+    await loadDebug();
+  }
+
+  async function copyDebug() {
+    const text = debugState.events
+      .map((item) => {
+        const parts = Object.entries(item.detail || {})
+          .filter(([, v]) => v !== null && v !== undefined && v !== "")
+          .map(([k, v]) => `    ${k}: ${typeof v === "object" ? JSON.stringify(v) : v}`);
+        return `[${item.time}] ${item.category} · ${item.title}${
+          item.duration_ms ? ` (${Math.round(item.duration_ms)} мс)` : ""
+        }${parts.length ? "\n" + parts.join("\n") : ""}`;
+      })
+      .join("\n\n");
+    try {
+      await navigator.clipboard.writeText(text || "журнал пуст");
+      $("debug-copy").textContent = "Скопировано";
+      setTimeout(() => ($("debug-copy").textContent = "Скопировать"), 1500);
+    } catch (error) {
+      renderMessage({ role: "system", text: `копирование недоступно: ${error.message}` });
+    }
+  }
+
+  // ------------------------------------------------------------------
   // Управление
   // ------------------------------------------------------------------
   function setMode(mode) {
@@ -646,6 +800,11 @@
 
     $("refresh-status").addEventListener("click", refreshStatus);
     $("enable-notifications").addEventListener("click", enableNotifications);
+    $("open-debug").addEventListener("click", openDebug);
+    $("debug-close").addEventListener("click", closeDebug);
+    $("debug-refresh").addEventListener("click", loadDebug);
+    $("debug-clear").addEventListener("click", clearDebug);
+    $("debug-copy").addEventListener("click", copyDebug);
     $("open-settings").addEventListener("click", openSettings);
     $("close-settings").addEventListener("click", closeSettings);
     $("save-settings").addEventListener("click", saveSettings);
@@ -658,6 +817,7 @@
     document.addEventListener("keydown", (event) => {
       if (event.key === "Escape") {
         closeSettings();
+        closeDebug();
         $("notification-tray").hidden = true;
         closePanel();
       }

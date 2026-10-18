@@ -17,12 +17,14 @@ import asyncio
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
 import httpx
 
 from core.config import Settings, get_settings
+from core.debuglog import journal
 
 log = logging.getLogger("llm")
 
@@ -113,6 +115,7 @@ class LLM:
         temperature: float | None = None,
         max_tokens: int | None = None,
         json_mode: bool = False,
+        label: str = "запрос",
     ) -> LLMResult:
         if not self.settings.llm_api_key:
             raise LLMError("DEEPSEEK_API_KEY не задан — модель недоступна")
@@ -132,6 +135,20 @@ class LLM:
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
 
+        started = time.perf_counter()
+        prompt_chars = sum(len(str(m.get("content") or "")) for m in messages)
+        journal.add(
+            "llm",
+            f"→ модель: {label}",
+            {
+                "модель": self.settings.llm_model,
+                "сообщений": len(messages),
+                "символов в запросе": prompt_chars,
+                "json": json_mode,
+                "инструменты": [tool.get("function", {}).get("name") for tool in (tools or [])] or None,
+                "последнее сообщение": (messages[-1].get("content") if messages else ""),
+            },
+        )
         client = await self._http()
         last_error = ""
         for attempt in range(3):
@@ -140,6 +157,13 @@ class LLM:
                 if response.status_code >= 400:
                     body = response.text[:400]
                     last_error = f"HTTP {response.status_code}: {body}"
+                    journal.add(
+                        "llm",
+                        f"← модель: ошибка {response.status_code}",
+                        {"ответ сервера": body, "label": label},
+                        duration_ms=(time.perf_counter() - started) * 1000,
+                        level="error",
+                    )
                     # 429/5xx имеет смысл повторить, 4xx — нет.
                     if response.status_code in (429, 500, 502, 503, 504):
                         await asyncio.sleep(1.5 * (attempt + 1))
@@ -155,6 +179,24 @@ class LLM:
                     usage=data.get("usage") or {},
                 )
                 self.last_error = ""
+                journal.add(
+                    "llm",
+                    f"← модель: {label}",
+                    {
+                        "модель": data.get("model") or self.settings.llm_model,
+                        "ответ": result.text,
+                        "вызовы инструментов": [
+                            {
+                                "имя": (call.get("function") or {}).get("name"),
+                                "аргументы": (call.get("function") or {}).get("arguments"),
+                            }
+                            for call in result.tool_calls
+                        ]
+                        or None,
+                        "токены": result.usage,
+                    },
+                    duration_ms=(time.perf_counter() - started) * 1000,
+                )
                 return result
             except (httpx.TimeoutException, httpx.TransportError) as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
@@ -174,6 +216,7 @@ class LLM:
             temperature=0.0,
             max_tokens=max_tokens or 900,
             json_mode=True,
+            label="разбор запроса",
         )
         data = extract_json(result.text)
         if not data:
@@ -195,6 +238,7 @@ class LLM:
             ],
             temperature=temperature,
             max_tokens=max_tokens,
+            label="текст ответа",
         )
         return result.text
 
@@ -210,7 +254,7 @@ class LLM:
         transcript: list[dict[str, Any]] = list(messages)
         trace: list[dict[str, Any]] = []
         for _ in range(max_steps):
-            result = await self.chat(transcript, tools=tools)
+            result = await self.chat(transcript, tools=tools, label="шаг с инструментами")
             if not result.tool_calls:
                 return result.text, trace
             transcript.append(result.raw)
@@ -237,5 +281,5 @@ class LLM:
                         "content": json.dumps(output, ensure_ascii=False)[:6000],
                     }
                 )
-        final = await self.chat(transcript)
+        final = await self.chat(transcript, label="итоговый ответ")
         return final.text, trace

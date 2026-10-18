@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 from core.config import Settings, get_settings
+from core.debuglog import journal
 
 log = logging.getLogger("mcp")
 
@@ -93,6 +95,8 @@ class KinozalMCP:
         if self._session is None:
             await self.start()
         assert self._session is not None
+        started = time.perf_counter()
+        journal.add("mcp", f"→ трекер: {tool}", dict(arguments))
         result = await self._session.call_tool(tool, arguments)
         text = ""
         for block in result.content:
@@ -106,7 +110,20 @@ class KinozalMCP:
             getattr(result, "is_error", False) or getattr(result, "isError", False)
         )
         if failed:
+            journal.add(
+                "mcp",
+                f"← трекер: {tool} — ошибка",
+                {"ответ": text},
+                duration_ms=(time.perf_counter() - started) * 1000,
+                level="error",
+            )
             raise MCPError(text or f"инструмент {tool} вернул ошибку")
+        journal.add(
+            "mcp",
+            f"← трекер: {tool}",
+            {"получено символов": len(text), "ответ": text},
+            duration_ms=(time.perf_counter() - started) * 1000,
+        )
         if not text:
             return None
         try:

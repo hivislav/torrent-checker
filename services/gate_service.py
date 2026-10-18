@@ -21,6 +21,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from core.config import get_settings
+from core.debuglog import configure as configure_journal
 from services.cf_gate import ChallengeBlocked, CloudflareGate, LoginFailed
 
 log = logging.getLogger("gate-service")
@@ -31,6 +32,8 @@ gate = CloudflareGate()
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    # Общий журнал отладки: события шлюза должны быть видны в интерфейсе сайта.
+    configure_journal(get_settings().data_dir / "debug.jsonl")
     try:
         await gate.start()
         log.info("шлюз Cloudflare поднят")

@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Any
 
 from core.config import Settings, get_settings
+from core.debuglog import journal
 from core.llm import LLM, LLMError
 from core.matching import (
     QUALITY_LABELS,
@@ -200,6 +201,11 @@ class Agent:
                 await self._remember_many(session_id, turn.messages)
                 return turn
 
+        journal.add(
+            "agent",
+            f"запрос пользователя ({'периодически' if effective_mode == 'periodic' else 'разово'})",
+            {"текст": text, "разобрано": parsed},
+        )
         if effective_mode == "periodic":
             await self._start_periodic(session_id, text, parsed, turn)
         else:
@@ -464,6 +470,15 @@ class Agent:
         pool = [Torrent.from_dict(item) for item in (task.options or {}).get("pool", [])]
         params = task.params
 
+        journal.add(
+            "agent",
+            f"поиск «{task.title}»",
+            {
+                "раздач на трекере": len(pool),
+                "по названию": len(filter_candidates(pool, {"title": params.get("title") or ""})),
+                "параметры": params,
+            },
+        )
         by_title = filter_candidates(pool, {"title": params.get("title") or ""})
         if not by_title:
             task.state = "not_found"
@@ -564,6 +579,11 @@ class Agent:
 
         best_list = rank(fresh, task.params)
         best = best_list[0]
+        journal.add(
+            "agent",
+            "нашёл кандидата, жду подтверждения",
+            {"раздача": best.title, "размер": best.size, "сидов": best.seeds},
+        )
         task.candidate = best.to_dict()
         task.options = {
             **(task.options or {}),
@@ -817,6 +837,7 @@ class Agent:
     ) -> None:
         task.state = "downloading"
         await self.store.save_task(task)
+        journal.add("agent", f"скачиваю: {torrent.title}", {"id": torrent.id, "качество": torrent.quality})
         try:
             result = await self._download(task, torrent)
         except Exception as exc:  # noqa: BLE001
@@ -1114,6 +1135,16 @@ class Agent:
             self._schedule_next(task)
             await self.store.add_check(
                 task.id, len(matched), len(fresh), ", ".join(t.title for t in fresh[:3])
+            )
+            journal.add(
+                "agent",
+                f"проверка задачи «{task.title}»",
+                {
+                    "подходящих раздач": len(matched),
+                    "новых": len(fresh),
+                    "новинки": [item.title for item in fresh[:3]] or None,
+                    "автоскачивание": task.auto_download,
+                },
             )
             if not fresh:
                 await self.store.save_task(task)

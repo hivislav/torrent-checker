@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from core.config import Settings, get_settings
+from core.debuglog import journal
 from core.torrent_meta import human_bytes, total_length
 
 log = logging.getLogger("transmission")
@@ -234,11 +235,31 @@ class Transmission:
         return info
 
     def check_space(self, need_bytes: int | None) -> StorageInfo:
-        """Места хватает? Бросает NotEnoughSpace, если нет."""
-        info = self.ensure_target()
+        """Места хватает? Бросает NotEnoughSpace, если нет (и пишет это в журнал)."""
+        try:
+            info = self.ensure_target()
+        except StorageUnavailable as exc:
+            journal.add(
+                "transmission",
+                "внешний диск недоступен",
+                {"ошибка": str(exc), "каталог": str(self.download_dir)},
+                level="error",
+            )
+            raise
         if need_bytes is not None:
             required = need_bytes + self.min_free_bytes()
             if info.free < required:
+                journal.add(
+                    "transmission",
+                    "не хватает места",
+                    {
+                        "нужно": human_bytes(need_bytes),
+                        "свободно": human_bytes(info.free),
+                        "резерв": human_bytes(self.min_free_bytes()),
+                        "диск": str(self.download_dir),
+                    },
+                    level="error",
+                )
                 raise NotEnoughSpace(need_bytes, info.free, self.download_dir, self.min_free_bytes())
         return info
 
@@ -323,9 +344,26 @@ class Transmission:
             }
 
         try:
-            return await asyncio.to_thread(run)
+            result = await asyncio.to_thread(run)
+            journal.add(
+                "transmission",
+                f"в очередь: {result.get('name') or torrent_path.name}",
+                {
+                    "каталог": result.get("download_dir"),
+                    "размер": human_bytes(need_bytes),
+                    "свободно было": human_bytes(info.free),
+                    "хеш": result.get("hash"),
+                },
+            )
+            return result
         except Exception as exc:  # noqa: BLE001
             self._client = None
+            journal.add(
+                "transmission",
+                "Transmission не принял торрент",
+                {"ошибка": self._explain(exc)},
+                level="error",
+            )
             raise TransmissionError(self._explain(exc)) from exc
 
     async def list_torrents(self, limit: int = 50) -> list[dict[str, Any]]:
