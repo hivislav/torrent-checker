@@ -2365,41 +2365,27 @@ class Agent:
             transmission_error = str(exc)
             log.warning("Transmission не принял торрент: %s", exc)
 
-        # Запоминаем каждую скачанную серию отдельной строкой. Иначе пачка
-        # «1–10» осталась бы в памяти как одна запись, и следующая проверка
-        # решила бы, что серии 8–10 уже есть. У Torrent серия — вычисляемое
-        # свойство, поэтому подменяем список серий, а не поле episode.
-        raw_selected = plan.get("selected_episodes") or (
-            [plan["episode"]] if plan.get("episode") is not None else []
-        )
-        episodes: list[int] = []
-        for item in raw_selected:
-            value = item.get("episode") if isinstance(item, dict) else item
-            if value is not None:
-                episodes.append(int(value))
-        if episodes:
-            for episode in sorted(set(episodes)):
-                try:
-                    recorded = replace(
-                        torrent,
-                        episodes=[episode],
-                        seasons=(
-                            [int(plan["season"])]
-                            if plan.get("season") is not None
-                            else torrent.seasons
-                        ),
-                        episodes_total=torrent.episodes_total,
-                    )
-                except Exception:  # noqa: BLE001
-                    recorded = torrent
-                await self.store.record_download(
-                    task, recorded, str(path), transmission_hash,
-                    torrent_name=added.get("name") or "",
-                )
-        else:
-            await self.store.record_download(
-                task, torrent, str(path), transmission_hash, torrent_name=added.get("name") or ""
+        # Запоминаем скачанное. Главное правило: раздача уже стоит в очереди
+        # Transmission, поэтому ЛЮБАЯ ошибка записи не должна ронять задачу —
+        # иначе получится «торрент в Transmission есть, а агент про него не
+        # знает» (именно так однажды и потерялась запись).
+        try:
+            await self._remember_download(task, torrent, path, plan, transmission_hash,
+                                          str(added.get("name") or ""))
+        except Exception as exc:  # noqa: BLE001
+            log.exception("не удалось запомнить скачанное")
+            journal.add(
+                "agent",
+                "скачанное не записано в память",
+                {
+                    "раздача": torrent.title,
+                    "хеш": transmission_hash,
+                    "ошибка": f"{type(exc).__name__}: {exc}",
+                },
+                level="error",
             )
+            task.last_error = f"запись в память не удалась: {exc}"
+
         task.last_result = f"скачано: {torrent.title}"
         task.last_error = ""
         seen = list(task.params.get("seen_ids") or [])
@@ -2414,6 +2400,58 @@ class Agent:
             "transmission_hash": transmission_hash,
             "plan": plan,
         }
+
+    async def _remember_download(
+        self,
+        task: Task,
+        torrent: Torrent,
+        path: Path,
+        plan: dict[str, Any],
+        transmission_hash: str,
+        torrent_name: str,
+    ) -> None:
+        """Пишет в память каждую скачанную серию отдельной строкой.
+
+        Пачка «1–10» одной записью исказила бы прогресс: следующая проверка
+        решила бы, что серии 8–10 уже есть. Поэтому на каждую серию — своя
+        строка. У Torrent серия вычисляется из списка, подменяем список.
+        """
+        raw_selected = plan.get("selected_episodes") or (
+            [plan["episode"]] if plan.get("episode") is not None else []
+        )
+        episodes: list[int] = []
+        for item in raw_selected:
+            value = item.get("episode") if isinstance(item, dict) else item
+            try:
+                if value is not None:
+                    episodes.append(int(value))
+            except (TypeError, ValueError):
+                continue
+
+        if not episodes:
+            await self.store.record_download(
+                task, torrent, str(path), transmission_hash, torrent_name=torrent_name
+            )
+            return
+
+        season = plan.get("season")
+        try:
+            season_value = int(season) if season is not None else None
+        except (TypeError, ValueError):
+            season_value = None
+        for episode in sorted(set(episodes)):
+            try:
+                recorded = replace(
+                    torrent,
+                    episodes=[episode],
+                    seasons=[season_value] if season_value is not None else torrent.seasons,
+                    episodes_total=torrent.episodes_total,
+                )
+            except Exception:  # noqa: BLE001 - запись всё равно важнее
+                recorded = torrent
+            await self.store.record_download(
+                task, recorded, str(path), transmission_hash, torrent_name=torrent_name
+            )
 
     async def _download(self, task: Task, torrent: Torrent) -> dict[str, Any]:
         """Автоматический путь (периодические задачи): без диалога.

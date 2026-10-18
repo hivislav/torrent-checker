@@ -99,6 +99,62 @@ def build() -> tuple[Agent, FakeTransmission]:
     return agent, fake
 
 
+async def test_record_survives_bad_plan() -> None:
+    """Регрессия: «торрент в Transmission есть, а агент про него не знает».
+
+    Так случилось один раз: раздача уже стояла в очереди, а разбор плана
+    («episodes» пришёл списком словарей) падал с TypeError — и запись в память
+    не создавалась. Теперь запись защищена и кривой план её не отменяет.
+    """
+    print("\n== запись не теряется при кривом плане ==")
+    agent, fake = build()
+    task = Task(id="t2", kind="oneshot", state="downloading", session_id="s",
+                user_query="проба", params={"title": "Проба"})
+
+    class AddTransmission(FakeTransmission):
+        async def add(self, path, *, need_bytes=None, files_wanted=None):  # noqa: D102
+            return {"ok": True, "name": "Проба", "hash": "h9",
+                    "download_dir": str(self.download_dir), "files_selected": []}
+
+    agent.transmission = AddTransmission(agent.settings.transmission_download_dir)  # type: ignore[assignment]
+    path = agent.settings.torrents_dir / "999.torrent"
+    path.write_bytes(b"d4:infod4:name4:testee")
+
+    # План с «episodes» из словарей и мусорным season — именно такая форма
+    # раньше роняла запись.
+    plan = {
+        "kind": "episode",
+        "selected_episodes": [3, {"episode": 4}],
+        "episodes": [{"episode": 3}, {"episode": 4}],
+        "season": None,
+        "size": 10,
+        "wanted": [0],
+    }
+    torrent = Torrent(id="999", title="Проба (3 сезон: 3-4 серии)", seasons=[3], episodes=[3, 4],
+                      series_key="proba")
+    result = await agent._finalize_download(task, torrent, path, plan)  # noqa: SLF001
+    check("постановка прошла", result.get("ok") is True, result)
+    rows = await agent.store.list_downloads()
+    print("  записей в памяти:", [(r.get("episode"), r.get("transmission_hash")) for r in rows])
+    check("запись появилась", bool(rows), rows)
+    check("серии записаны по одной", sorted(r.get("episode") for r in rows) == [3, 4], rows)
+    check("хеш сохранён", all(r.get("transmission_hash") == "h9" for r in rows), rows)
+
+    # А если хранилище вообще упало — задача не должна рухнуть.
+    class BrokenStore:
+        async def record_download(self, *args, **kwargs):  # noqa: D102
+            raise RuntimeError("база недоступна")
+
+    original = agent.store
+    agent.store = BrokenStore()  # type: ignore[assignment]
+    try:
+        result = await agent._finalize_download(task, torrent, path, plan)  # noqa: SLF001
+        check("ошибка записи не роняет скачивание", result.get("ok") is True, result)
+    finally:
+        agent.store = original
+    agent.store.close()
+
+
 async def main() -> int:
     print("\n== очередь Transmission видна в карточке ==")
     agent, fake = build()
@@ -123,6 +179,7 @@ async def main() -> int:
     check("у чужого есть прогресс", (foreign.get("progress") or {}).get("percent") == 100.0,
           foreign.get("progress"))
 
+    await test_record_survives_bad_plan()
     print("\n== удаление раздачи, о которой нет записи ==")
     confirm = await agent.request_delete("", "h2")
     text = confirm.messages[0].text
