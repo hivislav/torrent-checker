@@ -222,7 +222,10 @@ class Agent:
         task = await self.store.get_task(task_id) if task_id else None
         turn.task = task
 
-        if kind == "cancel" and task:
+        if kind == "cancel" and task is None:
+            # Отмена подтверждения (например, удаления) — задачи тут может не быть.
+            turn.add("Отменено, ничего не трогаю.")
+        elif kind == "cancel" and task:
             await self.cancel_task(task.id)
             turn.add(
                 f"Задача «{task.title}» отменена.",
@@ -289,6 +292,12 @@ class Agent:
                 turn.add("Эта раздача больше не в списке — дождитесь следующей проверки.", kind="error")
             else:
                 await self._download_with_report(task, torrent, turn, periodic_context=True)
+        elif kind == "delete_download":
+            torrent_id = str(payload.get("torrent_id") or "")
+            turn = await self.request_delete(torrent_id)
+        elif kind == "confirm_delete":
+            torrent_id = str(payload.get("torrent_id") or "")
+            turn = await self.perform_delete(torrent_id)
         elif kind == "retry_transmission" and task:
             await self._retry_transmission(task, turn)
         elif kind == "check_now" and task:
@@ -1031,7 +1040,9 @@ class Agent:
             transmission_error = str(exc)
             log.warning("Transmission не принял торрент: %s", exc)
 
-        await self.store.record_download(task, torrent, str(path), transmission_hash)
+        await self.store.record_download(
+            task, torrent, str(path), transmission_hash, torrent_name=added.get("name") or ""
+        )
         task.last_result = f"скачано: {torrent.title}"
         task.last_error = ""
         # Помним id в задаче, чтобы не качать одно и то же повторно.
@@ -1091,6 +1102,146 @@ class Agent:
         )
         if task.kind == "periodic":
             message.actions = self._task_actions(task)
+
+    # ------------------------------------------------------------------
+    # Удаление раздачи вместе с файлами
+    # ------------------------------------------------------------------
+    async def request_delete(self, torrent_id: str) -> Turn:
+        """Спрашивает подтверждение: удаление файлов необратимо."""
+        turn = Turn()
+        record = await self.store.get_download(torrent_id)
+        if record is None:
+            turn.add(
+                "Не нашёл эту раздачу в списке скачанного — обновите картотеку.",
+                kind="error",
+            )
+            return turn
+
+        size_note = f" ({record.get('size')})" if record.get("size") else ""
+        lines = [
+            f"Удалить раздачу «{record.get('title')}»{size_note}?",
+        ]
+        if record.get("name"):
+            lines.append(f"Будет удалено: {record.get('name')} в каталоге загрузок.")
+        if record.get("torrent_path"):
+            lines.append(f"Torrent-файл: {record.get('torrent_path')}")
+        lines.append(
+            "Файлы стираются насовсем, минуя корзину — восстановить их не получится."
+        )
+        message = turn.add("\n".join(lines), kind="error", payload={"download": record})
+        message.actions = [
+            Action(
+                id="delete-forever",
+                label="Удалить навсегда",
+                kind="confirm_delete",
+                payload={"torrent_id": torrent_id},
+                style="danger",
+            ),
+            Action(
+                id="cancel-delete",
+                label="Отмена",
+                kind="cancel",
+                payload={"torrent_id": torrent_id, "task_id": record.get("task_id") or ""},
+            ),
+        ]
+        return turn
+
+    async def perform_delete(self, torrent_id: str) -> Turn:
+        """Убирает раздачу из Transmission, стирает файлы и .torrent."""
+        from core.files import delete_paths
+
+        turn = Turn()
+        record = await self.store.get_download(torrent_id)
+        if record is None:
+            turn.add("Запись уже удалена — обновите картотеку.", kind="error")
+            return turn
+
+        torrent_hash = str(record.get("transmission_hash") or "")
+        name = str(record.get("name") or "")
+        download_dir = Path(self.settings.transmission_download_dir)
+        file_list: list[str] = []
+
+        # 1. Раздача ещё в очереди? Забираем список файлов и убираем её оттуда
+        #    без delete_local_data: иначе macOS отправит данные в корзину.
+        if torrent_hash:
+            try:
+                found = await self.transmission.find_by_hash(torrent_hash)
+            except TransmissionError as exc:
+                found = None
+                journal.add(
+                    "transmission", "не смог прочитать раздачу перед удалением",
+                    {"ошибка": str(exc)}, level="warn",
+                )
+            if found:
+                if found.get("download_dir"):
+                    download_dir = Path(found["download_dir"])
+                file_list = [str(item) for item in found.get("files") or []]
+                if not name:
+                    name = str(found.get("name") or "")
+                try:
+                    await self.transmission.remove(torrent_hash, delete_data=False)
+                except TransmissionError as exc:
+                    turn.add(f"Не удалось убрать раздачу из Transmission: {exc}", kind="error")
+                    return turn
+
+        # 2. Что именно удалять на диске.
+        roots = [download_dir, download_dir / ".incomplete", self.settings.torrents_dir]
+        targets: list[Path] = []
+        if name:
+            targets.append(download_dir / name)
+            targets.append(download_dir / ".incomplete" / name)
+        for item in file_list:
+            targets.append(download_dir / item)
+        torrent_path = str(record.get("torrent_path") or "")
+        if torrent_path:
+            targets.append(Path(torrent_path))
+        else:
+            targets.append(self.settings.torrents_dir / f"{torrent_id}.torrent")
+
+        result = await asyncio.to_thread(delete_paths, targets, roots)
+
+        # Повторная проверка: если Transmission успел дописать файл уже после
+        # удаления, папка появляется снова. Дочищаем (до трёх подходов).
+        for _ in range(3):
+            leftovers = [path for path in targets if path.exists()]
+            if not leftovers:
+                break
+            await asyncio.sleep(1.0)
+            extra = await asyncio.to_thread(delete_paths, leftovers, roots)
+            result.deleted.extend(extra.deleted)
+            result.freed_bytes += extra.freed_bytes
+            result.errors.extend(extra.errors)
+
+        # 3. Забываем раздачу: файлов больше нет.
+        await self.store.forget_download(torrent_id)
+        journal.add(
+            "agent",
+            f"удалена раздача: {record.get('title')}",
+            {
+                "файлов удалено": len(result.deleted),
+                "освобождено": result.summary(),
+                "вне разрешённых папок": result.refused[:5] or None,
+                "ошибки": result.errors or None,
+            },
+            level="error" if result.errors else "info",
+        )
+
+        text = f"Удалил «{record.get('title')}» из очереди и с диска. {result.summary()}"
+        if result.missing and not result.deleted:
+            text += "\nФайлов на диске уже не было — убрал только запись и torrent-файл."
+        if result.errors:
+            text += "\nПроблемы:\n• " + "\n• ".join(result.errors[:5])
+        last = turn.add(text, kind="error" if result.errors else "task")
+        await self.events.publish(
+            {
+                "type": "download_deleted",
+                "torrent_id": torrent_id,
+                "title": str(record.get("title") or ""),
+                "message": last.to_dict(),
+            }
+        )
+        await self.desktop.send("Раздача удалена", str(record.get("title") or "")[:120])
+        return turn
 
     # ------------------------------------------------------------------
     # Периодическая проверка (вызывается шедулером)

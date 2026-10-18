@@ -344,6 +344,20 @@
           .join(" · ");
         row.appendChild(heading);
         if (meta.textContent) row.appendChild(meta);
+
+        const actions = document.createElement("div");
+        actions.className = "task-card__actions";
+        actions.appendChild(
+          smallButton("Удалить", "btn btn--danger", async (event) => {
+            event.target.disabled = true;
+            await runAction(
+              { kind: "delete_download", payload: { torrent_id: item.torrent_id } },
+              event.target
+            );
+            event.target.disabled = false;
+          })
+        );
+        row.appendChild(actions);
         downloadBox.appendChild(row);
       });
     } catch (error) {
@@ -443,7 +457,11 @@
           pushNotification(data.message);
         }
         refreshTasks();
-      } else if (data.type === "download_done" || data.type === "task_cancelled") {
+      } else if (
+        data.type === "download_done" ||
+        data.type === "download_deleted" ||
+        data.type === "task_cancelled"
+      ) {
         refreshTasks();
       }
     };

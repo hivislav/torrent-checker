@@ -106,7 +106,17 @@ class Store:
         self._conn.execute("PRAGMA journal_mode=WAL")
         with self._lock:
             self._conn.executescript(SCHEMA)
+            self._migrate()
             self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Дописывает колонки, появившиеся позже: базу не пересоздаём."""
+        columns = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(downloads)").fetchall()
+        }
+        if "name" not in columns:
+            self._conn.execute("ALTER TABLE downloads ADD COLUMN name TEXT NOT NULL DEFAULT ''")
 
     # ------------------------------------------------------------------
     # низкий уровень
@@ -211,17 +221,18 @@ class Store:
     # скачанное (память агента)
     # ------------------------------------------------------------------
     async def record_download(self, task: Task, torrent: Any, torrent_path: str,
-                              transmission_hash: str = "") -> None:
+                              transmission_hash: str = "", torrent_name: str = "") -> None:
         def run(conn: sqlite3.Connection) -> None:
             conn.execute(
-                "INSERT OR IGNORE INTO downloads (task_id, torrent_id, title, series_key, "
+                "INSERT OR IGNORE INTO downloads (task_id, torrent_id, title, name, series_key, "
                 "quality, voice, season, episode, size, upload_date, uploaded_ts, "
                 "torrent_path, transmission_hash, added_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     task.id,
                     torrent.id,
                     torrent.title,
+                    torrent_name or getattr(torrent, "title", ""),
                     getattr(torrent, "series_key", "") or "",
                     torrent.quality,
                     torrent.voice,
@@ -235,6 +246,24 @@ class Store:
                     now_iso(),
                 ),
             )
+
+        await self._call(run)
+
+    async def get_download(self, torrent_id: str) -> dict[str, Any] | None:
+        def run(conn: sqlite3.Connection):
+            cursor = conn.execute(
+                "SELECT * FROM downloads WHERE torrent_id = ? LIMIT 1", (str(torrent_id),)
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+        return await self._call(run)
+
+    async def forget_download(self, torrent_id: str) -> None:
+        """Убирает запись из памяти агента: файлов больше нет, помнить нечего."""
+
+        def run(conn: sqlite3.Connection) -> None:
+            conn.execute("DELETE FROM downloads WHERE torrent_id = ?", (str(torrent_id),))
 
         await self._call(run)
 

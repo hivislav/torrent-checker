@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import shutil
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -295,6 +296,83 @@ class Transmission:
                 level="error",
             )
             raise TransmissionError(self._explain(exc)) from exc
+
+    async def find_by_hash(self, torrent_hash: str) -> dict[str, Any] | None:
+        """Раздача в очереди по хешу: имя, файлы, каталог, размер."""
+        if not torrent_hash:
+            return None
+
+        def run() -> dict[str, Any] | None:
+            client = self._get_client()
+            for torrent in client.get_torrents():
+                if getattr(torrent, "hash_string", "") != torrent_hash:
+                    continue
+                # Имена файлов лежат в сырых полях RPC: у объекта Torrent
+                # списка файлов нет (там только FileStat без имён).
+                raw_files = (getattr(torrent, "fields", {}) or {}).get("files") or []
+                files = [
+                    str(item.get("name"))
+                    for item in raw_files
+                    if isinstance(item, dict) and item.get("name")
+                ]
+                return {
+                    "hash": torrent_hash,
+                    "name": getattr(torrent, "name", ""),
+                    "download_dir": str(getattr(torrent, "download_dir", "")),
+                    "percent_done": float(getattr(torrent, "percent_done", 0.0)),
+                    "total_size": int(getattr(torrent, "total_size", 0) or 0),
+                    "files": files,
+                }
+            return None
+
+        return await asyncio.to_thread(run)
+
+    async def remove(self, torrent_hash: str, *, delete_data: bool = False) -> dict[str, Any]:
+        """Убирает раздачу из очереди.
+
+        `delete_data` намеренно выключен по умолчанию: на macOS Transmission
+        «удаляет» данные перемещением в корзину, а нам нужно освобождать место
+        сразу. Файлы стирает агент — см. core/files.py.
+        """
+        if not torrent_hash:
+            return {"ok": False, "error": "не передан хеш раздачи"}
+
+        def run() -> dict[str, Any]:
+            client = self._get_client()
+            try:
+                client.stop_torrent(torrent_hash)
+            except Exception:  # noqa: BLE001 - уже остановлена
+                pass
+            client.remove_torrent(torrent_hash, delete_data=delete_data)
+            # Transmission убирает раздачу не мгновенно: пока он это делает,
+            # файлы могут ещё дописываться. Ждём, пока раздача исчезнет из
+            # очереди, иначе удаление файлов прошло бы «под» активной записью и
+            # каталог успел бы появиться снова.
+            deadline = time.time() + 15
+            while time.time() < deadline:
+                if not any(
+                    getattr(item, "hash_string", "") == torrent_hash
+                    for item in client.get_torrents()
+                ):
+                    break
+                time.sleep(0.3)
+            return {"ok": True, "hash": torrent_hash, "delete_data": delete_data}
+
+        try:
+            result = await asyncio.to_thread(run)
+            journal.add(
+                "transmission",
+                "раздача убрана из очереди",
+                {"хеш": torrent_hash, "данные удалил Transmission": delete_data},
+            )
+            return result
+        except Exception as exc:  # noqa: BLE001
+            message = self._explain(exc)
+            # «нет такой раздачи» — не ошибка: файлы всё равно надо убрать
+            if "not found" in str(exc).lower() or "Invalid argument" in str(exc):
+                return {"ok": True, "hash": torrent_hash, "already_gone": True}
+            journal.add("transmission", "не удалось убрать раздачу", {"ошибка": message}, level="error")
+            raise TransmissionError(message) from exc
 
     async def list_torrents(self, limit: int = 50) -> list[dict[str, Any]]:
         def run() -> list[dict[str, Any]]:
