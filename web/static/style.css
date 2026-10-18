@@ -1244,11 +1244,16 @@ body {
   .chat__legend { font-size: 12.5px; }
   .mode-btn__label { font-size: 11px; }
   .mode-btn__hint { font-size: 10.5px; }
-  .composer__input { font-size: 14.5px; }
+  /* iOS Safari сам приближает страницу, если шрифт в поле меньше 16px —
+     из-за этого при вводе страница «зумилась» в ширину. */
+  .composer__input,
+  .field input,
+  .field textarea,
+  .field select { font-size: 16px; }
   .modal__title { font-size: 18px; }
   .modal__note { font-size: 12.5px; }
   .field span { font-size: 9.5px; }
-  .field input { font-size: 13px; }
+
   .modal__result { font-size: 10.5px; }
   .status-grid { font-size: 10.5px; }
 
