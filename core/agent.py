@@ -607,11 +607,15 @@ class Agent:
             )
             message.actions = self._start_actions(task, plan)
         elif kind == "delete_download":
-            torrent_id = str(payload.get("torrent_id") or "")
-            turn = await self.request_delete(torrent_id)
+            turn = await self.request_delete(
+                str(payload.get("torrent_id") or ""),
+                str(payload.get("hash") or ""),
+            )
         elif kind == "confirm_delete":
-            torrent_id = str(payload.get("torrent_id") or "")
-            turn = await self.perform_delete(torrent_id)
+            turn = await self.perform_delete(
+                str(payload.get("torrent_id") or ""),
+                str(payload.get("hash") or ""),
+            )
         elif kind == "retry_transmission" and task:
             await self._retry_transmission(task, turn)
         elif kind == "check_now" and task:
@@ -653,13 +657,62 @@ class Agent:
         return await self.store.history(session_id, limit)
 
     async def downloads(self, limit: int = 50) -> list[dict[str, Any]]:
-        """Скачанное с текущим прогрессом из Transmission."""
-        rows = await self.store.list_downloads(limit)
-        hashes = [str(row.get("transmission_hash") or "") for row in rows]
+        """Что лежит на диске: наши записи ПЛЮС всё, что есть в очереди Transmission.
+
+        Второе важно: торрент могли добавить прямо в Transmission (или запись
+        потерялась), и он всё равно должен быть виден в карточке — иначе список
+        расходится с реальностью.
+        """
+        records = await self.store.list_downloads(limit)
+        try:
+            queue = await self.transmission.list_torrents(limit=200)
+        except TransmissionError as exc:
+            log.warning("не удалось прочитать очередь Transmission: %s", exc)
+            queue = []
+
+        hashes = [str(row.get("transmission_hash") or "") for row in records]
+        hashes += [str(item.get("hash") or "") for item in queue]
         progress = await self.transmission.progress([item for item in hashes if item])
-        for row in rows:
-            row["progress"] = progress.get(str(row.get("transmission_hash") or ""))
-        return rows
+
+        result: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for row in records:
+            torrent_hash = str(row.get("transmission_hash") or "")
+            row["source"] = "agent"
+            row["hash"] = torrent_hash
+            row["progress"] = progress.get(torrent_hash)
+            result.append(row)
+            if torrent_hash:
+                seen.add(torrent_hash)
+
+        for item in queue:
+            torrent_hash = str(item.get("hash") or "")
+            if torrent_hash in seen:
+                continue
+            state = progress.get(torrent_hash) or {}
+            result.append(
+                {
+                    "id": None,
+                    "torrent_id": "",
+                    "task_id": "",
+                    "title": item.get("name") or "без названия",
+                    "name": item.get("name") or "",
+                    "series_key": "",
+                    "quality": "",
+                    "voice": "",
+                    "season": None,
+                    "episode": None,
+                    "size": state.get("size_human") or "",
+                    "torrent_path": "",
+                    "transmission_hash": torrent_hash,
+                    "hash": torrent_hash,
+                    "progress": state or None,
+                    "source": "transmission",
+                    "added_at": "",
+                    "download_dir": item.get("download_dir") or "",
+                }
+            )
+        return result
 
     async def status(self) -> dict[str, Any]:
         import httpx
@@ -2499,16 +2552,48 @@ class Agent:
     # ------------------------------------------------------------------
     # Удаление раздачи вместе с файлами
     # ------------------------------------------------------------------
-    async def request_delete(self, torrent_id: str) -> Turn:
+    async def _find_delete_target(
+        self, torrent_id: str = "", torrent_hash: str = ""
+    ) -> dict[str, Any] | None:
+        """Ищет запись для удаления: по id раздачи, по хешу или прямо в очереди."""
+        record = await self.store.get_download(torrent_id) if torrent_id else None
+        if record is None and torrent_hash:
+            record = await self.store.get_download_by_hash(torrent_hash)
+        if record is not None:
+            return record
+        if not torrent_hash:
+            return None
+        # Раздачи нет в нашей памяти — она могла быть добавлена прямо в Transmission.
+        try:
+            found = await self.transmission.find_by_hash(torrent_hash)
+        except TransmissionError:
+            found = None
+        if not found:
+            return None
+        return {
+            "torrent_id": "",
+            "task_id": "",
+            "title": found.get("name") or "раздача из Transmission",
+            "name": found.get("name") or "",
+            "size": human_bytes(int(found.get("total_size") or 0)),
+            "torrent_path": "",
+            "transmission_hash": torrent_hash,
+            "source": "transmission",
+        }
+
+    async def request_delete(self, torrent_id: str, torrent_hash: str = "") -> Turn:
         """Спрашивает подтверждение: удаление файлов необратимо."""
         turn = Turn()
-        record = await self.store.get_download(torrent_id)
+        record = await self._find_delete_target(torrent_id, torrent_hash)
         if record is None:
             turn.add(
-                "Не нашёл эту раздачу в списке скачанного — обновите картотеку.",
+                "Не нашёл эту раздачу ни в памяти агента, ни в очереди Transmission — "
+                "обновите картотеку.",
                 kind="error",
             )
             return turn
+        if not torrent_id:
+            torrent_id = str(record.get("torrent_id") or "")
 
         size_note = f" ({record.get('size')})" if record.get("size") else ""
         lines = [
@@ -2532,7 +2617,7 @@ class Agent:
                 id="delete-forever",
                 label="Удалить навсегда",
                 kind="confirm_delete",
-                payload={"torrent_id": torrent_id},
+                payload={"torrent_id": torrent_id, "hash": record.get("transmission_hash") or ""},
                 style="danger",
             ),
             Action(
@@ -2544,17 +2629,18 @@ class Agent:
         ]
         return turn
 
-    async def perform_delete(self, torrent_id: str) -> Turn:
+    async def perform_delete(self, torrent_id: str, torrent_hash: str = "") -> Turn:
         """Убирает раздачу из Transmission, стирает файлы и .torrent."""
         from core.files import delete_paths
 
         turn = Turn()
-        record = await self.store.get_download(torrent_id)
+        record = await self._find_delete_target(torrent_id, torrent_hash)
         if record is None:
             turn.add("Запись уже удалена — обновите картотеку.", kind="error")
             return turn
+        torrent_id = str(record.get("torrent_id") or torrent_id or "")
 
-        torrent_hash = str(record.get("transmission_hash") or "")
+        torrent_hash = str(record.get("transmission_hash") or "") or torrent_hash
         name = str(record.get("name") or "")
         download_dir = Path(self.settings.transmission_download_dir)
         file_list: list[str] = []
@@ -2610,8 +2696,9 @@ class Agent:
             result.freed_bytes += extra.freed_bytes
             result.errors.extend(extra.errors)
 
-        # 3. Забываем раздачу: файлов больше нет.
-        await self.store.forget_download(torrent_id)
+        # 3. Забываем раздачу: файлов больше нет (если о ней была запись).
+        if torrent_id:
+            await self.store.forget_download(torrent_id)
         journal.add(
             "agent",
             f"удалена раздача: {record.get('title')}",

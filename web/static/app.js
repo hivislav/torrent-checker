@@ -537,6 +537,14 @@
           .filter(Boolean)
           .join(" · ");
         row.appendChild(heading);
+        const origin = item.source === "transmission" ? "добавлено в Transmission" : "";
+        if (origin) {
+          const note = document.createElement("div");
+          note.className = "task-card__meta";
+          note.style.opacity = ".7";
+          note.textContent = origin;
+          meta.textContent = [meta.textContent, origin].filter(Boolean).join(" · ");
+        }
         if (meta.textContent) row.appendChild(meta);
         if (item.progress) {
           row.appendChild(progressBar(item.progress));
@@ -554,7 +562,10 @@
           smallButton("Удалить", "btn btn--danger", async (event) => {
             event.target.disabled = true;
             await runAction(
-              { kind: "delete_download", payload: { torrent_id: item.torrent_id } },
+              {
+                kind: "delete_download",
+                payload: { torrent_id: item.torrent_id || "", hash: item.hash || "" },
+              },
               event.target
             );
             event.target.disabled = false;

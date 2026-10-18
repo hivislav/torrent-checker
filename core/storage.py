@@ -280,6 +280,20 @@ class Store:
 
         return await self._call(run)
 
+    async def get_download_by_hash(self, torrent_hash: str) -> dict[str, Any] | None:
+        """Запись по хешу Transmission (когда id раздачи неизвестен)."""
+
+        def run(conn: sqlite3.Connection):
+            cursor = conn.execute(
+                "SELECT * FROM downloads WHERE transmission_hash = ? AND deleted_at IS NULL "
+                "ORDER BY id DESC LIMIT 1",
+                (str(torrent_hash),),
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+        return await self._call(run)
+
     async def forget_download(self, torrent_id: str) -> None:
         """Помечает скачанное удалённым, но НЕ стирает запись.
 
