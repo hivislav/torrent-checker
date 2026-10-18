@@ -150,10 +150,17 @@ class FakeTransmission:
         }
 
     async def find_by_hash(self, torrent_hash):  # noqa: D102
-        return None
+        return {
+            "hash": torrent_hash,
+            "name": self.torrent_name,
+            "download_dir": str(self.download_dir),
+            "files": [],
+        }
 
     async def remove(self, torrent_hash, *, delete_data=False):  # noqa: D102
         return {"ok": True}
+
+    torrent_name = "Звёзды в джунглях.S03"
 
 
 def build_agent() -> tuple[Agent, FakeMCP, FakeTransmission]:
@@ -249,6 +256,52 @@ async def test_auto_download() -> None:
     agent.store.close()
 
 
+async def test_delete_keeps_progress() -> None:
+    print("\n== посмотрел серию и удалил файл — прогресс не откатывается ==")
+    agent, mcp, transmission = build_agent()
+    task = await create_task(agent, auto=True)
+    assert task is not None
+
+    mcp.episodes = 3
+    await agent.check_task(task)
+    task = await agent.store.get_task(task.id)
+    assert task is not None
+    check("3-я серия скачана", transmission.added and transmission.added[-1]["files"] == [2],
+          transmission.added[-1:] or None)
+
+    # Кладём на диск «скачанное», чтобы удалению было что стирать.
+    folder = agent.settings.transmission_download_dir / transmission.torrent_name
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "03. Звёзды в джунглях.S03.avi").write_bytes(b"x" * 1024)
+
+    # Ключ сериала берём из самой записи — он вычисляется из названия раздачи.
+    rows = await agent.store.list_downloads()
+    series_key = rows[0]["series_key"] if rows else ""
+    before = await agent.store.episodes_by_season(series_key)
+    print("  ключ сериала:", series_key, "| прогресс до удаления:", before)
+    await agent.perform_delete("2156284")
+
+    check("файлов на диске больше нет", not folder.exists())
+    check("в списке «скачано» пусто", not await agent.store.list_downloads())
+    after = await agent.store.episodes_by_season(series_key)
+    print("  прогресс после удаления:", after)
+    check("прогресс сохранился (3-я серия помнится)", after.get(3) == 3, after)
+
+    # Трекер всё ещё показывает 1-3: агент не должен качать третью заново.
+    added_before = len(transmission.added)
+    await agent.check_task(task)
+    check("третья серия повторно не скачивается", len(transmission.added) == added_before,
+          transmission.added[added_before:])
+
+    # Появилась четвёртая — качаем именно её.
+    mcp.episodes = 4
+    await agent.check_task(task)
+    print("  новые постановки:", transmission.added[added_before:])
+    check("следующая скачана — 4-я серия",
+          transmission.added[-1]["files"] == [3], transmission.added[-1])
+    agent.store.close()
+
+
 async def test_notify_only() -> None:
     print("\n== «проверяй наличие новых серий, начиная с третьей» ==")
     agent, mcp, transmission = build_agent()
@@ -311,6 +364,7 @@ async def test_plan_for_periodic() -> None:
 
 async def main() -> int:
     await test_auto_download()
+    await test_delete_keeps_progress()
     await test_notify_only()
     await test_episode_before_floor()
     await test_plan_for_periodic()

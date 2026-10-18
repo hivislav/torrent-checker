@@ -61,7 +61,10 @@ CREATE TABLE IF NOT EXISTS downloads (
     uploaded_ts REAL,
     torrent_path TEXT NOT NULL DEFAULT '',
     transmission_hash TEXT NOT NULL DEFAULT '',
-    added_at TEXT NOT NULL
+    added_at TEXT NOT NULL,
+    -- Когда файл удалили с диска. Запись НЕ стирается: по ней агент помнит,
+    -- что эта серия уже была, и не скачивает её повторно.
+    deleted_at TEXT
 );
 -- Уникальность по раздаче И серии: одна и та же раздача обновляется на трекере
 -- и приносит новые выпуски, поэтому записей по ней может быть несколько.
@@ -120,6 +123,8 @@ class Store:
         }
         if "name" not in columns:
             self._conn.execute("ALTER TABLE downloads ADD COLUMN name TEXT NOT NULL DEFAULT ''")
+        if "deleted_at" not in columns:
+            self._conn.execute("ALTER TABLE downloads ADD COLUMN deleted_at TEXT")
         # Старый уникальный индекс «одна запись на раздачу» мешает запоминать
         # несколько серий из одной и той же пачки — заменяем на составной.
         self._conn.execute("DROP INDEX IF EXISTS idx_downloads_torrent")
@@ -234,10 +239,14 @@ class Store:
                               transmission_hash: str = "", torrent_name: str = "") -> None:
         def run(conn: sqlite3.Connection) -> None:
             conn.execute(
-                "INSERT OR IGNORE INTO downloads (task_id, torrent_id, title, name, series_key, "
+                "INSERT INTO downloads (task_id, torrent_id, title, name, series_key, "
                 "quality, voice, season, episode, size, upload_date, uploaded_ts, "
                 "torrent_path, transmission_hash, added_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(torrent_id, IFNULL(season, 0), IFNULL(episode, 0)) "
+                "DO UPDATE SET deleted_at = NULL, added_at = excluded.added_at, "
+                "torrent_path = excluded.torrent_path, "
+                "transmission_hash = excluded.transmission_hash",
                 (
                     task.id,
                     torrent.id,
@@ -260,9 +269,11 @@ class Store:
         await self._call(run)
 
     async def get_download(self, torrent_id: str) -> dict[str, Any] | None:
+        """Запись о скачанном, которое ещё лежит на диске."""
         def run(conn: sqlite3.Connection):
             cursor = conn.execute(
-                "SELECT * FROM downloads WHERE torrent_id = ? LIMIT 1", (str(torrent_id),)
+                "SELECT * FROM downloads WHERE torrent_id = ? AND deleted_at IS NULL LIMIT 1",
+                (str(torrent_id),),
             )
             row = cursor.fetchone()
             return dict(row) if row else None
@@ -270,16 +281,27 @@ class Store:
         return await self._call(run)
 
     async def forget_download(self, torrent_id: str) -> None:
-        """Убирает запись из памяти агента: файлов больше нет, помнить нечего."""
+        """Помечает скачанное удалённым, но НЕ стирает запись.
+
+        Так агент помнит, что эта серия уже была: иначе периодическая задача
+        «качай новые, начиная с третьей» после удаления третьей скачала бы её
+        заново.
+        """
 
         def run(conn: sqlite3.Connection) -> None:
-            conn.execute("DELETE FROM downloads WHERE torrent_id = ?", (str(torrent_id),))
+            conn.execute(
+                "UPDATE downloads SET deleted_at = ? WHERE torrent_id = ? AND deleted_at IS NULL",
+                (now_iso(), str(torrent_id)),
+            )
 
         await self._call(run)
 
     async def is_downloaded(self, torrent_id: str) -> bool:
         def run(conn: sqlite3.Connection):
-            cursor = conn.execute("SELECT 1 FROM downloads WHERE torrent_id = ? LIMIT 1", (torrent_id,))
+            cursor = conn.execute(
+                "SELECT 1 FROM downloads WHERE torrent_id = ? AND deleted_at IS NULL LIMIT 1",
+                (torrent_id,),
+            )
             return cursor.fetchone() is not None
 
         return bool(await self._call(run))
@@ -288,10 +310,11 @@ class Store:
         def run(conn: sqlite3.Connection):
             if series_key:
                 cursor = conn.execute(
-                    "SELECT torrent_id FROM downloads WHERE series_key = ?", (series_key,)
+                    "SELECT torrent_id FROM downloads WHERE series_key = ? AND deleted_at IS NULL",
+                    (series_key,),
                 )
             else:
-                cursor = conn.execute("SELECT torrent_id FROM downloads")
+                cursor = conn.execute("SELECT torrent_id FROM downloads WHERE deleted_at IS NULL")
             return [row["torrent_id"] for row in cursor.fetchall()]
 
         return set(await self._call(run))
@@ -315,7 +338,11 @@ class Store:
         return int(await self._call(run) or 0)
 
     async def episodes_by_season(self, series_key: str) -> dict[int, int]:
-        """Что уже скачано по сезонам: {сезон: максимальная серия}."""
+        """Докуда дошли по сезонам: {сезон: максимальная серия}.
+
+        Удалённые записи тоже считаются: если пользователь посмотрел серию и
+        удалил файл, прогресс не должен откатиться назад.
+        """
 
         def run(conn: sqlite3.Connection):
             cursor = conn.execute(
@@ -342,7 +369,8 @@ class Store:
     async def list_downloads(self, limit: int = 100) -> list[dict[str, Any]]:
         def run(conn: sqlite3.Connection):
             cursor = conn.execute(
-                "SELECT * FROM downloads ORDER BY id DESC LIMIT ?", (limit,)
+                "SELECT * FROM downloads WHERE deleted_at IS NULL ORDER BY id DESC LIMIT ?",
+                (limit,),
             )
             return [dict(row) for row in cursor.fetchall()]
 

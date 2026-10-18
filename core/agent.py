@@ -1033,7 +1033,7 @@ class Agent:
         await self.store.save_task(task)
 
         head = (
-            f"Задача «{task.title}» — проверять каждые "
+            f"Задача «{task.title}» — проверять "
             f"{self._human_interval(task.interval_minutes)}."
         )
         if best:
@@ -1126,7 +1126,7 @@ class Agent:
         mode = "и сразу качать" if task.auto_download else "и сообщать о находках"
         return (
             f"Взял в работу: «{task.title}».\n"
-            f"Буду проверять каждые {self._human_interval(task.interval_minutes)} {mode}.\n"
+            f"Буду проверять {self._human_interval(task.interval_minutes)} {mode}.\n"
             f"{self._filter_text(task)}"
         )
 
@@ -1743,7 +1743,11 @@ class Agent:
             season = None
         next_episode = int(params.get("next_episode") or 0)
         if not next_episode:
-            next_episode = self._next_episode(params, {})
+            # Прогресс берём из базы (удалённые серии тоже учитываются).
+            progress: dict[int, int] = {}
+            if torrent.series_key:
+                progress = await self.store.episodes_by_season(torrent.series_key)
+            next_episode = self._next_episode(params, progress)
 
         picked = None
         if next_episode:
@@ -1873,6 +1877,11 @@ class Agent:
         lines.append(
             "Файлы стираются насовсем, минуя корзину — восстановить их не получится."
         )
+        if record.get("episode"):
+            lines.append(
+                f"Серия {record['episode']} останется в памяти агента: периодическая "
+                "задача продолжит со следующей и не станет качать её заново."
+            )
         message = turn.add("\n".join(lines), kind="error", payload={"download": record})
         message.actions = [
             Action(
@@ -1972,6 +1981,11 @@ class Agent:
         )
 
         text = f"Удалил «{record.get('title')}» из очереди и с диска. {result.summary()}"
+        if record.get("episode"):
+            text += (
+                f"\nСерия {record['episode']} осталась в памяти: следующая проверка "
+                "возьмёт серию дальше, а не эту же."
+            )
         if result.missing and not result.deleted:
             text += "\nФайлов на диске уже не было — убрал только запись и torrent-файл."
         if result.errors:
@@ -2312,16 +2326,28 @@ class Agent:
 
     @staticmethod
     def _human_interval(minutes: int | None) -> str:
+        """Период словами, готовый к подстановке: «проверять раз в час».
+
+        Возвращает оборот целиком («раз в час», «каждые 2 часа», «раз в сутки»),
+        чтобы не появлялось «каждые 1 час» и «каждые 24 часов».
+        """
         if not minutes:
             return "не задано"
+        if minutes % 1440 == 0 and minutes >= 1440:
+            days = minutes // 1440
+            return "раз в сутки" if days == 1 else f"каждые {days} суток" if days % 10 in (2, 3, 4) else f"каждые {days} суток"
         if minutes % 60 == 0 and minutes >= 60:
             hours = minutes // 60
-            word = "час" if hours == 1 else ("часа" if hours in (2, 3, 4) else "часов")
-            return f"{hours} {word}"
-        word = "минуту" if minutes % 10 == 1 and minutes % 100 != 11 else "минут"
+            if hours == 1:
+                return "раз в час"
+            if hours in (2, 3, 4):
+                return f"каждые {hours} часа"
+            return f"каждые {hours} часов"
+        if minutes == 1:
+            return "раз в минуту"
         if minutes % 10 in (2, 3, 4) and minutes % 100 not in (12, 13, 14):
-            word = "минуты"
-        return f"{minutes} {word}"
+            return f"каждые {minutes} минуты"
+        return f"каждые {minutes} минут"
 
     # ------------------------------------------------------------------
     # создание задачи и работа с историей
