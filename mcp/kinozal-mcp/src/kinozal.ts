@@ -251,12 +251,14 @@ export async function downloadTorrent(
       return { success: false, message: "download.php вернул пустой ответ" };
     }
     if (buffer[0] !== 0x64 /* 'd' */) {
-      const sniff = buffer.subarray(0, 200).toString("utf8").replace(/\s+/g, " ");
+      // Вместо .torrent трекер отдаёт страницу с уведомлением: чаще всего
+      // «Вам недоступен торрент-файл — использовано количество в сутки»,
+      // реже — просьбу войти. Вытаскиваем суть, чтобы агент сказал по-русски,
+      // а не показывал человеку кусок HTML.
+      const notice = extractNotice(buffer);
       return {
         success: false,
-        message:
-          "download.php вернул не torrent-файл (похоже, требуется вход на трекер): " +
-          sniff.slice(0, 160),
+        message: notice || "трекер вернул страницу вместо torrent-файла",
       };
     }
     await writeFile(outputPath, buffer);
@@ -271,6 +273,51 @@ export async function downloadTorrent(
       message: `ошибка: ${error instanceof Error ? error.message : String(error)}`,
     };
   }
+}
+
+/**
+ * Достаёт из страницы-заглушки фразу-объяснение, почему вместо .torrent
+ * пришёл HTML: «Вам недоступен торрент-файл…», «Войдите на сайт…» и т.п.
+ */
+function extractNotice(buffer: Buffer): string {
+  let text = "";
+  try {
+    text = new TextDecoder("windows-1251").decode(buffer);
+  } catch {
+    text = buffer.toString("utf8");
+  }
+  text = text
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    // Конец строки/блока — граница предложения: иначе «…скачивания Вы
+    // использовали…» склеивается в одну нечитаемую фразу.
+    .replace(/<br\s*\/?>/gi, ". ")
+    .replace(/<\/(p|div|li|td|tr|h\d)>/gi, ". ")
+    // Заголовок-уведомление у kinozal оформлен <span class=u9>, а следом идёт
+    // <div class=pad5x5> с причиной: граница span→div — конец предложения.
+    .replace(/<\/span>\s*(?=<div)/gi, ". ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/\s+/g, " ")
+    .replace(/(?:\.\s*){2,}/g, ". ")
+    .replace(/\s+\./g, ".")
+    .trim();
+
+  const markers = ["Вам недоступен", "Вы использовали", "Войдите", "Вход", "Недостаточно прав"];
+  for (const marker of markers) {
+    const at = text.indexOf(marker);
+    if (at === -1) continue;
+    // Берём одну-две первые фразы: весь футер страницы человеку не нужен.
+    const tail = text.slice(at, at + 400);
+    let out = "";
+    for (const sentence of tail.split(/(?<=\.)\s+/)) {
+      if (out && out.length + sentence.length > 180) break;
+      out = out ? `${out} ${sentence}` : sentence;
+      if (out.length > 60) break;
+    }
+    return out.trim().slice(0, 300);
+  }
+  return "";
 }
 
 export { BASE_URL, GATE_URL };

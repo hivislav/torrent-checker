@@ -565,6 +565,7 @@ Transmission при штатном удалении перемещает дан�
 .venv/bin/python tests/test_suggest.py       # опечатки и «возможно, вы имели в виду»
 .venv/bin/python tests/test_progress.py      # прогресс загрузки и переход в «готово»
 .venv/bin/python tests/test_web.py           # интерфейс: вход, чат, кнопки, телефон
+.venv/bin/python tests/test_tracker.py       # ошибки трекера и «что нашлось» в вопросе
 .venv/bin/python tests/test_gate.py          # только шлюз Cloudflare (долго)
 ```
 

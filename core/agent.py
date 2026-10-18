@@ -1090,7 +1090,9 @@ class Agent:
             options, options_pool = self._options_under(by_title, params, dimension)
             values = options["qualities"] if dimension == "quality" else options["voices"]
             if len(values) > 1:
-                await self._ask_dimension(task, turn, dimension, values, len(fresh))
+                await self._ask_dimension(
+                    task, turn, dimension, values, len(fresh), found=fresh
+                )
                 return
             if len(values) == 1:
                 # Один вариант — спрашивать не о чем, фиксируем автоматически.
@@ -1250,17 +1252,50 @@ class Agent:
         )
 
     async def _ask_dimension(
-        self, task: Task, turn: Turn, dimension: str, values: list[str], count: int
+        self,
+        task: Task,
+        turn: Turn,
+        dimension: str,
+        values: list[str],
+        count: int,
+        found: list[Torrent] | None = None,
     ) -> None:
         """Спрашивает качество или озвучку — отдельной группой кнопок."""
         title = "Какое качество берём?" if dimension == "quality" else "Какую озвучку берём?"
         shown = ", ".join(
             self._quality_label(v) if dimension == "quality" else v for v in values[:8]
         )
-        text = (
-            f"По запросу «{task.title}» нашлось {count} раздач. {title}\n\n"
-            f"Доступно с учётом остальных условий: {shown}."
-        )
+        lines = [
+            f"По запросу «{task.title}» нашлось "
+            f"{_plural(count, 'раздача', 'раздачи', 'раздач')}. {title}",
+            "",
+        ]
+        # Показываем, ЧТО именно нашлось: при кривом названии трекер всё равно
+        # отдаёт похожие сериалы, и без списка непонятно, откуда взялись 41.
+        found = found or []
+        shows: dict[str, int] = {}
+        for item in found:
+            name = (item.series_title or "").strip() or (item.title or "").strip()
+            if name:
+                shows[name] = shows.get(name, 0) + 1
+        top = sorted(shows.items(), key=lambda pair: -pair[1])[:4]
+        if top:
+            lines.append("Что нашлось:")
+            for name, number in top:
+                lines.append(f"• {name} — {_plural(number, 'раздача', 'раздачи', 'раздач')}")
+            lines.append("")
+        original = str(task.user_query or "").split(" | ")[0]
+        best_found = max(found, key=lambda item: item.seeds, default=None) if found else None
+        weak = best_found is not None and bool(self._missing_tokens(original, best_found.title))
+        if weak:
+            lines.append(
+                "⚠ Точного совпадения по названию нет — это похожие сериалы. "
+                "Если нужен другой — возьмите его кнопкой ниже или нажмите "
+                "«Отмена» и уточните название."
+            )
+            lines.append("")
+        lines.append(f"Доступно с учётом остальных условий: {shown}.")
+        text = "\n".join(lines)
         group = "Качество" if dimension == "quality" else "Озвучка"
         message = turn.add(text, kind="tickets", task_id=task.id, payload={"task": task.to_dict()})
         message.actions = [
@@ -1273,6 +1308,23 @@ class Agent:
             )
             for index, value in enumerate(values[:8])
         ]
+        # Название совпало не точно — под рукой кнопки с похожими сериалами,
+        # чтобы не набирать название заново.
+        if weak:
+            for item in ((task.options or {}).get("suggestions") or [])[:3]:
+                message.actions.append(
+                    Action(
+                        id=f"similar-title-{item['torrent_id']}",
+                        label=f"Это «{item['title']}»"[:60],
+                        kind="choose",
+                        payload={
+                            "task_id": task.id,
+                            "dimension": "title",
+                            "value": item["title"],
+                        },
+                        group="Похожие названия",
+                    )
+                )
         message.actions.append(
             Action(
                 id="cancel-choose",
@@ -1319,11 +1371,14 @@ class Agent:
             "alternatives": [t.to_dict() for t in best_list[1:4]],
         }
 
-        path, error = await self._fetch_torrent(best)
+        path, error, reason = await self._fetch_torrent(best)
         if path is None:
-            await self._report_storage_problem(
-                task, best, {"error": error, "reason": "disk", "path": None}, turn
-            )
+            if reason == "tracker":
+                await self._report_tracker_problem(task, best, error, turn)
+            else:
+                await self._report_storage_problem(
+                    task, best, {"error": error, "reason": "disk", "path": None}, turn
+                )
             return
 
         entries = parse_files(file_list(path))
@@ -1825,8 +1880,15 @@ class Agent:
                     return []
         return []
 
-    async def _fetch_torrent(self, torrent: Torrent, *, refresh: bool = False) -> tuple[Path | None, str]:
-        """Сохраняет .torrent на внешний диск. Возвращает (путь, ошибка).
+    async def _fetch_torrent(
+        self, torrent: Torrent, *, refresh: bool = False
+    ) -> tuple[Path | None, str, str]:
+        """Сохраняет .torrent на внешний диск. Возвращает (путь, ошибка, причина).
+
+        Причина пустая при успехе, «disk» — если недоступен внешний диск,
+        «tracker» — если файл не выдал сам трекер (лимит скачиваний, слетевшая
+        сессия). Раньше ошибка трекера вылетала исключением и превращалась
+        в 500 без внятного текста.
 
         `refresh=True` — перекачать даже если файл уже есть. Это обязательно для
         периодических задач: на трекере одна и та же раздача обновляется новыми
@@ -1841,16 +1903,58 @@ class Agent:
                 {"ошибка": str(exc), "папка": str(self.settings.torrents_dir)},
                 level="error",
             )
-            return None, f"папка для torrent-файлов недоступна: {exc}"
+            return None, f"папка для torrent-файлов недоступна: {exc}", "disk"
 
         path = self.settings.torrents_dir / f"{torrent.id}.torrent"
         if not refresh and path.exists() and path.stat().st_size > 0:
-            return path, ""  # уже скачан — второй раз не тянем
+            return path, "", ""  # уже скачан — второй раз не тянем
 
-        result = await self.mcp.download(torrent.id, path)
+        try:
+            result = await self.mcp.download(torrent.id, path)
+        except MCPError as exc:
+            return None, str(exc), "tracker"
         if not result.get("success"):
-            return None, str(result.get("message") or "не удалось скачать torrent-файл")
-        return path, ""
+            message = str(result.get("message") or "не удалось скачать torrent-файл")
+            return None, message, "tracker"
+        return path, "", ""
+
+    async def _report_tracker_problem(
+        self, task: Task, torrent: Torrent, error: str, turn: Turn
+    ) -> None:
+        """Трекер не отдал .torrent: объясняем причину и даём кнопку «Повторить»."""
+        task.state = "failed"
+        task.last_error = error
+        await self.store.save_task(task)
+        text = (
+            "Трекер не выдал torrent-файл, поэтому скачать пока нечего.\n\n"
+            f"• {torrent.title}\n{error}"
+        )
+        lowered = error.lower()
+        if "лимит" in lowered or "количество торрент-файлов" in lowered or "использовали" in lowered:
+            text += (
+                "\n\nЭто ограничение kinozal.me: на аккаунте кончился дневной лимит "
+                "торрент-файлов. Счётчик обнуляется в «Управление голосами» на "
+                "трекере (за голоса) или сам на следующий день."
+            )
+        if "вход" in lowered or "войдите" in lowered:
+            text += "\n\nПохоже, сессия на трекере слетела — стоит заново войти на kinozal.me."
+        message = turn.add(text, kind="error", task_id=task.id, payload={"task": task.to_dict()})
+        message.actions = [
+            Action(
+                id="retry-fetch",
+                label="Повторить",
+                kind="confirm_download",
+                payload={"task_id": task.id, "torrent_id": torrent.id},
+                style="primary",
+            ),
+            Action(
+                id="cancel-fetch",
+                label="Отмена",
+                kind="cancel",
+                payload={"task_id": task.id},
+                style="danger",
+            ),
+        ]
 
     async def _download_with_report(
         self, task: Task, torrent: Torrent, turn: Turn, periodic_context: bool = False
@@ -1869,8 +1973,11 @@ class Agent:
             {"id": torrent.id, "качество": torrent.quality, "озвучка": torrent.voice},
         )
 
-        path, error = await self._fetch_torrent(torrent)
+        path, error, reason = await self._fetch_torrent(torrent)
         if path is None:
+            if reason == "tracker":
+                await self._report_tracker_problem(task, torrent, error, turn)
+                return
             task.state = "failed"
             task.last_error = error
             await self.store.save_task(task)
@@ -2280,7 +2387,9 @@ class Agent:
             )
             return
         if not result["ok"]:
-            if result.get("retryable"):
+            if result.get("reason") == "tracker":
+                await self._report_tracker_problem(task, torrent, str(result["error"]), turn)
+            elif result.get("retryable"):
                 await self._report_storage_problem(task, torrent, result, turn)
             else:
                 turn.add(
@@ -2461,12 +2570,18 @@ class Agent:
         пачка на 14 выпусков, где сейчас 1–2, а нужна третья, то при появлении
         «1–3» скачается только третий файл.
         """
-        path, error = await self._fetch_torrent(torrent, refresh=True)
+        path, error, reason = await self._fetch_torrent(torrent, refresh=True)
         if path is None:
             task.last_error = error
             task.state = "failed"
             await self.store.save_task(task)
-            return {"ok": False, "error": error, "retryable": True, "reason": "disk", "path": None}
+            return {
+                "ok": False,
+                "error": error,
+                "retryable": reason != "tracker",
+                "reason": reason or "disk",
+                "path": None,
+            }
 
         entries = parse_files(file_list(path))
         plan = self._plan_files(task, entries)

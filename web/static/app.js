@@ -30,13 +30,16 @@
       throw new Error("нужен вход");
     }
     if (!response.ok) {
+      // Тело читаем ОДИН раз: response.json() забирает поток, и повторный
+      // response.text() падал с «body stream already read» вместо текста ошибки.
       let detail = "";
+      const raw = await response.text();
       try {
-        detail = (await response.json()).detail || "";
+        detail = JSON.parse(raw).detail || "";
       } catch (_) {
-        detail = await response.text();
+        detail = raw;
       }
-      throw new Error(detail || `HTTP ${response.status}`);
+      throw new Error(String(detail || `HTTP ${response.status}`).slice(0, 400));
     }
     return response.json();
   }

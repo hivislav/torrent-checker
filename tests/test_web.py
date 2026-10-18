@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import re
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -40,6 +41,11 @@ def run() -> int:
     settings = get_settings()
     password = settings.site_password
     SHOTS.mkdir(parents=True, exist_ok=True)
+
+    conn = sqlite3.connect(str(settings.db_path))
+    start_msg = conn.execute("SELECT IFNULL(MAX(id), 0) FROM messages").fetchone()[0]
+    start_tasks = {row[0] for row in conn.execute("SELECT id FROM tasks")}
+    conn.close()
 
     with sync_playwright() as p:
         browser = p.chromium.launch(channel="chrome", headless=True, args=["--no-sandbox"])
@@ -124,7 +130,6 @@ def run() -> int:
         # Раньше строка «диск» в «Служебном» показывала старые цифры до
         # перезагрузки страницы: статус обновлялся раз в минуту. Проверяем,
         # что после удаления карточки статус перезапрашивается сразу.
-        import sqlite3
         import shutil
 
         test_id = "ui-test-delete"
@@ -290,6 +295,23 @@ def run() -> int:
         check("консоль без ошибок", not noisy, noisy[:3])
 
         browser.close()
+
+    # Тест ходит в трекер по-настоящему: его переписку в истории чата
+    # не оставляем, иначе человек увидит чужие запросы.
+    conn = sqlite3.connect(str(settings.db_path))
+    conn.execute(
+        "DELETE FROM messages WHERE id > ? AND (text LIKE ? OR text LIKE ?)",
+        (start_msg, "%Тед Лассо%", "%ui-test-delete%"),
+    )
+    # Задачи, заведённые тестом, не должны висеть в картотеке у человека.
+    placeholders = ",".join("?" for _ in start_tasks) or "''"
+    conn.execute(
+        f"UPDATE tasks SET state = 'cancelled' "
+        f"WHERE id NOT IN ({placeholders})",
+        tuple(start_tasks),
+    )
+    conn.commit()
+    conn.close()
 
     print("\n=== ИТОГ ===")
     print("скриншоты:", SHOTS)

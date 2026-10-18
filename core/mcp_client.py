@@ -31,6 +31,27 @@ class MCPError(RuntimeError):
     pass
 
 
+def _error_text(text: str) -> str:
+    """Достаёт из ответа инструмента человекочитаемое сообщение.
+
+    MCP-сервер отдаёт ошибку как JSON (`{"success": false, "message": …}`),
+    и без разбора в интерфейс попадала бы вся структура вместо фразы.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return raw
+    if isinstance(data, dict):
+        for key in ("message", "error", "detail"):
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return raw
+
+
 class KinozalMCP:
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
@@ -117,7 +138,7 @@ class KinozalMCP:
                 duration_ms=(time.perf_counter() - started) * 1000,
                 level="error",
             )
-            raise MCPError(text or f"инструмент {tool} вернул ошибку")
+            raise MCPError(_error_text(text) or f"инструмент {tool} вернул ошибку")
         journal.add(
             "mcp",
             f"← трекер: {tool}",
