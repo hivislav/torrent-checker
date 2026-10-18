@@ -99,6 +99,14 @@ def test_filtering() -> None:
     ranked = rank(found_1080, {"title": "Тед Лассо", "quality": "1080p"})
     check("ранжирование по сидам", ranked[0].id == "10", ranked[0].id)
 
+    # Сериал vs фильм: у сериала в названии есть сезон/серия.
+    series_only = filter_candidates(pool, {"title": "", "type": "series"})
+    check("type=series оставляет сериалы", {t.id for t in series_only} == {"10", "11", "12"},
+          [t.id for t in series_only])
+    movie_only = filter_candidates(pool, {"title": "", "type": "movie"})
+    check("type=movie оставляет фильмы", [t.id for t in movie_only] == ["13"],
+          [t.id for t in movie_only])
+
 
 def test_new_episodes() -> None:
     print("\n== что считать новой серией ==")

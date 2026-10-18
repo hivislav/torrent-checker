@@ -66,7 +66,13 @@ from core.episodes import (
     pick_new_episodes,
 )
 from core.parsing import normalize, parse_torrent
-from core.suggest import query_variants, similar_titles, similarity
+from core.suggest import (
+    MIN_SCORE,
+    query_variants,
+    similar_titles,
+    similarity,
+    translit,
+)
 from core.storage import Store
 from core.storage_target import StorageUnavailable as TargetUnavailable
 from core.storage_target import ensure_target as ensure_dir
@@ -104,10 +110,16 @@ PARSE_SYSTEM = """Ты — разборщик запросов торрент-а
   "intent": "find" | "monitor" | "question"
 }
 
-Дополнительно поле:
+Дополнительно поля:
   "refine": true|false — true, если сообщение является уточнением к предыдущему
             запросу в этом же диалоге («нет, я про 4 сезон», «а если 4К?»,
             «второй вариант», «не то, нужен другой фильм»), а не новой задачей.
+  "aliases": массив строк — ДРУГИЕ общеизвестные названия того же фильма/сериала
+            (русское ↔ оригинальное, официальный перевод): для «Лост» — 
+            ["Остаться в живых", "Lost"]. До 3 штук, только если уверен.
+            Не выдумывай: нет уверенности — пустой массив.
+  "type": "series" | "movie" | null — сериал или фильм, если это названо
+            («сериал», «фильм», «серия», «сезоны») или очевидно из названия.
 
 Правила:
 - Тебе дана история переписки. Текущее сообщение может быть уточнением:
@@ -407,7 +419,8 @@ class Agent:
                 return False
         parsed_params = [
             key
-            for key in ("original_title", "quality", "voice", "season", "episode_from", "year")
+            for key in ("original_title", "quality", "voice", "season", "episode_from",
+                        "year", "type")
             if parsed.get(key) not in (None, "", "null")
         ]
         if parsed_params:
@@ -433,9 +446,10 @@ class Agent:
         before = dict(task.params or {})
         merged = dict(before)
         changed: dict[str, Any] = {}
-        for key in ("title", "original_title", "quality", "voice", "season", "episode_from", "year"):
+        for key in ("title", "original_title", "quality", "voice", "season",
+                    "episode_from", "year", "type", "aliases"):
             value = parsed.get(key)
-            if value in (None, "", "null"):
+            if value in (None, "", "null", []):
                 continue
             if merged.get(key) != value:
                 merged[key] = value
@@ -444,8 +458,9 @@ class Agent:
         parsed_fields = {
             key: value
             for key, value in (parsed or {}).items()
-            if key in ("title", "original_title", "quality", "voice", "season", "episode_from", "year")
-            and value not in (None, "", "null")
+            if key in ("title", "original_title", "quality", "voice", "season",
+                       "episode_from", "year", "type", "aliases")
+            and value not in (None, "", "null", [])
         }
         if not changed and parsed_fields:
             # В сообщении были параметры, просто уже такие же — показываем
@@ -962,6 +977,24 @@ class Agent:
         for key in ("title", "original_title", "quality", "voice"):
             value = data.get(key)
             cleaned[key] = str(value).strip() if value not in (None, "", "null") else None
+        aliases = data.get("aliases")
+        cleaned["aliases"] = [
+            str(item).strip()
+            for item in (aliases if isinstance(aliases, list) else [])
+            if str(item).strip()
+        ][:3]
+        kind_hint = str(data.get("type") or "").strip().lower()
+        # Если модель не указала тип, но человек написал «сериал»/«фильм» —
+        # понимаем это сами: на трекере это разные категории.
+        lowered = str(text or "").lower()
+        if kind_hint not in ("series", "movie"):
+            if re.search(r"\bсериал", lowered):
+                kind_hint = "series"
+            elif re.search(r"\bфильм|\bкино", lowered):
+                kind_hint = "movie"
+            else:
+                kind_hint = ""
+        cleaned["type"] = kind_hint or None
         for key in ("season", "episode_from", "year", "interval_minutes"):
             value = data.get(key)
             try:
@@ -1072,43 +1105,127 @@ class Agent:
         torrents = await self._search(params)
         by_title = filter_candidates(torrents, {"title": title}) if title else []
         if by_title:
-            # Нашлось — но всё ли из запроса учтено? Если в исходном тексте есть
-            # слово, которого нет в найденном названии, ищем варианты всё равно.
+            # Нашлось — но то ли? Если в исходном тексте есть слово, которого
+            # нет в найденном названии, или само название мало похоже на
+            # найденное («Лост» → «Джимми Киммел… Алоха, Лост!»), ищем variants.
             best_found = rank(by_title, params)[0]
             missing = self._missing_tokens(source, best_found.title)
-            if not missing:
+            score = similarity(source, best_found.series_title or best_found.title)
+            if not missing and score >= MIN_SCORE:
                 return torrents, []
             journal.add(
                 "agent",
-                "в запросе есть слова, которых нет в найденном названии",
-                {"запрос": source, "название": best_found.title, "лишние": missing},
+                "найденное не похоже на запрос",
+                {"запрос": source, "название": best_found.title,
+                 "лишние слова": missing, "похожесть": round(score, 2)},
             )
 
         seen = {torrent.id for torrent in torrents}
         extra: list[Torrent] = []
+        alias_hits: dict[str, dict[str, Any]] = {}
+        queries: list[str] = []
+
+        def add_query(value: str) -> None:
+            query = str(value or "").strip()
+            if query and query.lower() not in {item.lower() for item in queries}:
+                queries.append(query)
+
+        # 1) Другие названия того же фильма/сериала — их подсказала модель:
+        #    «Лост» → «Остаться в живых», «Lost». Именно они находят сериал.
+        aliases = [str(item) for item in (params.get("aliases") or []) if str(item).strip()]
+        for alias in aliases:
+            add_query(alias)
+        # Для подсказок берём только первое (самое точное) название: поиск по
+        # короткому «Lost» тянет «Lost You Forever» и прочие чужие сериалы.
+        primary_alias = aliases[0] if aliases else ""
+        latin = translit(title or source)
+        add_query(latin)
+        # 2) Укороченные варианты запроса — на случай лишних слов.
         for variant in query_variants(source):
+            add_query(variant)
+
+        wanted_type = str(params.get("type") or "").lower()
+        for query in queries:
             try:
-                rows = await self.mcp.search_pages(variant, pages=1)
+                rows = await self.mcp.search_pages(query, pages=1)
             except MCPError as exc:
-                log.warning("поиск варианта «%s» не удался: %s", variant, exc)
+                log.warning("поиск варианта «%s» не удался: %s", query, exc)
                 continue
+            # Подсказки — только по точному альтернативному названию: латинская
+            # транслитерация ищет по слову и тащит чужие «Lost You Forever».
+            trusted = bool(primary_alias) and query == primary_alias
             for raw in rows:
                 torrent = parse_torrent(raw)
-                if torrent.id and torrent.id not in seen:
+                if not torrent.id:
+                    continue
+                if torrent.id not in seen:
                     seen.add(torrent.id)
                     extra.append(torrent)
-            if extra:
-                # Дальше уточнять нет смысла: подсказки уже есть.
-                continue
+                if not trusted:
+                    continue
+                # Оставляем только то, где слова другого названия реально есть:
+                # поиск по «Остаться в живых» иначе тащит случайные сериалы.
+                alias_tokens = [
+                    token for token in normalize(query).split() if len(token) > 2
+                ]
+                haystack = normalize(torrent.title)
+                if alias_tokens and not all(token in haystack for token in alias_tokens):
+                    continue
+                is_series = bool(torrent.seasons or torrent.episodes)
+                if wanted_type == "series" and not is_series:
+                    continue
+                if wanted_type == "movie" and is_series:
+                    continue
+                name = (torrent.series_title or torrent.title or "").strip()
+                key = normalize(name)
+                if not key:
+                    continue
+                hit = alias_hits.setdefault(
+                    key,
+                    {"title": name, "torrent_id": torrent.id, "count": 0, "score": 0.9},
+                )
+                hit["count"] += 1
 
-        suggestions = similar_titles(source or title, extra or torrents)
+        type_map = {
+            torrent.id: bool(torrent.seasons or torrent.episodes) for torrent in torrents + extra
+        }
+        kinds: list[dict[str, Any]] = []
+        for item in similar_titles(source or title, extra or torrents):
+            if wanted_type:
+                is_series = type_map.get(str(item.get("torrent_id") or ""))
+                if is_series is None:
+                    continue
+                if (wanted_type == "series") != is_series:
+                    continue
+            kinds.append({**item, "alias": False})
+        # Альтернативные названия важнее «похожих по буквам»: это тот же фильм.
+        for key, hit in alias_hits.items():
+            kinds.append({**hit, "alias": True, "torrent_title": hit["title"]})
+        deduped: dict[str, dict[str, Any]] = {}
+        for item in kinds:
+            key = normalize(item["title"])
+            if not key:
+                continue
+            previous = deduped.get(key)
+            if previous is None or (item.get("alias") and not previous.get("alias")):
+                deduped[key] = item
+        suggestions = sorted(
+            deduped.values(),
+            key=lambda item: (
+                1 if item.get("alias") else 0,
+                item.get("count") or 0,
+                item.get("score") or 0,
+            ),
+            reverse=True,
+        )[:10]
         journal.add(
             "agent",
             "подбор похожих названий",
             {
                 "запрос": source,
                 "название от модели": title,
-                "варианты": query_variants(source),
+                "другие названия": aliases,
+                "искали ещё": queries,
                 "найдено раздач": len(extra),
                 "подсказки": [item["title"] for item in suggestions],
             },
@@ -1255,7 +1372,16 @@ class Agent:
         # два списка, которые спорят друг с другом.
         ranked = rank(fresh, params)
         suggestions = (task.options or {}).get("suggestions") or []
-        if suggestions and ranked and self._missing_tokens(task.title, ranked[0].title):
+        weak = False
+        if ranked:
+            best_found = ranked[0]
+            weak = bool(self._missing_tokens(task.title, best_found.title))
+            if not weak:
+                score = similarity(task.title, best_found.series_title or best_found.title)
+                # Похожесть ниже порога — это другой фильм («Лост» → «Джимми
+                # Киммел… Алоха, Лост!»). Показываем подсказки, а не карточку.
+                weak = score < MIN_SCORE
+        if weak and suggestions:
             await self._ask_title(task, suggestions[:10], len(fresh), turn, weak=True)
             return
 
@@ -3797,8 +3923,9 @@ class Agent:
         clean = {
             key: value
             for key, value in params.items()
-            if key in ("title", "original_title", "quality", "voice", "season", "episode_from", "year")
-            and value not in (None, "", "null")
+            if key in ("title", "original_title", "quality", "voice", "season",
+                       "episode_from", "year", "type", "aliases")
+            and value not in (None, "", "null", [])
         }
         clean.setdefault("seen_ids", [])
         task = Task(

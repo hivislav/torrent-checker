@@ -363,6 +363,78 @@ async def test_many_series() -> None:
     agent.store.close()
 
 
+class SearchMCP:
+    """Заглушка поиска: отдаёт разные выдачи на разные запросы."""
+
+    def __init__(self, table: dict[str, list[dict]]) -> None:
+        self.table = table
+        self.queries: list[str] = []
+
+    async def search_pages(self, query: str, pages: int = 1) -> list[dict]:
+        self.queries.append(query)
+        return self.table.get(query, [])
+
+
+def row(tid: str, title: str, *, seeds: int = 5) -> dict:
+    return {
+        "id": tid,
+        "title": title,
+        "size": "5 ГБ",
+        "seeds": seeds,
+        "peers": 1,
+        "comments": 0,
+        "upload_date": "10.10.2026 в 10:00",
+        "uploader": "test",
+        "category": "1",
+    }
+
+
+async def test_lost_aliases() -> None:
+    print("\n== «Лост» находит «Остаться в живых» через другое название ==")
+    from core.suggest import translit
+
+    check("транслитерация работает", translit("Лост") == "Lost", translit("Лост"))
+
+    tmp = Path(tempfile.mkdtemp(prefix="lost-"))
+    settings = dataclasses.replace(
+        get_settings(),
+        data_dir=tmp,
+        db_path=tmp / "lost.sqlite3",
+        torrents_dir=tmp / "torrent-files",
+        transmission_download_dir=tmp / "torrents",
+    )
+    agent = Agent(settings)
+    jimmy = "Джимми Киммел в прямом эфире (8 сезон: 144 эпизод) Алоха, Лост! / Jimmy Kimmel Live: Aloha to Lost / 2010 / ЛО / СТ / HDTV (720p)"
+    lost = "Остаться в живых (1-6 сезоны: 1-122 серии из 122) / Lost / 2004-2010 / ДБ, СТ / WEB-DL (1080p)"
+    agent.mcp = SearchMCP({  # type: ignore[assignment]
+        "Лост": [row("1510207", jimmy), row("1509957", jimmy)],
+        "Остаться в живых": [
+            row("1876358", lost, seeds=30),
+            row("1995179", "Остаться в живых (6 сезон: 1-18 серии из 18) / Lost / 2010 / WEB-DL (1080p)", seeds=5),
+        ],
+    })
+    params = {"title": "Лост", "aliases": ["Остаться в живых", "Lost"], "type": "series"}
+    torrents, suggestions = await agent._search_with_suggestions(params, original="Лост")
+    titles = [item["title"] for item in suggestions]
+    check("альтернативное название в подсказках", "Остаться в живых" in titles, titles[:5])
+    check("оно первое — это тот же фильм", bool(titles) and titles[0] == "Остаться в живых", titles[:3])
+    check("чужие «Lost …» отфильтрованы серiалом",
+          all("Lost" not in title or "Остаться" in title for title in titles), titles[:5])
+    check("поиск шёл по другому названию", "Остаться в живых" in agent.mcp.queries)  # type: ignore[attr-defined]
+
+    task = Task(
+        id="lost-task", kind="oneshot", state="searching", session_id="checks",
+        user_query="Лост", params={"title": "Лост", "aliases": ["Остаться в живых"], "type": "series"},
+    )
+    task.options = {"pool": [t.to_dict() for t in torrents], "suggestions": suggestions}
+    await agent.store.save_task(task)
+    turn = Turn()
+    await agent._selection_step(task, turn)
+    text = turn.messages[-1].text
+    check("вместо карточки спрашиваем сериал", "Какой сериал вы имели в виду?" in text, text[:200])
+    agent.store.close()
+
+
 async def test_alternatives_and_pack() -> None:
     print("\n== варианты подписаны, сезон предлагается кнопкой ==")
     tmp = Path(tempfile.mkdtemp(prefix="pack-"))
@@ -423,6 +495,7 @@ async def main() -> int:
     await test_ask_dimension()
     await test_title_first()
     await test_many_series()
+    await test_lost_aliases()
     await test_card_without_torrent()
     await test_alternatives_and_pack()
     print("\n=== ИТОГ ===")

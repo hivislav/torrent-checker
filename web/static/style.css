@@ -151,6 +151,10 @@ body {
   position: relative;
   z-index: 10;
   padding: 0 var(--rail);
+  /* Запуск с домашнего экрана (standalone, status bar black-translucent)
+     начинается под статус-баром — без этого отступа шапка уезжала под вырез.
+     В обычной вкладке Safari env() = 0, поэтому ничего не меняется. */
+  padding-top: env(safe-area-inset-top, 0px);
 }
 
 /* ---------- Панель задач ---------- */
@@ -1086,6 +1090,11 @@ body {
   }
   .panel-scrim.is-visible { display: block; }
 
+  .app {
+    padding-left: max(12px, env(safe-area-inset-left));
+    padding-right: max(12px, env(safe-area-inset-right));
+  }
+  .panel { padding-top: env(safe-area-inset-top, 0px); }
   .marquee__menu { display: grid; place-items: center; }
   .marquee { padding: 10px 12px; gap: 10px; }
   .marquee__title { font-size: 17px; letter-spacing: .16em; }

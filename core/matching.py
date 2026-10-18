@@ -74,6 +74,7 @@ def filter_candidates(
     quality = str(params.get("quality") or "").strip()
     voice = str(params.get("voice") or "").strip()
     season = params.get("season")
+    wanted_type = str(params.get("type") or "").strip().lower()
     skip_ids = skip_ids or set()
 
     result: list[Torrent] = []
@@ -81,6 +82,12 @@ def filter_candidates(
         if skip_ids and torrent.id in skip_ids:
             continue
         if not title_match(str(params.get("title") or ""), torrent):
+            continue
+        # Сериал vs фильм: у сериала в названии есть сезон или серия.
+        is_series = bool(torrent.seasons or torrent.episodes)
+        if wanted_type == "series" and not is_series:
+            continue
+        if wanted_type == "movie" and is_series:
             continue
         if quality and not quality_match(quality, torrent.qualities):
             continue

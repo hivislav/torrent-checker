@@ -31,6 +31,33 @@ MAX_SUGGESTIONS = 5
 MIN_SCORE = 0.55
 
 
+# Транслитерация: «Лост» → «Lost». На трекере часть раздач подписана только
+# английским названием, и русский запрос сам по себе их не находит.
+_TRANSLIT = {
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e",
+    "ж": "zh", "з": "z", "и": "i", "й": "y", "к": "k", "л": "l", "м": "m",
+    "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
+    "ф": "f", "х": "kh", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "sch",
+    "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya",
+}
+
+
+def translit(query: str) -> str:
+    """Русское название латиницей: «Лост» → «Lost», «Остаться в живых» → …"""
+    words = []
+    for word in str(query or "").split():
+        if not re.search("[а-яё]", word, flags=re.IGNORECASE):
+            words.append(word)
+            continue
+        transliterated = "".join(_TRANSLIT.get(char, char) for char in word.lower())
+        words.append(transliterated.capitalize())
+    result = " ".join(words).strip()
+    # normalize() сам транслитерирует кириллицу, поэтому сравниваем исходный текст.
+    if not result or result.lower() == str(query or "").strip().lower():
+        return ""
+    return result
+
+
 def query_variants(query: str, limit: int = MAX_VARIANTS) -> list[str]:
     """Более короткие варианты запроса: их и ищем, если исходный дал ноль."""
     words = [word for word in str(query).split() if word]
