@@ -262,6 +262,7 @@ DeepSeek `deepseek-flash` (DeepSeek-V4.1-Flash), ключ в `.env`.
 | `KINOZAL_USERNAME`, `KINOZAL_PASSWORD` | учётка трекера |
 | `TRANSMISSION_HOST/PORT/USERNAME/PASSWORD` | RPC Transmission |
 | `TRANSMISSION_DOWNLOAD_DIR` | внешний диск для загрузок (`/Volumes/<диск>/torrents`) |
+| `TORRENTS_DIR` | папка для `.torrent`-файлов на том же внешнем диске |
 | `TRANSMISSION_MIN_FREE_GB` | сколько места обязано остаться после скачивания |
 | `GATE_PORT`, `GATE_HEADLESS`, `GATE_PROFILE_DIR` | шлюз Cloudflare |
 | `DEFAULT_INTERVAL_MINUTES`, `MIN_INTERVAL_MINUTES` | период проверки по умолчанию и минимум |

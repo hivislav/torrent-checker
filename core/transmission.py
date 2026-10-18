@@ -27,6 +27,12 @@ from typing import Any
 
 from core.config import Settings, get_settings
 from core.debuglog import journal
+from core.storage_target import (  # общие правила для внешнего тома
+    StorageUnavailable,
+    TargetInfo,
+    can_write as _can_write,
+    volume_root,
+)
 from core.torrent_meta import human_bytes, total_length
 
 log = logging.getLogger("transmission")
@@ -36,8 +42,7 @@ class TransmissionError(RuntimeError):
     pass
 
 
-class StorageUnavailable(TransmissionError):
-    """Внешний диск не подключён (или каталог недоступен для записи)."""
+# StorageUnavailable приходит из core.storage_target: одно правило для всех папок.
 
 
 class NotEnoughSpace(TransmissionError):
@@ -66,35 +71,7 @@ class NotEnoughSpace(TransmissionError):
         )
 
 
-@dataclass
-class StorageInfo:
-    """Состояние диска, куда кладём загрузки."""
-
-    path: Path
-    mounted: bool
-    writable: bool
-    free: int = 0
-    total: int = 0
-    error: str = ""
-
-    @property
-    def ok(self) -> bool:
-        return self.mounted and self.writable
-
-    def to_dict(self) -> dict[str, Any]:
-        volume = self.path.parent.name if self.path.parent.name else str(self.path.parent)
-        return {
-            "path": str(self.path),
-            "volume": volume,
-            "ok": self.ok,
-            "mounted": self.mounted,
-            "writable": self.writable,
-            "free": self.free,
-            "free_human": human_bytes(self.free),
-            "total": self.total,
-            "total_human": human_bytes(self.total),
-            "error": self.error,
-        }
+StorageInfo = TargetInfo  # прежнее имя, чтобы не ломать вызывающий код
 
 
 class Transmission:
@@ -156,73 +133,26 @@ class Transmission:
         return int(self.settings.transmission_min_free_gb * 1024**3)
 
     def _volume_root(self) -> Path:
-        """Точка монтирования тома: /Volumes/EAGET для /Volumes/EAGET/torrents.
-
-        Отдельная ветка для /Volumes обязательна: без неё поиск «первой точки
-        монтирования вверх по дереву» уходил до корня «/» (он тоже mount point),
-        и агент считал смонтированным несуществующий диск.
-        """
-        import os
-
-        parts = self.download_dir.parts
-        if len(parts) >= 3 and parts[1] == "Volumes":
-            return Path("/Volumes") / parts[2]
-        for candidate in (self.download_dir, *self.download_dir.parents):
-            try:
-                if os.path.ismount(str(candidate)):
-                    return candidate
-            except OSError:
-                continue
-        return self.download_dir.parent
+        """Точка монтирования тома для каталога загрузок."""
+        return volume_root(self.download_dir)
 
     def storage_info(self) -> StorageInfo:
-        """Живое состояние целевого диска. Ничего не создаёт и не падает."""
-        path = self.download_dir
-        volume = self._volume_root()
+        """Живое состояние целевого диска (общие правила — core.storage_target)."""
+        from core.storage_target import target_info
 
-        # Диск должен быть именно смонтирован: проверка «каталог существует»
-        # недостаточна — пустая папка /Volumes/EAGET может остаться от прошлого
-        # раза, и загрузка молча легла бы на системный раздел.
-        import os
-
-        mounted = volume.exists() and os.path.ismount(str(volume))
-        if not mounted:
-            return StorageInfo(
-                path=path,
-                mounted=False,
-                writable=False,
-                error=f"внешний диск «{volume.name}» не подключён ({volume} отсутствует)",
-            )
-        try:
-            usage = shutil.disk_usage(str(volume))
-        except OSError as exc:
-            return StorageInfo(
-                path=path,
-                mounted=True,
-                writable=False,
-                error=f"не удалось прочитать размер свободного места: {exc}",
-            )
-
-        writable = path.exists() and _can_write(path)
-        if not path.exists():
-            writable = _can_write(volume)
-        return StorageInfo(
-            path=path,
-            mounted=True,
-            writable=writable,
-            free=usage.free,
-            total=usage.total,
-            error="" if writable else f"каталог {path} недоступен для записи",
-        )
+        return target_info(self.download_dir)
 
     def ensure_target(self) -> StorageInfo:
-        """Проверяет диск и создаёт каталог загрузок. Бросает StorageUnavailable."""
+        """Проверяет диск и создаёт каталог загрузок.
+
+        Решение «есть ли диск» принимается по `self.storage_info()`: этот метод
+        остаётся единственной точкой правды, через которую можно подменить
+        состояние диска в тестах.
+        """
         info = self.storage_info()
         if not info.mounted:
             raise StorageUnavailable(info.error or "внешний диск не подключён")
         if not info.writable:
-            # Пробуем создать каталог — на подключённом диске он обычно просто
-            # ещё не создан (первый запуск).
             try:
                 self.download_dir.mkdir(parents=True, exist_ok=True)
             except OSError as exc:
@@ -390,22 +320,3 @@ class Transmission:
             return await asyncio.to_thread(run)
         except Exception as exc:  # noqa: BLE001
             raise TransmissionError(self._explain(exc)) from exc
-
-
-def _can_write(path: Path) -> bool:
-    """Проверка записи настоящей пробой.
-
-    `os.access` на внешних томах (exFAT, сетевые диски) врёт: права есть, а
-    запись падает. Поэтому пробуем создать и сразу удалить пустой файл — это и
-    есть ответ на вопрос «можно ли сюда качать».
-    """
-    probe = Path(path) / ".agent-write-probe"
-    try:
-        probe.write_bytes(b"")
-    except OSError:
-        return False
-    try:
-        probe.unlink()
-    except OSError:
-        pass
-    return True

@@ -55,6 +55,8 @@ from core.notify import DesktopNotifier, EventBus
 from core.push import WebPush
 from core.parsing import parse_torrent
 from core.storage import Store
+from core.storage_target import StorageUnavailable as TargetUnavailable
+from core.storage_target import ensure_target as ensure_dir
 from core.transmission import (
     NotEnoughSpace,
     StorageUnavailable,
@@ -344,7 +346,10 @@ class Agent:
             gate = {"ok": False, "error": str(exc)[:200]}
 
         transmission = await self.transmission.test_connection()
+        from core.storage_target import target_info
+
         storage = self.transmission.storage_info().to_dict()
+        torrents = target_info(self.settings.torrents_dir).to_dict()
         return {
             "model": {
                 "name": self.settings.llm_model,
@@ -355,6 +360,7 @@ class Agent:
             "gate": gate,
             "transmission": transmission,
             "storage": storage,
+            "torrents": torrents,
             "tasks": {
                 "active": len(await self.store.list_tasks(limit=500, states=["monitoring"])),
             },
@@ -915,20 +921,36 @@ class Agent:
                 f"\n\nДиск «{storage.to_dict()['volume']}»: свободно "
                 f"{storage.to_dict()['free_human']} из {storage.to_dict()['total_human']}."
             )
-        text += (
-            f"\n\nФайл раздачи уже сохранён ({result.get('path')}), "
-            "освободите место и нажмите «Поставить в очередь»."
-        )
+        if result.get("path"):
+            text += (
+                f"\n\nФайл раздачи уже сохранён ({result.get('path')}), "
+                "освободите место и нажмите «Поставить в очередь»."
+            )
+        else:
+            text += (
+                "\n\nTorrent-файл сохранить не удалось — подключите диск и "
+                "повторите попытку, искать раздачу заново не нужно."
+            )
 
         message = turn.add(text, kind="error", task_id=task.id, payload={"task": task.to_dict()})
-        message.actions = [
-            Action(
+        if result.get("path"):
+            primary = Action(
                 id="retry-transmission",
                 label="Поставить в очередь",
                 kind="retry_transmission",
                 payload={"task_id": task.id, "torrent_id": torrent.id},
                 style="primary",
-            ),
+            )
+        else:
+            primary = Action(
+                id="retry-download",
+                label="Повторить скачивание",
+                kind="confirm_download",
+                payload={"task_id": task.id, "torrent_id": torrent.id},
+                style="primary",
+            )
+        message.actions = [
+            primary,
             Action(
                 id="cancel-after-space",
                 label="Отмена",
@@ -952,6 +974,28 @@ class Agent:
 
     async def _download(self, task: Task, torrent: Torrent) -> dict[str, Any]:
         """Качает .torrent через MCP, ставит в Transmission и запоминает факт."""
+        # .torrent-файлы живут на внешнем диске вместе с загрузками, поэтому
+        # сначала проверяем, что он на месте: иначе MCP вернёт невнятный ENOENT.
+        try:
+            ensure_dir(self.settings.torrents_dir)
+        except TargetUnavailable as exc:
+            task.last_error = str(exc)
+            task.state = "failed"
+            await self.store.save_task(task)
+            journal.add(
+                "agent",
+                "не могу сохранить .torrent: диск недоступен",
+                {"ошибка": str(exc), "папка": str(self.settings.torrents_dir)},
+                level="error",
+            )
+            return {
+                "ok": False,
+                "error": f"папка для torrent-файлов недоступна: {exc}",
+                "retryable": True,
+                "reason": "disk",
+                "path": None,
+            }
+
         path = self.settings.torrents_dir / f"{torrent.id}.torrent"
         result = await self.mcp.download(torrent.id, path)
         if not result.get("success"):

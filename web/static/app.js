@@ -375,6 +375,15 @@
           ? `${mark(true)} ${status.transmission.version || ""}`
           : `<span class="status-bad">${(status.transmission.error || "").slice(0, 80)}</span>`,
       ]);
+      if (status.torrents) {
+        const files = status.torrents;
+        rows.push([
+          "torrent-файлы",
+          files.ok
+            ? `${mark(true)} ${files.path}`
+            : `<span class="status-bad">${(files.error || "нет доступа").slice(0, 80)}</span>`,
+        ]);
+      }
       if (status.storage) {
         const disk = status.storage;
         rows.push([

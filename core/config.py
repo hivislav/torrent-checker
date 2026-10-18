@@ -171,7 +171,10 @@ def get_settings() -> Settings:
         ),
         gate_headless=_as_bool(get("GATE_HEADLESS"), False),
         gate_profile_dir=resolve(get("GATE_PROFILE_DIR", str(data_dir / "chrome-profile"))),
-        torrents_dir=resolve(get("TORRENTS_DIR", str(data_dir / "torrents"))),
+        # .torrent-файлы лежат рядом с загрузками, на том же внешнем диске, но
+        # в отдельной папке: их удобно разбирать руками, а Transmission не
+        # путает их с данными раздач.
+        torrents_dir=resolve(get("TORRENTS_DIR", "/Volumes/EAGET/torrent-files")),
         db_path=resolve(get("DB_PATH", str(data_dir / "agent.sqlite3"))),
         default_interval_minutes=_as_int(get("DEFAULT_INTERVAL_MINUTES"), 30),
         min_interval_minutes=_as_int(get("MIN_INTERVAL_MINUTES"), 5),

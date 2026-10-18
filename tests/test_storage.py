@@ -29,6 +29,12 @@ from core.agent import Agent  # noqa: E402
 from core.config import get_settings  # noqa: E402
 from core.models import Torrent, Turn  # noqa: E402
 from core.torrent_meta import human_bytes, total_length  # noqa: E402
+from core.storage_target import (  # noqa: E402
+    StorageUnavailable as TargetUnavailable,
+    ensure_target,
+    target_info,
+    volume_root,
+)
 from core.transmission import (  # noqa: E402
     NotEnoughSpace,
     StorageUnavailable,
@@ -122,6 +128,37 @@ def test_space_rules(tmp: Path) -> None:
         check("в сообщении есть резерв", "резерв" in text, text)
 
 
+def test_torrent_files_dir() -> None:
+    print("\n== папка для .torrent-файлов ==")
+    settings = get_settings()
+    torrents_dir = settings.torrents_dir
+    print("  путь:", torrents_dir)
+    check(
+        "torrent-файлы на том же диске, что и загрузки",
+        volume_root(torrents_dir) == volume_root(settings.transmission_download_dir),
+        f"{volume_root(torrents_dir)} vs {volume_root(settings.transmission_download_dir)}",
+    )
+    check(
+        "это отдельная папка, а не каталог загрузок",
+        torrents_dir != Path(settings.transmission_download_dir),
+        str(torrents_dir),
+    )
+    info = target_info(torrents_dir)
+    if info.mounted and info.writable:
+        created = ensure_target(torrents_dir)
+        check("каталог создаётся и доступен", created.ok, created.error)
+    else:
+        print("  (нет прав записи из этого окружения — создание каталога пропускаю)")
+
+    # диск не подключён — агент обязан отказаться, а не писать на системный
+    broken = dataclasses.replace(settings, torrents_dir=Path("/Volumes/НЕТ_ДИСКА/torrent-files"))
+    try:
+        ensure_target(broken.torrents_dir)
+        check("отказ без диска для torrent-файлов", False, "исключения не было")
+    except TargetUnavailable as exc:
+        check("отказ без диска для torrent-файлов", "не подключён" in str(exc), str(exc))
+
+
 def test_missing_disk(tmp: Path) -> None:
     print("\n== диск не подключён ==")
     settings = dataclasses.replace(
@@ -190,6 +227,43 @@ async def test_real_add(tmp: Path) -> None:
     check("тестовая раздача убрана", True)
 
 
+async def test_agent_refuses_without_torrent_dir() -> None:
+    print("\n== агент не качает .torrent при отсутствии диска ==")
+    tmp = Path(tempfile.mkdtemp(prefix="agent-torrents-"))
+    base = get_settings()
+    settings = dataclasses.replace(
+        base,
+        data_dir=tmp,
+        db_path=tmp / "torrent-dir-test.sqlite3",
+        torrents_dir=Path("/Volumes/НЕТ_ДИСКА/torrent-files"),
+    )
+    agent = Agent(settings)
+
+    called = {"mcp": False}
+
+    class FakeMCP:
+        async def download(self, torrent_id, path):
+            called["mcp"] = True
+            return {"success": True, "path": str(path)}
+
+    agent.mcp = FakeMCP()  # type: ignore[assignment]
+    from core.models import Task
+
+    task = Task(
+        id="probe",
+        kind="oneshot",
+        state="awaiting_confirm",
+        session_id="probe",
+        user_query="проба",
+        params={"title": "проба"},
+    )
+    result = await agent._download(task, Torrent(id="1", title="Проба"))  # noqa: SLF001
+    check("отказ до обращения к MCP", called["mcp"] is False, called)
+    check("причина — диск", result.get("reason") == "disk", result)
+    check("сообщение понятное", "torrent-файлов" in result.get("error", ""), result.get("error"))
+    agent.store.close()
+
+
 async def test_agent_message() -> None:
     print("\n== что агент говорит пользователю ==")
     tmp = Path(tempfile.mkdtemp(prefix="agent-storage-"))
@@ -242,8 +316,10 @@ async def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="storage-test-"))
     test_sizes(tmp)
     test_space_rules(tmp)
+    test_torrent_files_dir()
     test_missing_disk(tmp)
     await test_real_add(tmp)
+    await test_agent_refuses_without_torrent_dir()
     await test_agent_message()
 
     print("\n=== ИТОГ ===")
