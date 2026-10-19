@@ -143,6 +143,9 @@ def _turn_to_json(turn) -> dict[str, Any]:
     return {
         "messages": [message.to_dict() for message in turn.messages],
         "task": turn.task.to_dict() if turn.task else None,
+        # Правка пришла в задачу, которую нельзя править: интерфейс открывает
+        # чистый лист новой задачи, как по кнопке «Новая задача».
+        "start_new": bool(turn.start_new),
     }
 
 

@@ -410,6 +410,11 @@
         state.taskId = created;
         clearChat();
         showCurrentTask(payload.task.params?.title || payload.task.user_query || "");
+      } else if (payload.start_new) {
+        // Текст пришёл в задачу, которую править нельзя (в работе или закрытую):
+        // сервер завёл новую задачу или попросил название — в любом случае
+        // открываем чистый лист, как по кнопке «Новая задача».
+        startNewTask();
       }
       renderTurn(payload);
     } catch (error) {

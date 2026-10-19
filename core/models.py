@@ -260,6 +260,10 @@ class Turn:
 
     messages: list[Message] = field(default_factory=list)
     task: Task | None = None
+    # Сообщение пришло в задачу, которую уже нельзя править (в работе или
+    # закрытая): интерфейс должен открыть чистый лист новой задачи, даже если
+    # по тексту задачу завести не удалось («а можно 4K» без названия).
+    start_new: bool = False
 
     def add(self, text: str, **kwargs: Any) -> Message:
         message = Message(role="agent", text=text, **kwargs)

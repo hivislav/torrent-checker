@@ -198,32 +198,23 @@ async def test_nothing_new_inside_task() -> None:
     agent.store.close()
 
 
-async def test_downloading_task_stays() -> None:
-    """Пока раздача качается, задачу нельзя превратить в другую.
+async def test_locked_tasks_start_new() -> None:
+    """Текст при открытой задаче «в работе» или закрытой = новая задача.
 
-    Настоящий случай: «Брестская крепость» качалась, человек в том же чате
-    написал про другой фильм — и задача стала периодической «Ты все видишь».
-    Раздача осталась в Transmission, а в ассистенте её больше не было видно.
+    Правило владельца: править можно только задачу, которая ещё выбирается
+    (поиск, качество, озвучка, серии, подтверждение). Задача в работе или
+    закрытая не редактируется вовсе — текст в поле ввода делает то же, что
+    кнопка «Новая задача». Раньше из-за этого «Брестская крепость» превратилась
+    в «Ты все видишь», а раздача осталась качаться без присмотра.
     """
-    print("\n== качающую задачу не превращаем в другую ==")
-    agent = make_agent("live-")
-    task = Task(
-        id="live-task",
-        kind="oneshot",
-        state="downloading",
-        session_id="s1",
-        user_query="Брестская крепость",
-        params={
-            "title": "Брестская крепость",
-            "type": "movie",
-            "transmission_hash": "b333ced2",
-            "progress": {"percent": 2.3, "done": False},
-        },
-    )
-    await agent.store.save_task(task)
+    print("\n== в работе и закрытые задачи не редактируются ==")
+    agent = make_agent("locked-")
 
     async def fake_parse(text, window, active):
         return {"title": "Ты все видишь", "year": 2026, "intent": "find"}
+
+    async def fake_parse_refine(text, window, active):
+        return {"quality": "2160p", "intent": "find"}
 
     async def fake_search(params):
         return []
@@ -245,11 +236,26 @@ async def test_downloading_task_stays() -> None:
         async def stop(self):
             return None
 
-    agent._parse_query = fake_parse  # noqa: SLF001
     agent._search = fake_search  # type: ignore[assignment]
     agent._selection_step = fake_selection  # type: ignore[assignment]
     agent.mcp = FakeMCP()  # type: ignore[assignment]
 
+    # 1) Качающаяся задача: любой текст заводит новую, старую не трогаем.
+    live = Task(
+        id="live-task",
+        kind="oneshot",
+        state="downloading",
+        session_id="s1",
+        user_query="Брестская крепость",
+        params={
+            "title": "Брестская крепость",
+            "type": "movie",
+            "transmission_hash": "b333ced2",
+            "progress": {"percent": 2.3, "done": False},
+        },
+    )
+    await agent.store.save_task(live)
+    agent._parse_query = fake_parse  # noqa: SLF001
     turn = await agent.handle_message(
         "s1", "Ты все видишь документальный фильм", "chat", "live-task"
     )
@@ -265,22 +271,85 @@ async def test_downloading_task_stays() -> None:
           turn.task.id if turn.task else None)
     text = " ".join(message.text for message in turn.messages).lower()
     check("сказано, что сейчас качается", "качается" in text, text[:120])
-    check("сказано, что задачу не тронули", "не трогаю" in text, text[:120])
-    check("уточнение «проверяй раз в сутки» всё ещё работает",
-          agent._owns_live_download(stored) is True)  # noqa: SLF001
+    check("сказано, что задачу не трогают", "не трогаю" in text, text[:120])
+    check("новая задача принадлежит новому запросу",
+          turn.task is not None and str((turn.task.params or {}).get("title")) == "Ты все видишь",
+          (turn.task.params or {}).get("title") if turn.task else None)
+    check("интерфейсу сказано открыть чистый лист", turn.start_new is True, turn.start_new)
 
-    # А вот обычное уточнение к качающей задаче по-прежнему остаётся внутри неё.
-    async def fake_parse_refine(text, window, active):
-        return {"quality": "2160p", "intent": "find"}
-
+    # 2) Даже «уточнение» вида «а можно 4K» не правит качающую задачу.
     agent._parse_query = fake_parse_refine  # noqa: SLF001
     turn = await agent.handle_message("s1", "а можно 4K", "chat", "live-task")
     stored = await agent.store.get_task("live-task")
-    check("уточнение качества осталось в той же задаче",
-          turn.task is not None and turn.task.id == "live-task",
+    check("качество качающей задачи не поменялось",
+          (stored.params or {}).get("quality") != "2160p", (stored.params or {}).get("quality"))
+    check("на текст без названия задача не заводится",
+          turn.task is None, turn.task.id if turn.task else None)
+    check("но чистый лист всё равно открывается", turn.start_new is True, turn.start_new)
+    text = " ".join(message.text for message in turn.messages).lower()
+    check("и попрошено название новой задачи", "название" in text, text[:160])
+    check("второго «не понял, что искать» нет", len(turn.messages) == 1,
+          [m.text[:40] for m in turn.messages])
+
+    # 3) Мониторинг: текст тоже заводит новую задачу.
+    watching = Task(
+        id="watch-task",
+        kind="periodic",
+        state="monitoring",
+        session_id="s1",
+        user_query="Ставка на любовь",
+        params={"title": "Ставка на любовь", "quality": "1080p"},
+    )
+    await agent.store.save_task(watching)
+    agent._parse_query = fake_parse  # noqa: SLF001
+    turn = await agent.handle_message("s1", "Ты все видишь", "chat", "watch-task")
+    stored = await agent.store.get_task("watch-task")
+    check("мониторинг не изменился",
+          stored.state == "monitoring" and (stored.params or {}).get("title") == "Ставка на любовь",
+          (stored.state, (stored.params or {}).get("title")))
+    check("для мониторинга тоже новая задача",
+          turn.task is not None and turn.task.id != "watch-task",
+          turn.task.id if turn.task else None)
+    text = " ".join(message.text for message in turn.messages).lower()
+    check("сказано, что задача уже в работе", "в работе" in text, text[:140])
+
+    # 4) Закрытая задача (отменена) — то же самое.
+    closed = Task(
+        id="closed-task",
+        kind="oneshot",
+        state="cancelled",
+        session_id="s1",
+        user_query="Тед Лассо",
+        params={"title": "Тед Лассо", "quality": "1080p"},
+    )
+    await agent.store.save_task(closed)
+    turn = await agent.handle_message("s1", "Ты все видишь", "chat", "closed-task")
+    stored = await agent.store.get_task("closed-task")
+    check("отменённая задача осталась отменённой", stored.state == "cancelled", stored.state)
+    check("и не переименовалась",
+          (stored.params or {}).get("title") == "Тед Лассо", (stored.params or {}).get("title"))
+    check("для закрытой тоже новая задача",
+          turn.task is not None and turn.task.id != "closed-task",
+          turn.task.id if turn.task else None)
+
+    # 5) Выбор ещё идёт — правка остаётся внутри задачи.
+    agent._parse_query = fake_parse_refine  # noqa: SLF001
+    picking = Task(
+        id="pick-task",
+        kind="oneshot",
+        state="awaiting_choice",
+        session_id="s2",
+        user_query="Дюна",
+        params={"title": "Дюна", "quality": "1080p"},
+    )
+    await agent.store.save_task(picking)
+    turn = await agent.handle_message("s2", "а можно 4K", "chat", "pick-task")
+    stored = await agent.store.get_task("pick-task")
+    check("на этапе выбора правка работает",
+          turn.task is not None and turn.task.id == "pick-task",
           turn.task.id if turn.task else None)
     check("качество применилось",
-          (stored.params or {}).get("quality") == "2160p", stored.params.get("quality"))
+          (stored.params or {}).get("quality") == "2160p", (stored.params or {}).get("quality"))
     agent.store.close()
 
 
@@ -540,7 +609,7 @@ async def main() -> int:
     await test_task_chats()
     await test_answered_once()
     await test_nothing_new_inside_task()
-    await test_downloading_task_stays()
+    await test_locked_tasks_start_new()
     await test_foreign_query()
     await test_prompt()
     test_refinement_rules()

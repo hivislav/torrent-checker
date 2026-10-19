@@ -387,6 +387,13 @@ class Agent:
         window = [item for item in window if item.get("text") != text]
         active = current or await self._active_task(session_id)
 
+        # Задачу, которую уже нельзя править (в работе или закрытую), текст в
+        # поле ввода не меняет: это новая задача — то же самое, что кнопка
+        # «Новая задача». Иначе качающая задача превращалась в другую (так
+        # «Брестская крепость» стала «Ты все видишь»), а закрытую можно было
+        # «переоткрыть» одной фразой.
+        locked = current is not None and not self._can_edit(current)
+
         try:
             parsed = await self._parse_query(text, window, active)
         except LLMError as exc:
@@ -397,8 +404,29 @@ class Agent:
         effective_mode = mode if mode in ("oneshot", "periodic") else (
             "periodic" if intent == "monitor" else "oneshot"
         )
-        # Уточнение ищем только среди задач того же типа, что запрошен кнопкой.
-        if current is None:
+        if locked:
+            journal.add(
+                "agent",
+                "правка нередактируемой задачи: завожу новую",
+                {
+                    "задача": current.id,
+                    "состояние": current.state,
+                    "текст": text,
+                    "разобрано": parsed,
+                },
+            )
+            turn.add(self._locked_note(current, parsed, text), kind="text")
+            turn.start_new = True
+            has_title = bool(str(parsed.get("title") or "").strip()) or self._looks_like_title(text)
+            current = None
+            active = None
+            if not has_title:
+                # Названия в тексте нет («а можно 4K») — заводить нечего, и
+                # просить его второй раз («Не понял, что искать») незачем:
+                # просьба уже есть в ответе.
+                await self._remember_many(session_id, turn.messages)
+                return turn
+        elif current is None:
             # Без открытой задачи — начинаем новую (так же работают API и бот).
             active = await self._active_task(session_id, kind=effective_mode)
         else:
@@ -406,33 +434,6 @@ class Agent:
             # относится к ней. Другое название — это правка задачи, а не
             # новый поиск (для новой задачи есть кнопка «Новая задача»).
             active = current
-
-        # Исключение из этого правила: если задача уже качает раздачу, а человек
-        # пишет про ДРУГОЙ фильм, молча переделывать её нельзя. Иначе раздача
-        # остаётся в Transmission, а задача превращается в другую — так
-        # «Брестская крепость» стала «Ты все видишь», и скачивание пропало из
-        # вида. Заводим отдельную задачу, старую не трогаем.
-        if (
-            current is not None
-            and self._owns_live_download(current)
-            and not self._is_refinement(text, parsed, current)
-        ):
-            previous = str((current.params or {}).get("title") or current.user_query or "")
-            percent = ((current.params or {}).get("progress") or {}).get("percent")
-            journal.add(
-                "agent",
-                "в задаче идёт скачивание: завожу новую задачу, старую не меняю",
-                {"качается": previous, "новый запрос": text, "прогресс": percent},
-            )
-            turn.add(
-                f"Сейчас качается «{previous}»"
-                + (f" ({percent} %)" if percent is not None else "")
-                + " — эту задачу не трогаю.\n"
-                f"Начинаю отдельную: «{parsed.get('title') or self._clean_title_text(text)}».",
-                kind="text",
-            )
-            current = None
-            active = None
 
         # Дополнение к уточнению: сначала ответили списком названий, потом человек
         # добавил слово («возвращение»). Ищем внутри уже найденного, а не с нуля.
@@ -611,6 +612,47 @@ class Agent:
             return False
         progress = params.get("progress") or {}
         return not progress.get("done")
+
+    def _can_edit(self, task: Task) -> bool:
+        """Задачу ещё можно править текстом — она в процессе выбора.
+
+        Пока идёт поиск, выбор качества/озвучки/серий или подтверждение, человек
+        вправе уточнять («нет, 4K», «проверяй раз в сутки»). Но как только задача
+        в работе или закрыта, правок в ней нет: текст заводит новую задачу.
+        """
+        return task.state in self.RESUME_STATES
+
+    # Как назвать состояние в объяснении «правки в неё не вношу».
+    STATE_WORDS = {
+        "downloading": "уже качается",
+        "monitoring": "уже в работе (мониторинг)",
+        "done": "уже скачана",
+        "cancelled": "отменена",
+        "failed": "завершилась ошибкой",
+        "not_found": "закрыта: ничего не нашлось",
+    }
+
+    def _locked_note(self, task: Task, parsed: dict[str, Any], text: str) -> str:
+        """Объясняет, почему текст открыл новую задачу, а не правку."""
+        title = str((task.params or {}).get("title") or task.user_query or "")
+        if self._owns_live_download(task):
+            percent = ((task.params or {}).get("progress") or {}).get("percent")
+            head = f"Сейчас качается «{title}»"
+            if percent is not None:
+                head += f" ({percent} %)"
+        else:
+            head = f"Задача «{title}» {self.STATE_WORDS.get(task.state, 'уже не правится')}"
+        # Название новой задачи берём из запроса, если оно там есть: «а можно 4K»
+        # названием не является, и обещать «начинаю новую: „а можно 4K“» нельзя.
+        new_title = str(parsed.get("title") or "").strip()
+        if not new_title and self._looks_like_title(text):
+            new_title = self._clean_title_text(text)
+        tail = (
+            f"Начинаю новую: «{new_title}»."
+            if new_title
+            else "Чтобы начать новую, напишите её название — например «Тед Лассо 1080p»."
+        )
+        return f"{head} — эту задачу не трогаю и не правлю.\n{tail}"
 
     def _is_refinement(self, text: str, parsed: dict[str, Any], active: Task) -> bool:
         """Это уточнение к активной задаче, а не новая задача?"""
