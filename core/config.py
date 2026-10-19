@@ -89,6 +89,14 @@ class Settings:
     # агент честно откажется ставить раздачу, а не зальёт её на внутренний.
     transmission_download_dir: Path
     transmission_min_free_gb: float
+    # Потолок скорости скачивания, МБ/с (0 — без ограничения). Transmission
+    # пишет на диск в том же потоке, который отвечает на RPC: на предельной
+    # скорости внешний SSD перестаёт успевать, запись блокирует поток, и API
+    # замолкает на минуты. Небольшой запас скорости оставляет демону дыхание.
+    transmission_speed_limit_mbps: float
+    # Кэш записи Transmission, МБ. Маленький кэш (по умолчанию 4) — это частые
+    # мелкие записи на exfat; крупная пачка пишется дольше, но реже.
+    transmission_cache_mb: int
 
     # --- обход Cloudflare ---
     gate_host: str
@@ -175,6 +183,8 @@ def get_settings() -> Settings:
             get("TRANSMISSION_DOWNLOAD_DIR", "/Volumes/EAGET/torrents")
         ),
         transmission_min_free_gb=float(get("TRANSMISSION_MIN_FREE_GB", "5") or 5),
+        transmission_speed_limit_mbps=float(get("TRANSMISSION_SPEED_LIMIT_MBPS", "70") or 0),
+        transmission_cache_mb=_as_int(get("TRANSMISSION_CACHE_MB"), 32),
         gate_host=get("GATE_HOST", "127.0.0.1"),
         gate_port=_as_int(get("GATE_PORT"), 8123),
         gate_chrome_path=get(

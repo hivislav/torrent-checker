@@ -376,6 +376,42 @@ async def test_status_cached_offloop() -> None:
     agent.store.close()
 
 
+async def test_status_keeps_last_known() -> None:
+    """Диск занят записью: прошлые цифры вместо прочерков.
+
+    Пока Transmission пишет 4K-сезон, обход внешнего тома может не уложиться в
+    бюджет. Раньше панель в этот момент писала «диск не ответил» и обнуляла
+    все значения — хотя диск на месте и работает.
+    """
+    print("\n== диск занят: панель показывает последние известные данные ==")
+    tmp = Path(tempfile.mkdtemp(prefix="disk-stale-"))
+    settings = dataclasses.replace(
+        get_settings(), data_dir=tmp, db_path=tmp / "s.sqlite3",
+        torrents_dir=tmp / "t", transmission_download_dir=tmp / "dl",
+    )
+    settings.torrents_dir.mkdir(parents=True, exist_ok=True)
+    settings.transmission_download_dir.mkdir(parents=True, exist_ok=True)
+    agent = Agent(settings)
+
+    empty, empty_torrents = agent._stale_storage()  # noqa: SLF001
+    check("без прошлых данных — честная ошибка", empty.get("ok") is False, empty)
+    check("и никаких выдуманных цифр", empty.get("free_human") == "—", empty.get("free_human"))
+    check("каталог .torrent пустой", empty_torrents == {}, empty_torrents)
+
+    last = {"ok": True, "volume": "EAGET", "free_human": "155,1 ГБ",
+            "total_human": "223,5 ГБ", "checked_at": "19:04"}
+    agent._storage_cache = (0.0, dict(last), {"path": "/Volumes/EAGET/torrent-files", "ok": True})  # noqa: SLF001
+    storage, torrents = agent._stale_storage()  # noqa: SLF001
+    check("свободное место не обнулилось", storage.get("free_human") == "155,1 ГБ", storage)
+    check("помечено как устаревшее", storage.get("stale") is True, storage)
+    check("видно, когда мерили", storage.get("checked_at") == "19:04", storage.get("checked_at"))
+    check("объяснение вместо «нет доступа»",
+          "занят" in str(storage.get("error")), storage.get("error"))
+    check("каталог .torrent тоже из прошлого ответа",
+          torrents.get("ok") is True, torrents)
+    agent.store.close()
+
+
 async def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="storage-test-"))
     test_sizes(tmp)
@@ -387,6 +423,7 @@ async def main() -> int:
     await test_agent_refuses_without_torrent_dir()
     await test_agent_message()
     await test_status_cached_offloop()
+    await test_status_keeps_last_known()
 
     print("\n=== ИТОГ ===")
     if FAILS:

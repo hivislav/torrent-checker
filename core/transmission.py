@@ -20,7 +20,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import shutil
+import signal
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,6 +44,23 @@ log = logging.getLogger("transmission")
 
 class TransmissionError(RuntimeError):
     pass
+
+
+class TransmissionBusy(TransmissionError):
+    """Демон жив, но занят диском и не отвечает: это не поломка связи.
+
+    Transmission отдаёт JSON-RPC из того же потока, который пишет куски на
+    диск. Пока идёт большая запись (4K-сезон на внешний exfat), ответа нет
+    вообще — секунды, иногда минуты. Отличать это от «приложение не запущено»
+    важно: в первом случае панель должна показать последние известные данные
+    и пометку «занят записью», а не красную ошибку и прочерки.
+    """
+
+    busy = True
+
+    def __init__(self, message: str, *, waited: float = 0.0) -> None:
+        self.waited = waited
+        super().__init__(message)
 
 
 # StorageUnavailable приходит из core.storage_target: одно правило для всех папок.
@@ -74,6 +94,27 @@ class NotEnoughSpace(TransmissionError):
 
 StorageInfo = TargetInfo  # прежнее имя, чтобы не ломать вызывающий код
 
+_DAEMON_PATTERN = "Transmission.app/Contents/MacOS/Transmission"
+
+
+def daemon_pids() -> list[int]:
+    """PID запущенного Transmission.app (пусто — приложение не запущено).
+
+    Именно приложения, а не демона transmission-daemon: в этой системе
+    Transmission работает как обычное приложение из /Applications.
+    """
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", _DAEMON_PATTERN],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return [int(chunk) for chunk in result.stdout.split() if chunk.strip().isdigit()]
+
 
 class Transmission:
     def __init__(self, settings: Settings | None = None) -> None:
@@ -86,6 +127,17 @@ class Transmission:
         self._client = None
         self._sig: tuple[str, int, str, str] | None = None
         self._session_synced = False
+        # «Демон занят диском»: пока стоит эта пауза, обычные вызовы падают
+        # сразу, а не ждут по 8 с каждый (см. _run).
+        self._timeouts = 0
+        self._busy_until = 0.0
+        self._busy_since: float | None = None
+        self._last_ok: dict[str, Any] | None = None
+        # Сколько ждать ответа в «прощупывающем» режиме, сколько — на повтор
+        # после обрыва, и до какого предела растёт пауза между попытками.
+        self.busy_probe_budget = 3.0
+        self.busy_retry_budget = 2.0
+        self.busy_max_pause = 20.0
 
     # ------------------------------------------------------------------
     def configure(self, host: str, port: int, username: str, password: str) -> None:
@@ -124,15 +176,52 @@ class Transmission:
         self._sig = None
         self._session_synced = False
 
-    async def _run(self, fn, *, budget: float = 8.0):
-        """Блокирующий вызов RPC: короткий бюджет и один повтор с новым клиентом.
+    # -- «демон занят диском» ------------------------------------------
+    def busy_for(self) -> float:
+        """Сколько секунд ещё действует пауза (0 — демон свободен)."""
+        return max(0.0, self._busy_until - time.monotonic())
 
-        Клиент transmission-rpc синхронный, поэтому вызов уходит в поток. Таймаут
-        библиотеки — 20 с, и после простоя это ровно те «зависшие» ответы в
-        интерфейсе. Здесь бюджет короче, а при таймауте соединение сбрасывается
-        и попытка повторяется — обычно второй раз отвечает мгновенно.
+    def busy_text(self) -> str:
+        waited = time.monotonic() - self._busy_since if self._busy_since else 0.0
+        tail = f" (уже {int(waited)} с)" if waited >= 1 else ""
+        return f"Transmission занят записью на диск и не отвечает{tail}"
+
+    def _mark_busy(self, exc: Exception) -> float:
+        """Ставит паузу после обрыва и возвращает её длину."""
+        self._timeouts += 1
+        delay = min(self.busy_max_pause, float(2 ** (self._timeouts - 1)))
+        self._busy_until = time.monotonic() + delay
+        if self._busy_since is None:
+            self._busy_since = time.monotonic()
+        return delay
+
+    def _mark_alive(self) -> None:
+        if self._timeouts:
+            log.info("Transmission снова отвечает после %s обрывов", self._timeouts)
+        self._timeouts = 0
+        self._busy_until = 0.0
+        self._busy_since = None
+
+    async def _run(self, fn, *, budget: float = 8.0, probe: bool = False, ignore_pause: bool = False):
+        """Блокирующий вызов RPC: короткий бюджет, без шторма повторов.
+
+        Клиент transmission-rpc синхронный, поэтому вызов уходит в поток. При
+        обрыве первого ответа бывает достаточно переподключиться — поэтому один
+        повтор (с коротким бюджетом). Но если демон завис на записи, повтор
+        только удваивал бы ожидание (было 8 с + 8 с), и панель, обновляющаяся
+        каждые 5 с, вставала вместе с ним.
+
+        Поэтому после обрыва включается пауза: обычные вызовы сразу бросают
+        `TransmissionBusy`, а `probe=True` (короткий бюджет, одна попытка)
+        проверяет, ожил ли демон, и снимает паузу. `ignore_pause=True` — для
+        действий по кнопке (поставить/убрать раздачу): их лучше попробовать,
+        чем отказать из-за недавнего обрыва.
         """
         import transmission_rpc as trpc
+
+        busy = self.busy_for()
+        if busy > 0 and not probe and not ignore_pause:
+            raise TransmissionBusy(self.busy_text(), waited=busy)
 
         transient = (
             asyncio.TimeoutError,
@@ -141,24 +230,41 @@ class Transmission:
             ConnectionError,
             OSError,
         )
+        timeout = min(budget, self.busy_probe_budget) if probe else budget
+        # Повтор нужен для другого случая: мёртвый сокет после простоя — тогда
+        # второй заход с новым соединением отвечает мгновенно. Поэтому он с
+        # коротким бюджетом: при зависшем на записи демоне ожидание не
+        # удваивается (было 8 + 8), а сразу переходит в паузу.
+        retry_timeout = min(budget, self.busy_retry_budget)
+        schedule = [(1, timeout)] if probe else [(1, timeout), (2, retry_timeout)]
         last: Exception | None = None
-        for attempt in (1, 2):
+        for attempt, limit in schedule:
             try:
-                return await asyncio.wait_for(asyncio.to_thread(fn), timeout=budget)
+                result = await asyncio.wait_for(asyncio.to_thread(fn), timeout=limit)
             except transient as exc:  # noqa: PERF203 - два подхода, не цикл
                 last = exc
+                pause = self._mark_busy(exc)
                 self._reset_client()
                 journal.add(
                     "transmission",
-                    "RPC не ответил — переподключаюсь",
-                    {"попытка": attempt, "ошибка": f"{type(exc).__name__}: {exc}"},
+                    "RPC не ответил — пауза перед следующей попыткой",
+                    {
+                        "попытка": attempt,
+                        "ждал": f"{limit:g} с",
+                        "пауза": f"{pause:.0f} с",
+                        "ошибка": f"{type(exc).__name__}: {exc}",
+                    },
                     level="warn",
                 )
             except Exception:
                 self._reset_client()
                 raise
-        raise TransmissionError(
-            f"Transmission не ответил за {int(budget)} с: {type(last).__name__}"
+            else:
+                self._mark_alive()
+                return result
+        raise TransmissionBusy(
+            f"Transmission не ответил за {int(timeout)} с: {type(last).__name__}",
+            waited=float(self._timeouts),
         )
 
     @staticmethod
@@ -243,6 +349,14 @@ class Transmission:
 
     # ------------------------------------------------------------------
     async def test_connection(self) -> dict[str, Any]:
+        """Проверка связи для панели — мягкая к занятому диском демону.
+
+        Единственный вызов, которому разрешено стучаться во время паузы: когда
+        демон занят записью, он идёт в «прощупывающем» режиме (короткий бюджет,
+        без повтора). Если ответа нет, возвращаем последние известные данные, а
+        не пустоту: панель не должна выглядеть сломанной из-за записи на диск.
+        """
+
         def run() -> dict[str, Any]:
             client = self._get_client()
             session = client.get_session()
@@ -254,12 +368,32 @@ class Transmission:
             }
 
         try:
-            result = await self._run(run, budget=6.0)
+            result = await self._run(run, budget=6.0, probe=self.busy_for() > 0)
+        except TransmissionBusy as exc:
+            return self._unreachable(exc, busy=True)
         except Exception as exc:  # noqa: BLE001
             self._client = None
-            return {"ok": False, "error": self._explain(exc)}
-        result["storage"] = self.storage_info().to_dict()
+            return self._unreachable(exc, busy=False)
+        try:
+            result["storage"] = self.storage_info().to_dict()
+        except Exception as exc:  # noqa: BLE001 - про диск панель скажет отдельно
+            log.debug("не удалось прочитать состояние диска: %s", exc)
+        self._last_ok = dict(result)
         return result
+
+    def _unreachable(self, exc: Exception, *, busy: bool) -> dict[str, Any]:
+        """Ответ «связи нет»: с последними известными данными, если они были."""
+        stale = dict(self._last_ok or {})
+        stale.update(
+            {
+                "ok": False,
+                "busy": busy,
+                "error": self.busy_text() if busy else self._explain(exc),
+                "stale": bool(stale),
+                "measured_at": time.strftime("%H:%M", time.localtime()),
+            }
+        )
+        return stale
 
     async def _sync_session_dir(self) -> None:
         """Ставит каталог загрузок в самом Transmission — для «ручных» добавлений.
@@ -272,6 +406,9 @@ class Transmission:
             return
         target = str(self.download_dir)
         incomplete = str(self.download_dir / ".incomplete")
+        cache_mb = int(self.settings.transmission_cache_mb or 0)
+        speed_mbps = float(self.settings.transmission_speed_limit_mbps or 0)
+        speed_kbps = int(speed_mbps * 1024) if speed_mbps > 0 else 0
 
         def run() -> None:
             client = self._get_client()
@@ -283,11 +420,27 @@ class Transmission:
                 changes["incomplete_dir"] = incomplete
             if not getattr(session, "incomplete_dir_enabled", False):
                 changes["incomplete_dir_enabled"] = True
+            # Разгрузка диска: крупный кэш = редкая, но большая запись, а
+            # потолок скорости оставляет демону время отвечать на RPC. Оба
+            # параметра ставим только если они разошлись с нашими.
+            have_cache = int(getattr(session, "cache_size_mib", 0) or 0)
+            if cache_mb and have_cache != cache_mb:
+                changes["cache_size_mb"] = cache_mb
+            have_limit = int(getattr(session, "speed_limit_down", 0) or 0)
+            limit_on = bool(getattr(session, "speed_limit_down_enabled", False))
+            if speed_kbps and (not limit_on or have_limit != speed_kbps):
+                changes["speed_limit_down_enabled"] = True
+                changes["speed_limit_down"] = speed_kbps
             if changes:
                 client.set_session(**changes)
-                log.info("Transmission: каталог загрузок переведён на %s", target)
+                log.info(
+                    "Transmission: каталог %s, кэш %s МБ, потолок %s МБ/с",
+                    target,
+                    cache_mb or "как есть",
+                    f"{speed_mbps:g}" if speed_kbps else "нет",
+                )
             else:
-                log.debug("Transmission: каталог загрузок уже %s", target)
+                log.debug("Transmission: настройки сессии уже наши")
 
         try:
             await self._run(run, budget=15.0)
@@ -355,7 +508,7 @@ class Transmission:
             }
 
         try:
-            result = await self._run(run)
+            result = await self._run(run, ignore_pause=True)
             journal.add(
                 "transmission",
                 f"в очередь: {result.get('name') or torrent_path.name}",
@@ -491,7 +644,7 @@ class Transmission:
             return {"ok": True, "hash": torrent_hash, "delete_data": delete_data}
 
         try:
-            result = await self._run(run)
+            result = await self._run(run, ignore_pause=True)
             journal.add(
                 "transmission",
                 "раздача убрана из очереди",
@@ -530,3 +683,131 @@ class Transmission:
             return await self._run(run)
         except Exception as exc:  # noqa: BLE001
             raise TransmissionError(self._explain(exc)) from exc
+
+    # ------------------------------------------------------------------
+    # Перезапуск демона и разгрузка диска
+    # ------------------------------------------------------------------
+    async def startup_tuning(self) -> None:
+        """Приводит настройки сессии в порядок сразу при старте приложения.
+
+        Раньше каталог/кэш выставлялись только при первой постановке раздачи,
+        то есть уже после того, как диск начали грузить.
+        """
+        self._session_synced = False
+        await self._sync_session_dir()
+
+    def _kill_daemon(self) -> dict[str, Any]:
+        """Синхронная часть перезапуска: гасит процесс (SIGTERM, потом SIGKILL)."""
+        pids = daemon_pids()
+        if not pids:
+            return {"ok": True, "killed": False, "forced": False}
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+        deadline = time.time() + 8
+        while time.time() < deadline and daemon_pids():
+            time.sleep(0.3)
+        forced = False
+        if daemon_pids():
+            # Зависший в записи процесс SIGTERM не замечает: он выйдет только
+            # когда вернётся системный вызов, а SIGKILL лишь пометит его на
+            # выход. Поэтому ждём здесь долго, а не считаем «не убился».
+            forced = True
+            for pid in daemon_pids():
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            deadline = time.time() + 40
+            while time.time() < deadline and daemon_pids():
+                time.sleep(0.5)
+        left = daemon_pids()
+        if left:
+            return {
+                "ok": False,
+                "killed": False,
+                "forced": forced,
+                "pids": left,
+                "error": "Transmission не завершается: держит зависшую запись на диск",
+            }
+        return {"ok": True, "killed": True, "forced": forced}
+
+    @staticmethod
+    def _open_app() -> bool:
+        try:
+            result = subprocess.run(
+                ["open", "-a", "Transmission"],
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return result.returncode == 0
+
+    async def restart_daemon(self, *, wait_ready: float = 60.0) -> dict[str, Any]:
+        """Гасит зависший Transmission и поднимает его заново.
+
+        Зачем это здесь: демон умеет намертво застрять в записи на внешний
+        диск (процесс в состоянии `U`). Тогда RPC мёртв, а сам себя демон уже
+        не отпустит — SIGTERM игнорируется, SIGKILL срабатывает только после
+        возврата зависшей записи. До этого лечилось исключительно терминалом.
+
+        Возвращает честный отчёт: что сделали, сколько ждали, поднялся ли и
+        с какой версией. Данные скачанного Transmission пересчитает сам.
+        """
+        killed = await asyncio.to_thread(self._kill_daemon)
+        if not killed.get("ok"):
+            return {**killed, "restarted": False}
+        if not await asyncio.to_thread(self._open_app):
+            return {
+                "ok": False,
+                "restarted": False,
+                "forced": killed.get("forced", False),
+                "error": "не удалось запустить Transmission.app",
+            }
+        self._reset_client()
+        self._mark_alive()
+        # После перезапуска настройки сессии надо применить заново.
+        self._session_synced = False
+
+        def ping() -> dict[str, Any]:
+            session = self._get_client().get_session()
+            return {"version": getattr(session, "version", "")}
+
+        started = time.monotonic()
+        deadline = started + wait_ready
+        while time.monotonic() < deadline:
+            try:
+                info = await self._run(ping, budget=5.0, probe=True)
+            except Exception:  # noqa: BLE001 - ещё поднимается
+                await asyncio.sleep(2.0)
+                continue
+            waited = round(time.monotonic() - started, 1)
+            journal.add(
+                "transmission",
+                "Transmission перезапущен",
+                {
+                    "пришлось убивать": killed.get("forced", False),
+                    "ждали": f"{waited} с",
+                    "версия": info.get("version", ""),
+                },
+            )
+            await self._sync_session_dir()
+            return {
+                "ok": True,
+                "restarted": True,
+                "killed": killed.get("killed", False),
+                "forced": killed.get("forced", False),
+                "waited": waited,
+                "version": info.get("version", ""),
+            }
+        return {
+            "ok": False,
+            "restarted": True,
+            "forced": killed.get("forced", False),
+            "error": f"Transmission не ответил за {int(wait_ready)} с после перезапуска",
+        }

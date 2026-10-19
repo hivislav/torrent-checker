@@ -281,6 +281,11 @@ body {
 
 .panel__section.is-collapsed .panel__hint { display: none; }
 
+/* «Transmission занят диском»: не ошибка, но и не свежие данные. */
+.panel__hint--busy {
+  color: var(--amber);
+}
+
 .task-list { display: flex; flex-direction: column; gap: 10px; }
 .task-list:empty { display: none; }
 

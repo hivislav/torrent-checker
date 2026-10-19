@@ -63,6 +63,7 @@
           <p class="panel__hint">
             Файлы, которые уже в Transmission и на внешнем диске. Отсюда можно удалить.
           </p>
+          <p class="panel__hint panel__hint--busy" id="downloads-note" hidden></p>
           <div class="task-list" id="download-list"></div>
         </section>
 
@@ -71,6 +72,7 @@
           <div class="status-grid" id="status-grid">проверяю…</div>
           <div class="panel__actions">
             <button class="btn btn--ghost" id="refresh-status">Обновить статус</button>
+            <button class="btn btn--ghost" id="restart-transmission">Перезапустить Transmission</button>
             <button class="btn btn--ghost" id="open-debug">Журнал отладки</button>
             <button class="btn btn--ghost" id="open-settings">Доступы</button>
             <button class="btn btn--ghost" id="enable-notifications">Включить уведомления</button>

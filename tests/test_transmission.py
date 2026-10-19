@@ -12,11 +12,12 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from core.transmission import Transmission  # noqa: E402
+from core.transmission import Transmission, daemon_pids  # noqa: E402
 
 FAILS: list[str] = []
 
@@ -58,12 +59,58 @@ def make_torrent(path: Path) -> None:
     path.write_bytes(bencode(torrent))
 
 
+async def test_busy_pause() -> None:
+    """Демон занят диском: пауза вместо шторма повторов.
+
+    Transmission пишет на диск в том же потоке, что отвечает на RPC. Пока идёт
+    большая запись, ответа нет; панель, обновляющаяся каждые 5 секунд, не должна
+    каждый раз ждать полный бюджет и плодить потоки.
+    """
+    print("\n== демон занят диском: пауза вместо шторма повторов ==")
+    client = Transmission()
+    calls = {"count": 0}
+
+    def slow() -> dict:
+        calls["count"] += 1
+        time.sleep(0.4)
+        return {}
+
+    try:
+        await client._run(slow, budget=0.2)  # noqa: SLF001 - проверяем внутренности
+        check("первый вызов упал по таймауту", False, "не упал")
+    except Exception as exc:  # noqa: BLE001
+        check("первый вызов падает как «занят»",
+              type(exc).__name__ == "TransmissionBusy", type(exc).__name__)
+    paused = client.busy_for()
+    check("после обрыва включилась пауза", paused > 0, round(paused, 2))
+
+    started = time.monotonic()
+    try:
+        await client._run(slow, budget=0.2)  # noqa: SLF001
+        check("во время паузы вызов падает сразу", False, "не упал")
+    except Exception as exc:  # noqa: BLE001
+        elapsed = time.monotonic() - started
+        check("во время паузы вызов падает сразу",
+              elapsed < 0.1 and type(exc).__name__ == "TransmissionBusy",
+              (round(elapsed, 3), type(exc).__name__))
+    # Один повтор — ради мёртвого сокета после простоя, но уже с коротким
+    # бюджетом, а не с полным: ожидание не удваивается.
+    check("был ровно один дешёвый повтор", calls["count"] == 2, calls)
+
+    answer = await client._run(lambda: {"ok": True}, budget=2.0, probe=True)  # noqa: SLF001
+    check("прощупывающий вызов разрешён и снимает паузу",
+          answer == {"ok": True} and client.busy_for() == 0, client.busy_for())
+    check("pid демона читается", isinstance(daemon_pids(), list), daemon_pids())
+
+
 async def main() -> int:
     transmission = Transmission()
     print("\n== связь по RPC ==")
     status = await transmission.test_connection()
     print(" ", status)
     check("Transmission отвечает", status.get("ok") is True, status.get("error"))
+
+    await test_busy_pause()
 
     if not status.get("ok"):
         print("\n=== ИТОГ ===")

@@ -82,6 +82,7 @@ from core.transmission import (
     NotEnoughSpace,
     StorageUnavailable,
     Transmission,
+    TransmissionBusy,
     TransmissionError,
 )
 
@@ -224,6 +225,11 @@ def _shorten(text: str, limit: int) -> str:
     return (cut or value[:limit]).rstrip(" ,") + " …"
 
 
+def _short_clock() -> str:
+    """«19:04» — когда показатель панели действительно измеряли."""
+    return time.strftime("%H:%M", time.localtime())
+
+
 def _age_text(stamp: float | None) -> str:
     """«сегодня», «вчера», «3 дня назад» или дата — возраст раздачи.
 
@@ -268,6 +274,15 @@ class Agent:
         self._details_cache_ttl = 600
         self.scheduler_task: asyncio.Task | None = None
         self.progress_task: asyncio.Task | None = None
+        self._tuning_task: asyncio.Task | None = None
+        # Состояние последнего чтения очереди: «Transmission занят диском» —
+        # это не пустой список, панель должна сказать об этом честно.
+        self.downloads_meta: dict[str, Any] = {
+            "stale": False,
+            "busy": False,
+            "error": "",
+            "measured_at": "",
+        }
         self.progress_tick_seconds = 5
         self.scheduler_tick_seconds = 20
         # Сколько серий можно поставить в очередь без спроса. Больше — это уже
@@ -293,6 +308,10 @@ class Agent:
             self.scheduler_task = asyncio.create_task(self._scheduler_loop())
             self.progress_task = asyncio.create_task(self._progress_loop())
             log.info("шедулер периодических задач и монитор загрузок запущены")
+        # Настройки сессии Transmission (каталог, кэш, потолок скорости) —
+        # в фоне: если приложение выключено, это ожидание, а интерфейс стартовать
+        # не мешает.
+        self._tuning_task = asyncio.create_task(self.transmission.startup_tuning())
 
     async def stop(self) -> None:
         if self.progress_task:
@@ -1442,6 +1461,14 @@ class Agent:
         except TransmissionError as exc:
             log.warning("не удалось прочитать очередь Transmission: %s", exc)
             queue = []
+            self.downloads_meta = {
+                "stale": True,
+                "busy": isinstance(exc, TransmissionBusy),
+                "error": str(exc),
+                "measured_at": _short_clock(),
+            }
+        else:
+            self.downloads_meta = {"stale": False, "busy": False, "error": "", "measured_at": _short_clock()}
 
         hashes = [str(row.get("transmission_hash") or "") for row in records]
         hashes += [str(item.get("hash") or "") for item in queue]
@@ -1524,6 +1551,10 @@ class Agent:
 
         transmission = await self.transmission.test_connection()
         storage, torrents = await self._storage_status()
+        if transmission.get("stale"):
+            # Демон занят записью на диск: панель показывает последние известные
+            # данные с пометкой, а не прочерки и красную ошибку.
+            log.debug("Transmission занят: отдаю последние известные данные")
         payload = {
             "model": {
                 "name": self.settings.llm_model,
@@ -1542,6 +1573,42 @@ class Agent:
         }
         self._status_cache = (time.monotonic(), payload)
         return payload
+
+    async def restart_transmission(self) -> dict[str, Any]:
+        """Перезапуск Transmission из интерфейса.
+
+        Демон умеет намертво застрять в записи на внешний диск: процесс висит в
+        состоянии `U`, RPC молчит, и сам он себя не отпустит. До этого помогал
+        только терминал — теперь есть кнопка. Скачанное Transmission пересчитает
+        сам (возможна перепроверка частичных файлов), поэтому об этом честно
+        пишем в отчёте.
+        """
+        journal.add("transmission", "перезапуск из интерфейса", {})
+        result = await self.transmission.restart_daemon()
+        # Кэши описывают старый процесс — после перезапуска они врут.
+        self._status_cache = None
+        self._downloads_cache = None
+        self._storage_cache = None
+        self.downloads_meta = {
+            "stale": False,
+            "busy": False,
+            "error": "",
+            "measured_at": _short_clock(),
+        }
+        if result.get("ok"):
+            journal.add(
+                "transmission",
+                "Transmission перезапущен из интерфейса",
+                {"ждали": f"{result.get('waited', 0)} с"},
+            )
+        else:
+            journal.add(
+                "transmission",
+                "перезапуск Transmission не удался",
+                {"ошибка": result.get("error") or ""},
+                level="error",
+            )
+        return result
 
     async def _storage_status(self) -> tuple[dict[str, Any], dict[str, Any]]:
         """Состояние диска для «Служебного»: в потоке, с бюджетом и кэшем.
@@ -1571,6 +1638,7 @@ class Agent:
             storage = info.to_dict()
             storage["downloads_size_human"] = human_size(own_downloads)
             storage["torrents_size_human"] = human_size(own_torrents)
+            storage["checked_at"] = _short_clock()
             return storage, target_info(self.settings.torrents_dir).to_dict()
 
         try:
@@ -1582,24 +1650,44 @@ class Agent:
                 {"ошибка": f"{type(exc).__name__}: {exc}"},
                 level="warn",
             )
-            result = (
-                {
-                    "ok": False,
-                    "mounted": True,
-                    "writable": False,
-                    "volume": "",
-                    "path": str(self.settings.transmission_download_dir),
-                    "free_human": "—",
-                    "total_human": "—",
-                    "used_human": "—",
-                    "own_human": "—",
-                    "hidden_human": "—",
-                    "error": "диск не ответил за отведённое время",
-                },
-                {},
-            )
+            result = self._stale_storage()
         self._storage_cache = (time.monotonic(), result[0], result[1])
         return result
+
+    def _stale_storage(self) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Прошлые значения вместо прочерков, если диск занят записью.
+
+        Пока Transmission пишет 4K-сезон, `statvfs` и обход каталога на внешнем
+        томе могут не уложиться в бюджет. Раньше панель в этот момент писала
+        «диск не ответил» и обнуляла все цифры — хотя диск на месте и работает.
+        Теперь показываем последние известные данные с пометкой «устарели».
+        """
+        cached = getattr(self, "_storage_cache", None)
+        if cached and (cached[1] or {}).get("ok"):
+            storage = dict(cached[1])
+            storage.update(
+                {
+                    "stale": True,
+                    "error": "диск занят записью — данные от последней проверки",
+                }
+            )
+            return storage, dict(cached[2] or {})
+        return (
+            {
+                "ok": False,
+                "mounted": True,
+                "writable": False,
+                "volume": "",
+                "path": str(self.settings.transmission_download_dir),
+                "free_human": "—",
+                "total_human": "—",
+                "used_human": "—",
+                "own_human": "—",
+                "hidden_human": "—",
+                "error": "диск не ответил за отведённое время",
+            },
+            {},
+        )
 
     # ------------------------------------------------------------------
     # Разбор запроса и поиск
@@ -4644,13 +4732,18 @@ class Agent:
             [plan["episode"]] if plan.get("episode") is not None else []
         )
         pairs = self._as_pairs(raw_selected)
-        if not pairs and plan.get("kind") == "all" and torrent.episodes_total:
-            # «Весь сезон» целиком: раздача-пачка без выбранных серий. Тогда
-            # пишем весь диапазон из названия (1–8), а не «серия 1, серия 8».
-            if len(torrent.seasons) <= 1:
+        if not pairs and len(torrent.seasons) <= 1 and (torrent.episodes_total or torrent.seasons):
+            # Вся раздача целиком (весь сезон или мини-сериал) без выбранной
+            # серии: серии берём из файлов, которые реально качаем, а не из
+            # названия. В названии бывает «из 20», а в раздаче — один выпуск:
+            # записать тогда 20 серий значит соврать о прогрессе (из-за этого
+            # задача потом «ждала 21-ю серию»).
+            groups = plan.get("episodes") or []
+            if len(groups) > 1:
                 pairs = [
-                    {"season": torrent.season, "episode": number}
-                    for number in range(1, int(torrent.episodes_total) + 1)
+                    {"season": group.get("season"), "episode": group.get("episode")}
+                    for group in groups
+                    if group.get("episode") is not None
                 ]
         fallback_season = plan.get("season")
         episodes: list[dict[str, Any]] = []

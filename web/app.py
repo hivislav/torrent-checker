@@ -196,7 +196,16 @@ async def cancel_task(task_id: str, session: str = Depends(current_session)) -> 
 
 @app.get("/api/downloads")
 async def downloads(limit: int = 50, session: str = Depends(current_session)) -> dict[str, Any]:
-    return {"downloads": await agent.downloads(limit)}
+    items = await agent.downloads(limit)
+    # meta — «Transmission занят диском»: список может быть от прошлого удачного
+    # чтения, и панель должна сказать об этом, а не делать вид, что всё свежее.
+    return {"downloads": items, "meta": agent.downloads_meta}
+
+
+@app.post("/api/transmission/restart")
+async def transmission_restart(session: str = Depends(current_session)) -> dict[str, Any]:
+    """Перезапуск Transmission из панели: лечит зависший в записи демон."""
+    return await agent.restart_transmission()
 
 
 @app.get("/api/torrent/{torrent_id}/details")

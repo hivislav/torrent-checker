@@ -724,11 +724,25 @@
 
   async function refreshTasks() {
     try {
-      const [{ tasks }, { downloads }] = await Promise.all([
+      const [{ tasks }, { downloads, meta }] = await Promise.all([
         api("/api/tasks"),
         api("/api/downloads?limit=30"),
       ]);
       state.tasks = tasks;
+      // «Transmission занят диском»: список мог остаться от прошлого удачного
+      // чтения. Об этом лучше сказать прямо, чем показывать мёртвые проценты.
+      const busyNote = $("downloads-note");
+      if (busyNote) {
+        if (meta && meta.stale) {
+          busyNote.hidden = false;
+          busyNote.textContent =
+            `Transmission занят записью — список от ${meta.measured_at || "прошлой проверки"}, ` +
+            "проценты не обновляются.";
+        } else {
+          busyNote.hidden = true;
+          busyNote.textContent = "";
+        }
+      }
       if (state.taskId) {
         const current = tasks.find((task) => task.id === state.taskId);
         if (current) showCurrentTask(current.params?.title || current.user_query || "");
@@ -837,12 +851,23 @@
           ? `${mark(true)}${status.gate.logged_in ? " + сессия" : ""}`
           : `<span class="status-bad">${(status.gate.error || "нет связи").slice(0, 60)}</span>`,
       ]);
-      rows.push([
-        "transmission",
-        status.transmission.ok
-          ? `${mark(true)} ${status.transmission.version || ""}`
-          : `<span class="status-bad">${(status.transmission.error || "").slice(0, 80)}</span>`,
-      ]);
+      const tr = status.transmission || {};
+      if (tr.ok) {
+        rows.push(["transmission", `${mark(true)} ${tr.version || ""}`]);
+      } else if (tr.busy) {
+        // Демон пишет на диск в том же потоке, что отвечает на RPC. Ответа
+        // нет, но это не поломка: показываем последние известные данные.
+        const when = tr.measured_at ? ` · данные от ${tr.measured_at}` : "";
+        rows.push([
+          "transmission",
+          `<span class="status-warn" title="Transmission пишет большой файл на внешний диск и не успевает отвечать. Закачка при этом идёт — данные в панели от последнего удачного ответа.">занят записью на диск${when}</span>`,
+        ]);
+      } else {
+        rows.push([
+          "transmission",
+          `<span class="status-bad">${(tr.error || "").slice(0, 80)}</span>`,
+        ]);
+      }
       if (status.torrents) {
         const files = status.torrents;
         rows.push([
@@ -854,13 +879,14 @@
       }
       if (status.storage) {
         const disk = status.storage;
-        rows.push([
-          "диск",
-          disk.ok
-            ? `<b>${disk.volume || "?"}</b> · свободно ${disk.free_human} из ${disk.total_human}`
-            : `<span class="status-bad">${(disk.error || "нет доступа").slice(0, 80)}</span>`,
-        ]);
         if (disk.ok) {
+          const stale = disk.stale
+            ? ` <span class="status-warn" title="Диск занят записью: цифры с последней удачной проверки, а не текущие.">(от ${disk.checked_at || "—"})</span>`
+            : "";
+          rows.push([
+            "диск",
+            `<b>${disk.volume || "?"}</b> · свободно ${disk.free_human} из ${disk.total_human}${stale}`,
+          ]);
           // «Диск пуст, а место занято» — самая частая причина вопросов.
           // Показываем занятое и отдельно наши файлы, чтобы разница была видна.
           rows.push([
@@ -874,6 +900,11 @@
               `<span class="status-warn" title="Занято ${disk.used_human}, из них наши загрузки и torrent-файлы — ${disk.own_human}. Остальное — другие файлы на диске или его корзина (.Trashes): место вернётся после «Очистить корзину» в Finder.">${disk.hidden_human}</span> — чужие данные или корзина диска`,
             ]);
           }
+        } else {
+          rows.push([
+            "диск",
+            `<span class="status-bad">${(disk.error || "нет доступа").slice(0, 80)}</span>`,
+          ]);
         }
       }
       rows.push(["в работе", String(status.tasks.active)]);
@@ -884,6 +915,50 @@
       box.innerHTML = `<b>статус</b><span class="status-bad">${error.message}</span>`;
     } finally {
       statusBusy = false;
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Перезапуск Transmission
+  // ------------------------------------------------------------------
+  // Демон умеет застрять в записи на внешний диск: процесс висит в
+  // непрерываемом ожидании, RPC молчит, и сам себя он не отпустит — даже
+  // SIGTERM игнорируется. Раньше это лечилось только в терминале.
+  async function restartTransmission(button) {
+    if (state.busy) return;
+    const confirmed = await confirmDialog({
+      title: "Перезапустить Transmission?",
+      text:
+        "Приложение Transmission будет закрыто и запущено заново. Закачки продолжатся, " +
+        "но начатые файлы он может перепроверить — на большом сезоне это займёт время.",
+      confirmLabel: "Перезапустить",
+      danger: false,
+    });
+    if (!confirmed) return;
+    state.busy = true;
+    const label = button ? button.textContent : "";
+    if (button) {
+      button.disabled = true;
+      button.textContent = "перезапускаю…";
+    }
+    try {
+      const result = await api("/api/transmission/restart", { method: "POST", body: {} });
+      pushNotification({
+        kind: result.ok ? "info" : "error",
+        text: result.ok
+          ? `Transmission ${result.version || ""} поднялся за ${result.waited ?? "?"} с`
+          : `перезапуск: ${result.error || "не удалось"}`,
+      });
+      await refreshStatus();
+      await refreshTasks();
+    } catch (error) {
+      pushNotification({ kind: "error", text: `перезапуск: ${error.message}` });
+    } finally {
+      state.busy = false;
+      if (button) {
+        button.disabled = false;
+        button.textContent = label;
+      }
     }
   }
 
@@ -1518,6 +1593,9 @@
     });
 
     $("refresh-status").addEventListener("click", refreshStatus);
+    $("restart-transmission").addEventListener("click", (event) =>
+      restartTransmission(event.currentTarget)
+    );
     $("enable-notifications").addEventListener("click", enableNotifications);
     $("open-debug").addEventListener("click", openDebug);
     $("debug-close").addEventListener("click", closeDebug);
