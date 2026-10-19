@@ -637,11 +637,12 @@
         smallButton("Отменить", "btn btn--danger", async (event) => {
           event.target.disabled = true;
           try {
-            await api(`/api/tasks/${task.id}/cancel`, { method: "POST" });
+            const result = await api(`/api/tasks/${task.id}/cancel`, { method: "POST" });
             refreshStatus();
+            const note = result?.note ? `\n${result.note[0].toUpperCase()}${result.note.slice(1)}.` : "";
             renderMessage({
               role: "agent",
-              text: `Задача «${task.params?.title || task.user_query}» отменена.`,
+              text: `Задача «${task.params?.title || task.user_query}» отменена.${note}`,
               created_at: new Date().toISOString(),
             });
             refreshTasks();
@@ -654,6 +655,33 @@
     }
     card.appendChild(actions);
     return card;
+  }
+
+  // Подпись раздачи в «Скачано на диск»: одна раздача — одна строка, а серии
+  // перечислены внутри («сезон 2, серии 1–8»), а не пятью отдельными записями.
+  function downloadsLabel(item) {
+    const list = Array.isArray(item.episodes) ? item.episodes.filter((e) => e && e.episode) : [];
+    if (!list.length) {
+      const fallback = [item.season ? `сезон ${item.season}` : "", item.episode ? `серия ${item.episode}` : ""];
+      return fallback.filter(Boolean).join(", ");
+    }
+    const seasons = [...new Set(list.map((e) => e.season).filter((s) => s !== null && s !== undefined))];
+    const numbers = [...new Set(list.map((e) => Number(e.episode)))].sort((a, b) => a - b);
+    let body;
+    if (numbers.length === 1) {
+      body = `серия ${numbers[0]}`;
+    } else if (numbers[numbers.length - 1] - numbers[0] === numbers.length - 1) {
+      body = `серии ${numbers[0]}–${numbers[numbers.length - 1]}`;
+    } else {
+      body = `серии ${numbers.join(", ")}`;
+    }
+    if (seasons.length === 1) return `сезон ${seasons[0]}, ${body}`;
+    if (seasons.length > 1) {
+      const span = `${seasons[0]}–${seasons[seasons.length - 1]}`;
+      const count = numbers.length === 1 ? `серия ${numbers[0]}` : `${numbers.length} серий`;
+      return `сезоны ${span}, ${count}`;
+    }
+    return body;
   }
 
   function progressText(progress) {
@@ -742,9 +770,7 @@
         const meta = document.createElement("div");
         meta.className = "task-card__meta";
         const bits = [item.quality, item.voice].filter(Boolean).join(" · ");
-        meta.textContent = [bits, item.season ? `сезон ${item.season}` : "", item.episode ? `серия ${item.episode}` : ""]
-          .filter(Boolean)
-          .join(" · ");
+        meta.textContent = [bits, downloadsLabel(item)].filter(Boolean).join(" · ");
         row.appendChild(heading);
         const origin = item.source === "transmission" ? "добавлено в Transmission" : "";
         if (origin) {
@@ -1745,8 +1771,21 @@
     await openLatestConversation();
     await refreshStatus();
     connectEvents();
-    setInterval(refreshTasks, 5000);
-    setInterval(refreshStatus, 30000);
+    // Пока вкладка/приложение скрыты, ничего не опрашиваем: телефон в кармане
+    // не должен дёргать сервер и Transmission каждые 5 секунд. Вернулись —
+    // сразу обновляем.
+    const pollTasks = setInterval(() => {
+      if (!document.hidden) refreshTasks();
+    }, 5000);
+    const pollStatus = setInterval(() => {
+      if (!document.hidden) refreshStatus();
+    }, 30000);
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) {
+        refreshTasks();
+        refreshStatus();
+      }
+    });
   }
 
   document.addEventListener("DOMContentLoaded", init);

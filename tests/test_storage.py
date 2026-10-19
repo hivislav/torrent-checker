@@ -331,6 +331,51 @@ async def test_agent_message() -> None:
     agent.store.close()
 
 
+
+async def test_status_cached_offloop() -> None:
+    """Состояние диска: считается в потоке, кэшируется, не подвешивает цикл."""
+    print("\n== диск в статусе: в потоке и с кэшем ==")
+    import time
+
+    from types import SimpleNamespace as NS
+
+    tmp = Path(tempfile.mkdtemp(prefix="disk-status-"))
+    settings = dataclasses.replace(
+        get_settings(), data_dir=tmp, db_path=tmp / "s.sqlite3",
+        torrents_dir=tmp / "t", transmission_download_dir=tmp / "dl",
+    )
+    settings.torrents_dir.mkdir(parents=True, exist_ok=True)
+    settings.transmission_download_dir.mkdir(parents=True, exist_ok=True)
+    agent = Agent(settings)
+
+    calls = {"n": 0}
+
+    class SlowDisk:
+        def storage_info(self):
+            calls["n"] += 1
+            time.sleep(0.05)  # «спящий» диск: любой вызов медленный
+            return NS(
+                ok=True, mounted=True, writable=True, free=100 * 1024**3,
+                total=224 * 1024**3, error="", own_bytes=0, own_complete=True,
+                to_dict=lambda: {"ok": True, "volume": "EAGET", "free_human": "100 ГБ",
+                                 "total_human": "224 ГБ", "error": ""},
+            )
+
+    agent.transmission = SlowDisk()  # type: ignore[assignment]
+    started = time.monotonic()
+    storage, torrents = await agent._storage_status()  # noqa: SLF001
+    first = time.monotonic() - started
+    started = time.monotonic()
+    await agent._storage_status()  # noqa: SLF001
+    second = time.monotonic() - started
+    print(f"  первый вызов: {first:.3f} с, второй: {second:.3f} с, обращений к диску: {calls['n']}")
+    check("диск опрошен", storage.get("ok") is True, storage)
+    check("второй раз — из кэша, без обращения к диску", calls["n"] == 1, calls["n"])
+    check("кэш отвечает мгновенно", second < 0.01, second)
+    check("состояние каталога .torrent тоже вернулось", isinstance(torrents, dict), torrents)
+    agent.store.close()
+
+
 async def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="storage-test-"))
     test_sizes(tmp)
@@ -341,6 +386,7 @@ async def main() -> int:
     await test_real_add(tmp)
     await test_agent_refuses_without_torrent_dir()
     await test_agent_message()
+    await test_status_cached_offloop()
 
     print("\n=== ИТОГ ===")
     if FAILS:

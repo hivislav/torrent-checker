@@ -60,18 +60,32 @@ def _norm(path: str | Path) -> str:
     return real.rstrip(os.sep) or os.sep
 
 
+def _allocated_size(path: str) -> int:
+    """Сколько блоков реально занято — для недокачанных файлов это не st_size.
+
+    Transmission создаёт файл нужной длины сразу и дописывает кусками: st_size
+    у такого файла — полный размер серии (6 ГБ), а занято может быть 600 МБ.
+    Считать «освобождено» по st_size значит обещать место, которого не было.
+    """
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return 0
+    blocks = getattr(stat, "st_blocks", None)
+    if blocks:
+        return int(blocks) * 512
+    return int(stat.st_size)
+
+
 def path_size(path: Path) -> int:
     """Сколько занимает файл или папка (для отчёта «освобождено»)."""
     try:
         if path.is_file():
-            return path.stat().st_size
+            return _allocated_size(str(path))
         total = 0
         for root, _dirs, files in os.walk(path):
             for name in files:
-                try:
-                    total += os.path.getsize(os.path.join(root, name))
-                except OSError:
-                    continue
+                total += _allocated_size(os.path.join(root, name))
         return total
     except OSError:
         return 0

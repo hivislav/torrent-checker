@@ -96,6 +96,10 @@ class Settings:
     gate_chrome_path: str
     gate_headless: bool
     gate_profile_dir: Path
+    # Как часто шлюз сам обновляет cf_clearance, пока работает (минуты).
+    # 0 — не обновлять: тогда первый запрос после долгого простоя ждёт, пока
+    # Chrome заново пройдёт challenge.
+    gate_keepalive_minutes: int
 
     # --- контекст переписки ---
     # Сколько последних сообщений видит модель при разборе запроса. Больше —
@@ -179,6 +183,7 @@ def get_settings() -> Settings:
         ),
         gate_headless=_as_bool(get("GATE_HEADLESS"), False),
         gate_profile_dir=resolve(get("GATE_PROFILE_DIR", str(data_dir / "chrome-profile"))),
+        gate_keepalive_minutes=_as_int(get("GATE_KEEPALIVE_MINUTES"), 12),
         # .torrent-файлы лежат рядом с загрузками, на том же внешнем диске, но
         # в отдельной папке: их удобно разбирать руками, а Transmission не
         # путает их с данными раздач.
@@ -186,7 +191,7 @@ def get_settings() -> Settings:
         db_path=resolve(get("DB_PATH", str(data_dir / "agent.sqlite3"))),
         context_messages=_as_int(get("CONTEXT_MESSAGES"), 20),
         active_task_ttl_minutes=_as_int(get("ACTIVE_TASK_TTL_MINUTES"), 30),
-        default_interval_minutes=_as_int(get("DEFAULT_INTERVAL_MINUTES"), 30),
+        default_interval_minutes=_as_int(get("DEFAULT_INTERVAL_MINUTES"), 1440),
         min_interval_minutes=_as_int(get("MIN_INTERVAL_MINUTES"), 5),
         extra=env,
     )

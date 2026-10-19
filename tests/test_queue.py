@@ -135,9 +135,14 @@ async def test_record_survives_bad_plan() -> None:
     result = await agent._finalize_download(task, torrent, path, plan)  # noqa: SLF001
     check("постановка прошла", result.get("ok") is True, result)
     rows = await agent.store.list_downloads()
+    import json as _json
+    episodes = _json.loads(rows[0]["episodes"]) if rows else []
     print("  записей в памяти:", [(r.get("episode"), r.get("transmission_hash")) for r in rows])
+    print("  серии в записи:", [entry.get("episode") for entry in episodes])
     check("запись появилась", bool(rows), rows)
-    check("серии записаны по одной", sorted(r.get("episode") for r in rows) == [3, 4], rows)
+    check("запись одна на раздачу", len(rows) == 1, len(rows))
+    check("серии записаны списком внутри записи",
+          sorted(entry.get("episode") for entry in episodes) == [3, 4], episodes)
     check("хеш сохранён", all(r.get("transmission_hash") == "h9" for r in rows), rows)
 
     # А если хранилище вообще упало — задача не должна рухнуть.

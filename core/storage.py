@@ -64,12 +64,18 @@ CREATE TABLE IF NOT EXISTS downloads (
     added_at TEXT NOT NULL,
     -- Когда файл удалили с диска. Запись НЕ стирается: по ней агент помнит,
     -- что эта серия уже была, и не скачивает её повторно.
-    deleted_at TEXT
+    deleted_at TEXT,
+    -- Когда загрузка реально дошла до 100%. Пока NULL, раздача ещё качается
+    -- и в списке «Скачано на диск» не показывается (она — в «В работе»).
+    done_at TEXT,
+    -- Какие серии скачаны из этой раздачи: JSON-список
+    -- [{"season": 4, "episode": 7}, …]. Одна раздача — одна запись в списке
+    -- «Скачано на диск», даже если из неё взяли весь сезон.
+    episodes TEXT NOT NULL DEFAULT '[]'
 );
--- Уникальность по раздаче И серии: одна и та же раздача обновляется на трекере
--- и приносит новые выпуски, поэтому записей по ней может быть несколько.
-CREATE UNIQUE INDEX IF NOT EXISTS idx_downloads_episode
-    ON downloads(torrent_id, IFNULL(season, 0), IFNULL(episode, 0));
+-- Уникальный индекс «одна запись на раздачу» создаётся в _migrate(), а не здесь:
+-- в старых базах на одну раздачу могло быть несколько строк (по серии), и
+-- индекс не создался бы, пока они не слиты.
 CREATE INDEX IF NOT EXISTS idx_downloads_series ON downloads(series_key);
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -125,13 +131,80 @@ class Store:
             self._conn.execute("ALTER TABLE downloads ADD COLUMN name TEXT NOT NULL DEFAULT ''")
         if "deleted_at" not in columns:
             self._conn.execute("ALTER TABLE downloads ADD COLUMN deleted_at TEXT")
-        # Старый уникальный индекс «одна запись на раздачу» мешает запоминать
-        # несколько серий из одной и той же пачки — заменяем на составной.
-        self._conn.execute("DROP INDEX IF EXISTS idx_downloads_torrent")
+        if "episodes" not in columns:
+            self._conn.execute(
+                "ALTER TABLE downloads ADD COLUMN episodes TEXT NOT NULL DEFAULT '[]'"
+            )
+        if "done_at" not in columns:
+            self._conn.execute("ALTER TABLE downloads ADD COLUMN done_at TEXT")
+        # Одна раздача — одна запись. Старые базы держали по строке на серию:
+        # сначала снимаем старый составной индекс (он запрещает слияние), потом
+        # сливаем строки, и только затем ставим индекс «одна строка на раздачу».
+        self._conn.execute("DROP INDEX IF EXISTS idx_downloads_episode")
+        self._merge_download_rows()
         self._conn.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_downloads_episode "
-            "ON downloads(torrent_id, IFNULL(season, 0), IFNULL(episode, 0))"
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_downloads_torrent "
+            "ON downloads(torrent_id)"
         )
+
+    def _merge_download_rows(self) -> None:
+        """Схлопывает записи «по серии» в одну запись на раздачу."""
+        import json as _json
+
+        rows = self._conn.execute(
+            "SELECT * FROM downloads ORDER BY id"
+        ).fetchall()
+        by_torrent: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            item = dict(row)
+            by_torrent.setdefault(str(item["torrent_id"]), []).append(item)
+        for torrent_id, items in by_torrent.items():
+            if len(items) == 1 and (items[0].get("episodes") or "[]") not in ("", "[]"):
+                continue
+            pairs: list[dict[str, Any]] = []
+            seen: set[tuple[int | None, int]] = set()
+            for item in items:
+                stored = item.get("episodes") or "[]"
+                try:
+                    loaded = _json.loads(stored)
+                except (TypeError, ValueError):
+                    loaded = []
+                if not isinstance(loaded, list):
+                    loaded = []
+                if loaded:
+                    candidates = [
+                        (entry.get("season"), entry.get("episode"))
+                        for entry in loaded if isinstance(entry, dict)
+                    ]
+                else:
+                    candidates = [(item.get("season"), item.get("episode"))]
+                for season, episode in candidates:
+                    if episode is None:
+                        continue
+                    key = (season if season is not None else None, int(episode))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    pairs.append({"season": key[0], "episode": key[1]})
+            pairs.sort(key=lambda entry: (entry["season"] or 0, entry["episode"]))
+            seasons = {entry["season"] for entry in pairs if entry["season"] is not None}
+            keep = items[0]
+            alive = any(item.get("deleted_at") is None for item in items)
+            merged_season = next(iter(seasons)) if len(seasons) == 1 else None
+            last_episode = max((entry["episode"] for entry in pairs), default=None)
+            self._conn.execute(
+                "UPDATE downloads SET episodes = ?, season = ?, episode = ?, "
+                "deleted_at = ? WHERE id = ?",
+                (
+                    _json.dumps(pairs, ensure_ascii=False),
+                    merged_season,
+                    last_episode,
+                    None if alive else (items[0].get("deleted_at") or now_iso()),
+                    keep["id"],
+                ),
+            )
+            for item in items[1:]:
+                self._conn.execute("DELETE FROM downloads WHERE id = ?", (item["id"],))
 
     # ------------------------------------------------------------------
     # низкий уровень
@@ -239,17 +312,74 @@ class Store:
     # скачанное (память агента)
     # ------------------------------------------------------------------
     async def record_download(self, task: Task, torrent: Any, torrent_path: str,
-                              transmission_hash: str = "", torrent_name: str = "") -> None:
+                              transmission_hash: str = "", torrent_name: str = "",
+                              episodes: list[dict[str, Any]] | None = None) -> None:
+        """Запоминает раздачу одной строкой, а серии — списком внутри неё.
+
+        «Одна раздача — одна запись»: в списке «Скачано на диск» не должно быть
+        пяти строк только потому, что из пачки взяли пять серий. Для прогресса
+        (какую серию ждать дальше) серии лежат в `episodes` — по ним и считается
+        `episodes_by_season`.
+        """
+        import json as _json
+
+        pairs: list[dict[str, Any]] = []
+        for item in episodes or []:
+            try:
+                episode = int(item.get("episode"))  # type: ignore[union-attr]
+            except (TypeError, ValueError, AttributeError):
+                continue
+            season = item.get("season") if isinstance(item, dict) else None
+            try:
+                season = int(season) if season not in (None, "") else None
+            except (TypeError, ValueError):
+                season = None
+            pairs.append({"season": season, "episode": episode})
+        if not pairs and getattr(torrent, "episodes", None):
+            season = getattr(torrent, "season", None)
+            pairs = [
+                {"season": season, "episode": int(item)}
+                for item in torrent.episodes if item is not None
+            ]
+
         def run(conn: sqlite3.Connection) -> None:
+            existing = conn.execute(
+                "SELECT episodes FROM downloads WHERE torrent_id = ?", (str(torrent.id),)
+            ).fetchone()
+            merged: list[dict[str, Any]] = []
+            seen: set[tuple[int | None, int]] = set()
+            if existing is not None:
+                try:
+                    loaded = _json.loads(existing["episodes"] or "[]")
+                except (TypeError, ValueError):
+                    loaded = []
+                for entry in loaded if isinstance(loaded, list) else []:
+                    if not isinstance(entry, dict):
+                        continue
+                    key = (entry.get("season"), int(entry.get("episode") or 0))
+                    if key[1] and key not in seen:
+                        seen.add(key)
+                        merged.append({"season": key[0], "episode": key[1]})
+            for pair in pairs:
+                key = (pair["season"], pair["episode"])
+                if key not in seen:
+                    seen.add(key)
+                    merged.append(pair)
+            merged.sort(key=lambda entry: (entry["season"] or 0, entry["episode"]))
+            seasons = {entry["season"] for entry in merged if entry["season"] is not None}
+            latest = max((entry["episode"] for entry in merged), default=None)
             conn.execute(
                 "INSERT INTO downloads (task_id, torrent_id, title, name, series_key, "
                 "quality, voice, season, episode, size, upload_date, uploaded_ts, "
-                "torrent_path, transmission_hash, added_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
-                "ON CONFLICT(torrent_id, IFNULL(season, 0), IFNULL(episode, 0)) "
+                "torrent_path, transmission_hash, added_at, episodes, done_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(torrent_id) "
                 "DO UPDATE SET deleted_at = NULL, added_at = excluded.added_at, "
                 "torrent_path = excluded.torrent_path, "
-                "transmission_hash = excluded.transmission_hash",
+                "transmission_hash = excluded.transmission_hash, "
+                "episodes = excluded.episodes, season = excluded.season, "
+                "episode = excluded.episode, "
+                "done_at = COALESCE(downloads.done_at, excluded.done_at)",
                 (
                     task.id,
                     torrent.id,
@@ -258,14 +388,18 @@ class Store:
                     getattr(torrent, "series_key", "") or "",
                     torrent.quality,
                     torrent.voice,
-                    torrent.season,
-                    torrent.episode,
+                    next(iter(seasons)) if len(seasons) == 1 else None,
+                    latest,
                     torrent.size,
                     torrent.upload_date,
                     torrent.uploaded_ts,
                     torrent_path,
                     transmission_hash,
                     now_iso(),
+                    _json.dumps(merged, ensure_ascii=False),
+                    # Пока файл не докачан, записи в «Скачано» нет: её поставит
+                    # опрос прогресса, когда Transmission скажет «готово».
+                    None,
                 ),
             )
 
@@ -296,6 +430,34 @@ class Store:
             return dict(row) if row else None
 
         return await self._call(run)
+
+    async def mark_downloads_done(self, hashes: list[str]) -> None:
+        """Помечает записи завершёнными: только после этого они видны в «Скачано»."""
+        clean = [str(item) for item in hashes if item]
+        if not clean:
+            return
+
+        def run(conn: sqlite3.Connection) -> None:
+            placeholders = ",".join("?" for _ in clean)
+            conn.execute(
+                f"UPDATE downloads SET done_at = COALESCE(done_at, ?) "
+                f"WHERE transmission_hash IN ({placeholders})",
+                (now_iso(), *clean),
+            )
+
+        await self._call(run)
+
+    async def drop_download(self, torrent_id: str) -> None:
+        """Удаляет запись целиком.
+
+        Так делаем только с отменённым скачиванием: файлов нет, «уже скачано»
+        не наступило, и память о нём мешала бы взять раздачу снова.
+        """
+
+        def run(conn: sqlite3.Connection) -> None:
+            conn.execute("DELETE FROM downloads WHERE torrent_id = ?", (str(torrent_id),))
+
+        await self._call(run)
 
     async def forget_download(self, torrent_id: str) -> None:
         """Помечает скачанное удалённым, но НЕ стирает запись.
@@ -362,13 +524,29 @@ class Store:
         """
 
         def run(conn: sqlite3.Connection):
+            import json as _json
+
             cursor = conn.execute(
-                "SELECT season, MAX(episode) AS ep FROM downloads "
-                "WHERE series_key = ? AND season IS NOT NULL AND episode IS NOT NULL "
-                "GROUP BY season",
+                "SELECT season, episode, episodes FROM downloads WHERE series_key = ?",
                 (series_key,),
             )
-            return [(row["season"], row["ep"]) for row in cursor.fetchall()]
+            found: dict[int, int] = {}
+            for row in cursor.fetchall():
+                pairs: list[tuple[int | None, int]] = []
+                try:
+                    loaded = _json.loads(row["episodes"] or "[]")
+                except (TypeError, ValueError):
+                    loaded = []
+                for entry in loaded if isinstance(loaded, list) else []:
+                    if isinstance(entry, dict) and entry.get("episode") is not None:
+                        pairs.append((entry.get("season"), int(entry["episode"])))
+                if not pairs and row["season"] is not None and row["episode"] is not None:
+                    pairs.append((row["season"], int(row["episode"])))
+                for season, episode in pairs:
+                    if season is None:
+                        continue
+                    found[int(season)] = max(found.get(int(season), 0), episode)
+            return list(found.items())
 
         rows = await self._call(run)
         return {int(season): int(episode) for season, episode in rows}

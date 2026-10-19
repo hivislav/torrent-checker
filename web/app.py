@@ -190,7 +190,8 @@ async def cancel_task(task_id: str, session: str = Depends(current_session)) -> 
     if task is None:
         raise HTTPException(status_code=404, detail="задача не найдена")
     await agent.events.publish({"type": "task_cancelled", "task_id": task.id, "title": task.title})
-    return {"ok": True, "task": task.to_dict()}
+    # note — что сделали со скачиванием: «раздача убрана из очереди, удалено 2,1 ГБ».
+    return {"ok": True, "task": task.to_dict(), "note": task.last_result if task.state == "cancelled" else ""}
 
 
 @app.get("/api/downloads")

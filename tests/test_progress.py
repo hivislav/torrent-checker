@@ -62,6 +62,11 @@ class FakeTransmission:
         return {"ok": True, "name": "Проба", "hash": "h1",
                 "download_dir": str(self.download_dir), "files_selected": []}
 
+    async def list_torrents(self, limit: int = 200):  # noqa: D102
+        return [{"hash": key, "name": state.get("name", ""),
+                 "status": state.get("status", ""), "download_dir": str(self.download_dir)}
+                for key, state in self.state.items()]
+
 
 def build_agent() -> tuple[Agent, FakeTransmission]:
     tmp = Path(tempfile.mkdtemp(prefix="progress-"))
@@ -88,6 +93,122 @@ async def make_task(agent: Agent) -> Task:
     )
     await agent.store.save_task(task)
     return task
+
+
+async def test_cancel_stops_download() -> None:
+    """«Отменить» задачу на скачивание значит и убрать раздачу из очереди."""
+    print("\n== отмена задачи убирает раздачу из очереди ==")
+    agent, fake = build_agent()
+    task = await make_task(agent)
+    from core.models import Torrent
+
+    folder = Path(agent.settings.transmission_download_dir) / "Gangster"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "Gangster.S02E01.mkv").write_bytes(b"\x00" * (3 * 1024 * 1024))
+
+    await agent.store.record_download(
+        task, Torrent(id="777", title="Гангстерленд (2 сезон: 1-5 серии из 10)", size="5 ГБ",
+                      seasons=[2], episodes=[1, 5], episodes_total=10),
+        str(agent.settings.torrents_dir / "777.torrent"), "h1", torrent_name="Gangster",
+        episodes=[{"season": 2, "episode": 1}],
+    )
+    fake.removed = []
+    fake.state["h1"] = {
+        "hash": "h1", "name": "Gangster", "percent": 13.0, "done": False,
+        "rate": 0, "rate_human": "", "eta_seconds": None, "eta_human": "",
+        "size": 5 * 1024**3, "size_human": "5 ГБ",
+        "downloaded_human": "0,6 ГБ", "left_human": "4,4 ГБ", "status": "downloading",
+    }
+    # фейку нужен find_by_hash, чтобы отмена знала папку и файлы
+    async def find_by_hash(torrent_hash):  # noqa: D102
+        return {"hash": torrent_hash, "name": "Gangster",
+                "download_dir": str(agent.settings.transmission_download_dir), "files": []}
+
+    fake.find_by_hash = find_by_hash  # type: ignore[assignment]
+    fake.remove = _remover(fake)  # type: ignore[assignment]
+
+    cancelled = await agent.cancel_task("dl")
+    assert cancelled is not None
+    print("  задача:", cancelled.state, "| примечание:", cancelled.last_result)
+    print("  убрано из очереди:", fake.removed)
+    check("задача отменена", cancelled.state == "cancelled", cancelled.state)
+    check("раздача убрана из Transmission", fake.removed == ["h1"], fake.removed)
+    check("недокачанное удалено с диска", not folder.exists())
+    check("запись о скачанном удалена", not await agent.store.list_downloads(),
+          await agent.store.list_downloads())
+    check("в примечании сказано, что сделали", "убрана из очереди" in (cancelled.last_result or ""),
+          cancelled.last_result)
+
+    print("  -- отмена уже докачанной раздачи --")
+    tr_task = await make_task(agent)
+    tr_task.id = "dl2"
+    await agent.store.save_task(tr_task)
+    fake.state["h1"]["done"] = True
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "Gangster.S02E01.mkv").write_bytes(b"\x01" * 1024)
+    done_task = await agent.cancel_task("dl2")
+    assert done_task is not None
+    print("  примечание:", done_task.last_result, "| папка цела:", folder.exists())
+    check("докачанное не удаляем", folder.exists())
+    check("и говорим об этом", "докачана" in (done_task.last_result or ""), done_task.last_result)
+    agent.store.close()
+
+
+def _remover(fake):
+    async def remove(torrent_hash, *, delete_data=False):  # noqa: D102
+        fake.removed.append(torrent_hash)
+        return {"ok": True}
+    return remove
+
+
+async def test_hidden_until_done() -> None:
+    """«Скачано на диск» — только после завершения, а не в момент постановки."""
+    print("\n== пока качается, в «Скачано» ничего нет ==")
+    agent, fake = build_agent()
+    task = await make_task(agent)
+    from core.models import Torrent
+
+    await agent.store.record_download(
+        task, Torrent(id="777", title="Гангстерленд (2 сезон: 1-5 серии из 10)",
+                      size="5 ГБ", seasons=[2], episodes=[1, 5], episodes_total=10),
+        "/tmp/777.torrent", "h1", torrent_name="Gangster.S02",
+        episodes=[{"season": 2, "episode": n} for n in range(1, 6)],
+    )
+    fake.state["h1"] = {
+        "hash": "h1", "name": "Gangster.S02", "percent": 12.0, "done": False,
+        "rate": 0, "rate_human": "", "eta_seconds": None, "eta_human": "",
+        "size": 5 * 1024**3, "size_human": "5 ГБ",
+        "downloaded_human": "0,6 ГБ", "left_human": "4,4 ГБ", "status": "downloading",
+    }
+    agent._downloads_cache = None  # сбрасываем кэш списка (он на 3 секунды)  # noqa: SLF001
+    items = await agent.downloads()
+    print("  пока качается — записей в «Скачано»:", len(items))
+    check("пока качается, в «Скачано» пусто", items == [], items)
+    rows = await agent.store.list_downloads()
+    check("но в памяти агента раздача уже есть", len(rows) == 1, len(rows))
+    check("и она ещё не помечена завершённой", not rows[0].get("done_at"), rows[0].get("done_at"))
+
+    print("  -- загрузка завершилась --")
+    fake.state["h1"] = {
+        "hash": "h1", "name": "Gangster.S02", "percent": 100.0, "done": True,
+        "rate": 0, "rate_human": "", "eta_seconds": None, "eta_human": "",
+        "size": 5 * 1024**3, "size_human": "5 ГБ",
+        "downloaded_human": "5 ГБ", "left_human": "0 Б", "status": "seeding",
+    }
+    agent._downloads_cache = None  # noqa: SLF001
+    items = await agent.downloads()
+    print("  после завершения — записей:", len(items),
+          "| серии:", len(items[0]["episodes"]) if items else 0)
+    check("после завершения раздача в «Скачано»", len(items) == 1, items)
+    rows = await agent.store.list_downloads()
+    check("и помечена завершённой", bool(rows[0].get("done_at")), rows[0].get("done_at"))
+    check("серии внутри одной записи", len(items[0]["episodes"]) == 5,
+          items[0]["episodes"] if items else None)
+    agent.store.close()
+
+
+async def main() -> int:
+    print("\n== прогресс загрузки ==")
 
 
 async def main() -> int:
@@ -187,6 +308,8 @@ async def main() -> int:
     check("завершённая задача остаётся завершённой", again.state == "done", again.state)
     agent.store.close()
 
+    await test_hidden_until_done()
+    await test_cancel_stops_download()
     print("\n=== ИТОГ ===")
     if FAILS:
         for name in FAILS:

@@ -279,7 +279,12 @@ async def test_auto_download() -> None:
     check("серия найдена и скачана автоматически", len(added) == 1, added)
     check("выбран только 3-й файл", added and added[-1]["files"] == [2], added[-1:] or None)
     rows = await agent.store.list_downloads()
-    check("в память записана серия 3", [r["episode"] for r in rows] == [3], [r["episode"] for r in rows])
+    import json as _json
+    episodes = _json.loads(rows[0]["episodes"]) if rows else []
+    print("  запись о скачанном:", len(rows), "| серии:", [e["episode"] for e in episodes])
+    check("одна запись на раздачу", len(rows) == 1, len(rows))
+    check("в память записана серия 3", [e["episode"] for e in episodes] == [3],
+          [e["episode"] for e in episodes])
 
     print("\n  -- проверка без изменений --")
     before = len(transmission.added)
@@ -292,8 +297,11 @@ async def test_auto_download() -> None:
     check("скачана только 4-я серия", transmission.added[-1]["files"] == [3],
           transmission.added[-1])
     rows = await agent.store.list_downloads()
-    check("в памяти серии 3 и 4", sorted(r["episode"] for r in rows) == [3, 4],
-          [r["episode"] for r in rows])
+    episodes = _json.loads(rows[0]["episodes"]) if rows else []
+    print("  записей:", len(rows), "| серии:", [e["episode"] for e in episodes])
+    check("по-прежнему одна запись на раздачу", len(rows) == 1, len(rows))
+    check("в памяти серии 3 и 4", sorted(e["episode"] for e in episodes) == [3, 4],
+          [e["episode"] for e in episodes])
     agent.store.close()
 
 
@@ -482,7 +490,19 @@ async def test_nothing_at_all() -> None:
     check("сказано, что на трекере пусто", "ничего нет" in text, text[:200])
     check("задача ждёт выбора режима", task.state == "awaiting_confirm", task.state)
     labels = [action.label for action in turn.messages[-1].actions]
-    check("можно включить автокачку", "Качать сразу и сообщать" in labels, labels)
+    check("режим спрашивается не сразу, а в резюме",
+          "Качать сразу и сообщать" not in labels, labels)
+    check("есть кнопка «следить строго» с условиями",
+          any(label.startswith("Следить строго") for label in labels), labels)
+    summary = await agent.handle_action(
+        "checks", "periodic_pick", {"task_id": task.id, "variant": "strict"}
+    )
+    summary_labels = [action.label for action in summary.messages[-1].actions]
+    print("  резюме:", summary.messages[-1].text.replace("\n", " | ")[:160])
+    check("в резюме можно включить автокачку",
+          "Качать сразу и сообщать" in summary_labels, summary_labels)
+    check("в резюме есть «Только сообщать» и «Отмена»",
+          "Только сообщать" in summary_labels and "Отмена" in summary_labels, summary_labels)
 
     # подтверждаем автокачку — задача уходит в мониторинг
     confirm = await agent.handle_action(
@@ -595,7 +615,8 @@ async def test_listing_before_torrent() -> None:
     assert task is not None
     print("  .torrent-файлов скачано:", mcp.downloads, "| страниц раздачи:", mcp.listing_calls)
     check("лимит не тратится, когда новой серии нет", mcp.downloads == 0, mcp.downloads)
-    check("состав раздачи спросили у страницы", mcp.listing_calls >= 1, mcp.listing_calls)
+    check("и страницу раздачи не спрашивали — нового нет", mcp.listing_calls == 0,
+          mcp.listing_calls)
     check("в Transmission пусто", not transmission.added, transmission.added)
 
     # Появился 3-й — теперь .torrent нужен, и он скачивается ровно один раз.
@@ -603,7 +624,8 @@ async def test_listing_before_torrent() -> None:
     await agent.check_task(task)
     task = await agent.store.get_task(task.id)
     assert task is not None
-    print("  .torrent-файлов скачано:", mcp.downloads)
+    print("  .torrent-файлов скачано:", mcp.downloads, "| страниц раздачи:", mcp.listing_calls)
+    check("состав раздачи спросили у страницы", mcp.listing_calls >= 1, mcp.listing_calls)
     check("торрент-файл скачан, когда серия появилась", mcp.downloads == 1, mcp.downloads)
     check("скачана именно 3-я серия",
           bool(transmission.added) and transmission.added[-1]["files"] == [2],
@@ -725,6 +747,230 @@ async def test_refine_periodic() -> None:
     agent.store.close()
 
 
+async def test_strict_conditions() -> None:
+    """«Прайм-тайм 2026 в 4K» при наличии только 2024 года: ничего не качаем."""
+    print("\n== периодическая задача не хватает чужое ==")
+    from core.models import Turn
+
+    agent, mcp, transmission = build_agent()
+    mcp.custom_rows = [
+        {"id": "2085056",
+         "title": "Злодейка прайм-тайма / A Vilã das Nove / 2024 / ЛМ / WEB-DLRip (AVC)",
+         "size": "1.95 ГБ", "seeds": 3, "peers": 0, "comments": 0,
+         "uploadDate": "09.04.2025 в 07:36", "uploader": "R", "category": "17"},
+        {"id": "1896787", "title": "Прайм-тайм / Prime Time / 2024 / ЛМ / WEB-DL (1080p)",
+         "size": "2.4 ГБ", "seeds": 5, "peers": 1, "comments": 2,
+         "uploadDate": "10.05.2025 в 10:00", "uploader": "x", "category": "17"},
+    ]
+    mcp.custom_files = {"2085056": 1, "1896787": 1}
+    tasks_before = len(await agent.store.list_tasks(limit=100))
+
+    turn = Turn()
+    await agent._start_periodic(  # noqa: SLF001
+        "s1", "Прайм-тайм 2026 скачай как появится 4к",
+        {"title": "Прайм-тайм", "year": 2026, "quality": "2160p",
+         "interval_minutes": 1440, "auto_download": True},
+        turn,
+    )
+    task = turn.task
+    message = turn.messages[-1]
+    text = message.text
+    print("  карточка:", text.replace("\n", " | ")[:220])
+    labels = [action.label for action in message.actions]
+    print("  кнопки:", labels)
+
+    check("сказано, что под условия ничего нет", "ничего нет" in text, text[:200])
+    check("условия названы честно", "2026" in text and "2160p" in text, text[:200])
+    check("чужой фильм не показан как найденный", "Сейчас подходит" not in text, text[:120])
+    check("кандидата на скачивание нет", not task.candidate, task.candidate)
+    check("базовая линия пустая", not task.params.get("baseline_episodes"),
+          task.params.get("baseline_episodes"))
+    check("есть кнопка «следить строго» с условиями",
+          any(label.startswith("Следить строго") and "2026" in label for label in labels),
+          labels)
+    check("на каждый похожий вариант есть кнопка",
+          sum(1 for label in labels if label.startswith("Следить:")) >= 1, labels)
+    check("к похожим вариантам есть «Подробнее»",
+          labels.count("Подробнее") >= 1, labels)
+    check("режим не спрашивается на шаге выбора",
+          "Качать сразу и сообщать" not in labels, labels)
+    check("задача не создала новых задач",
+          len(await agent.store.list_tasks(limit=100)) == tasks_before + 1,
+          (tasks_before, len(await agent.store.list_tasks(limit=100))))
+
+    # Подтверждаем режим: ничего не скачивается, задача просто встаёт в работу.
+    await agent.handle_action("s1", "periodic_pick", {"task_id": task.id, "variant": "strict"})
+    await agent.handle_action("s1", "periodic_auto", {"task_id": task.id})
+    task = await agent.store.get_task(task.id)
+    print("  после подтверждения:", task.state, "| постановок:", transmission.added)
+    check("после подтверждения ничего не качается", not transmission.added, transmission.added)
+    check("задача в работе", task.state == "monitoring", task.state)
+    check("подтверждение не создало задачу",
+          len(await agent.store.list_tasks(limit=100)) == tasks_before + 1)
+
+    # Проверка по расписанию тоже ничего не тянет: условия не выполнены.
+    await agent.check_task(task)
+    check("плановая проверка ничего не качает", not transmission.added, transmission.added)
+    check("и не тратит торрент-файлы", mcp.downloads == 0, mcp.downloads)
+
+    # Пользователь сам выбирает похожий вариант кнопкой — тогда раздача видна.
+    near_action = next(
+        action for action in message.actions if action.kind == "periodic_pick"
+        and str(action.payload.get("variant", "")).startswith("near:")
+    )
+    relaxed = await agent.handle_action(
+        "s1", "periodic_pick",
+        {"task_id": task.id, "variant": near_action.payload["variant"]},
+    )
+    relaxed_text = " ".join(item.text for item in relaxed.messages)
+    print("  после выбора варианта:", relaxed_text.replace("\n", " | ")[:200])
+    check("после выбора варианта раздача видна", "Сейчас подходит" in relaxed_text,
+          relaxed_text[:200])
+    task = await agent.store.get_task(task.id)
+    print("  условия варианта:", {k: task.params.get(k) for k in ("year", "quality")})
+    check("условия взяты из выбранной раздачи",
+          str(task.params.get("year")) == "2024", task.params.get("year"))
+    check("выбор варианта не создал задачу",
+          len(await agent.store.list_tasks(limit=100)) == tasks_before + 1)
+    agent.store.close()
+
+
+async def test_make_periodic_in_place() -> None:
+    print("\n== «сделать периодической» не плодит задачи ==")
+    agent, mcp, transmission = build_agent()
+    mcp.custom_rows = [
+        {"id": "900", "title": "Тихий омут / 2026 / ДБ / WEB-DL (1080p)", "size": "3 ГБ",
+         "seeds": 5, "peers": 0, "comments": 0, "uploadDate": "18.10.2026 в 10:00",
+         "uploader": "x", "category": "17"},
+    ]
+    mcp.custom_files = {"900": 1}
+    from core.models import Turn
+
+    turn = Turn()
+    await agent._start_oneshot(  # noqa: SLF001
+        "s2", "Тихий омут", {"title": "Тихий омут"}, turn,
+    )
+    task = turn.task
+    oneshot_id = task.id
+    count_before = len(await agent.store.list_tasks(limit=100))
+    print("  разовая задача:", oneshot_id, "| задач в базе:", count_before)
+
+    follow = await agent.handle_action(
+        "s2", "make_periodic", {"task_id": oneshot_id, "interval_minutes": 60}
+    )
+    same = await agent.store.get_task(oneshot_id)
+    print("  после кнопки: kind =", same.kind, "| id тот же:", same.id == oneshot_id,
+          "| задач:", len(await agent.store.list_tasks(limit=100)))
+    check("задача стала периодической на месте", same.kind == "periodic", same.kind)
+    check("id не изменился", same.id == oneshot_id, same.id)
+    check("новых задач в базе не появилось",
+          len(await agent.store.list_tasks(limit=100)) == count_before,
+          (count_before, len(await agent.store.list_tasks(limit=100))))
+    check("показана карточка периодической задачи",
+          any("проверять" in message.text for message in follow.messages),
+          [message.text[:60] for message in follow.messages])
+    agent.store.close()
+
+
+async def test_refine_settings() -> None:
+    """«Проверяй раз в сутки» и «только сообщай» меняют задачу, а не путают."""
+    print("\n== уточнение расписания и режима словами ==")
+    from core.models import Turn
+
+    agent, mcp, transmission = build_agent()
+    task = await create_task(agent, auto=True)
+    assert task is not None
+    check("интервал из запроса", task.interval_minutes == 60, task.interval_minutes)
+
+    turn = Turn()
+    await agent._refine_task(task, {"interval_minutes": 1440}, "проверяй раз в сутки", turn)  # noqa: SLF001
+    task = await agent.store.get_task(task.id)
+    assert task is not None
+    text = " ".join(message.text for message in turn.messages)
+    print("  ответ:", text.replace("\n", " | ")[:160])
+    print("  интервал:", task.interval_minutes, "| next:", task.next_check_at)
+    check("интервал обновился", task.interval_minutes == 1440, task.interval_minutes)
+    check("задача осталась в работе", task.state == "monitoring", task.state)
+    check("сказано, что именно изменилось", "раз в сутки" in text, text[:160])
+    check("расписание пересчитано", bool(task.next_check_at), task.next_check_at)
+
+    # Режим: «только сообщай»
+    turn = Turn()
+    await agent._refine_task(task, {"auto_download": False}, "только сообщай", turn)  # noqa: SLF001
+    task = await agent.store.get_task(task.id)
+    assert task is not None
+    text = " ".join(message.text for message in turn.messages)
+    print("  ответ:", text.replace("\n", " | ")[:160])
+    check("режим стал «только сообщать»", task.auto_download is False, task.auto_download)
+    check("сказано про режим", "только сообщаю" in text or "сообщать" in text, text[:160])
+
+    # Ничего не изменилось — честное «уже так и настроено», без новых задач.
+    count = len(await agent.store.list_tasks(limit=100))
+    turn = Turn()
+    await agent._refine_task(task, {"interval_minutes": 1440}, "проверяй раз в сутки", turn)  # noqa: SLF001
+    text = " ".join(message.text for message in turn.messages)
+    print("  ответ:", text.replace("\n", " | ")[:120])
+    check("повтор ничего не ломает", "настроено" in text, text[:120])
+    check("уточнения не создали задач",
+          len(await agent.store.list_tasks(limit=100)) == count, count)
+    agent.store.close()
+
+
+async def test_cancel_only_in_panel() -> None:
+    """Отмена уже следящей задачи — только в карточке «В работе», не в чате."""
+    print("\n== отмена: только в карточке, не в чате ==")
+    from core.models import Turn
+
+    agent, mcp, transmission = build_agent()
+    task = await create_task(agent, auto=True)
+    assert task is not None
+    task = await agent.store.get_task(task.id)
+    assert task is not None
+    check("задача следит", task.state == "monitoring", task.state)
+
+    labels = [action.label for action in agent._task_actions(task)]  # noqa: SLF001
+    print("  кнопки под сообщением в monitoring:", labels)
+    check("в чате есть «Проверить сейчас»", "Проверить сейчас" in labels, labels)
+    check("в чате нет «Отменить задачу»", "Отменить задачу" not in labels, labels)
+
+    # То же после уточнения задачи — отмена тоже не появляется.
+    turn = Turn()
+    await agent._refine_task(task, {"interval_minutes": 1440}, "проверяй раз в сутки", turn)  # noqa: SLF001
+    labels = [action.label for action in turn.messages[-1].actions]
+    print("  кнопки в ответе на уточнение:", labels)
+    check("после уточнения отмены в чате нет", "Отменить задачу" not in labels, labels)
+
+    # Пока задача не в работе, кнопка отмены в чате нужна: карточки может не быть под рукой.
+    task.state = "awaiting_confirm"
+    labels = [action.label for action in agent._task_actions(task)]  # noqa: SLF001
+    print("  кнопки до старта:", labels)
+    check("до старта «Отменить задачу» остаётся", "Отменить задачу" in labels, labels)
+    agent.store.close()
+
+
+async def test_default_interval() -> None:
+    """Если период не назван — проверка раз в сутки."""
+    print("\n== период по умолчанию ==")
+    from core.models import Turn
+
+    agent, mcp, transmission = build_agent()
+    turn = Turn()
+    await agent._start_periodic(  # noqa: SLF001
+        "s1", "Сериал без названного периода",
+        {"title": "Сериал без названного периода"},  # interval_minutes нет
+        turn,
+    )
+    task = turn.task
+    print("  интервал:", task.interval_minutes, "мин")
+    check("по умолчанию — сутки", task.interval_minutes == 1440, task.interval_minutes)
+    text = turn.messages[-1].text
+    check("в карточке написано «раз в сутки»", "раз в сутки" in text, text[:120])
+    check("это значение из настроек",
+          task.interval_minutes == agent.settings.default_interval_minutes,
+          (task.interval_minutes, agent.settings.default_interval_minutes))
+    agent.store.close()
+
+
 def test_name_matching() -> None:
     print("\n== поиск не цепляет чужие сериалы ==")
     from core.matching import title_match
@@ -758,6 +1004,11 @@ async def main() -> int:
     await test_listing_before_torrent()
     await test_pack_needs_choice()
     await test_refine_periodic()
+    await test_strict_conditions()
+    await test_make_periodic_in_place()
+    await test_refine_settings()
+    await test_cancel_only_in_panel()
+    await test_default_interval()
     test_name_matching()
 
     print("\n=== ИТОГ ===")

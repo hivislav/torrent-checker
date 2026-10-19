@@ -114,6 +114,38 @@ ensure_cert() {
 }
 
 # ----------------------------------------------------------------------
+# Запуск под caffeinate: пока агент работает, система не засыпает от простоя, а
+# внешний диск не уходит в сон. Без этого macOS через 10 минут тишины паркует
+# диск (pmset disksleep 10): Transmission блокируется на записи, первый же
+# запрос RPC отваливается по таймауту, и после простоя всё «тормозит».
+# Отключается строкой CAFFEINATE=0 в .env.
+keep_awake_prefix() {
+  local value
+  value="$(setting CAFFEINATE 1)"
+  if [ "$value" = "0" ] || ! command -v caffeinate >/dev/null 2>&1; then
+    return 0
+  fi
+  printf 'caffeinate -i -m'
+}
+
+# background start: пишет pid в файл и подменяет себя нужной командой, чтобы
+# pid в файле был именно у процесса (иначе остановка убивала бы caffeinate,
+# а сервер оставался жить).
+start_bg() {
+  local pid_file="$1" log_file="$2"
+  shift 2
+  local prefix
+  prefix="$(keep_awake_prefix)"
+  if [ -n "$prefix" ]; then
+    # shellcheck disable=SC2086
+    nohup $prefix bash -c 'echo $$ > "$1"; shift; exec "$@"' _ "$pid_file" "$@" \
+      >>"$log_file" 2>&1 &
+  else
+    nohup "$@" >>"$log_file" 2>&1 &
+    echo $! > "$pid_file"
+  fi
+}
+
 is_running() { [ -f "$1" ] && kill -0 "$(cat "$1")" 2>/dev/null; }
 pid_of() { [ -f "$1" ] && cat "$1" || echo ""; }
 
@@ -140,10 +172,8 @@ start_gate() {
     return
   fi
   echo "поднимаю шлюз Cloudflare на ${GATE_HOST}:${GATE_PORT} (Chrome стартует при первом запросе)"
-  nohup "$PY" -m uvicorn services.gate_service:app \
-    --host "$GATE_HOST" --port "$GATE_PORT" --log-level info \
-    >>"$GATE_LOG" 2>&1 &
-  echo $! > "$GATE_PID"
+  start_bg "$GATE_PID" "$GATE_LOG" "$PY" -m uvicorn services.gate_service:app \
+    --host "$GATE_HOST" --port "$GATE_PORT" --log-level info
   for _ in $(seq 1 40); do
     if curl -sf "http://${GATE_HOST}:${GATE_PORT}/health" >/dev/null 2>&1; then
       echo "шлюз отвечает"
@@ -167,10 +197,8 @@ start_web() {
     scheme="https"
   fi
   echo "запускаю сайт на ${SITE_HOST}:${SITE_PORT} (${scheme})"
-  nohup "$PY" -m uvicorn web.app:app \
-    --host "$SITE_HOST" --port "$SITE_PORT" --log-level info "${extra[@]}" \
-    >>"$WEB_LOG" 2>&1 &
-  echo $! > "$WEB_PID"
+  start_bg "$WEB_PID" "$WEB_LOG" "$PY" -m uvicorn web.app:app \
+    --host "$SITE_HOST" --port "$SITE_PORT" --log-level info "${extra[@]}"
   for _ in $(seq 1 40); do
     if curl -skf "${scheme}://127.0.0.1:${SITE_PORT}/health" >/dev/null 2>&1; then
       echo "сайт отвечает"

@@ -30,6 +30,26 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 gate = CloudflareGate()
 
 
+async def _keepalive_loop(minutes: int) -> None:
+    """Раз в N минут обновляет cf_clearance, пока шлюз работает.
+
+    Без этого после долгого простоя первый же запрос к трекеру ждёт, пока
+    Chrome заново пройдёт challenge (десятки секунд) — в интерфейсе это
+    выглядит как «всё подвисло, пока я не подходил к компьютеру». Раз в
+    10–15 минут страница трекера открывается сама, cookie остаётся живой.
+    """
+    while True:
+        try:
+            await asyncio.sleep(max(60, minutes * 60))
+            await gate.refresh_clearance()
+            log.debug("cf_clearance обновлён по расписанию")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - шлюз не должен падать
+            log.warning("не удалось обновить cf_clearance: %s", exc)
+            await asyncio.sleep(60)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     # Общий журнал отладки: события шлюза должны быть видны в интерфейсе сайта.
@@ -39,7 +59,14 @@ async def lifespan(_: FastAPI):
         log.info("шлюз Cloudflare поднят")
     except Exception as exc:  # noqa: BLE001 - сервис должен жить и уметь пожаловаться
         log.error("не удалось поднять Chrome: %s", exc)
+    keepalive = None
+    minutes = int(getattr(get_settings(), "gate_keepalive_minutes", 0) or 0)
+    if minutes > 0:
+        keepalive = asyncio.create_task(_keepalive_loop(minutes))
+        log.info("cf_clearance будет обновляться каждые %s мин", minutes)
     yield
+    if keepalive is not None:
+        keepalive.cancel()
     await gate.stop()
 
 

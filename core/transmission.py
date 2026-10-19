@@ -114,6 +114,53 @@ class Transmission:
         self._session_synced = False
         return self._client
 
+    def _reset_client(self) -> None:
+        """Забывает соединение: следующий вызов откроет новое.
+
+        После простоя (сон диска, засыпание экрана, пауза машины) старый сокет
+        уже мёртв, и первый запрос висит до таймаута. Переподключение дешевле.
+        """
+        self._client = None
+        self._sig = None
+        self._session_synced = False
+
+    async def _run(self, fn, *, budget: float = 8.0):
+        """Блокирующий вызов RPC: короткий бюджет и один повтор с новым клиентом.
+
+        Клиент transmission-rpc синхронный, поэтому вызов уходит в поток. Таймаут
+        библиотеки — 20 с, и после простоя это ровно те «зависшие» ответы в
+        интерфейсе. Здесь бюджет короче, а при таймауте соединение сбрасывается
+        и попытка повторяется — обычно второй раз отвечает мгновенно.
+        """
+        import transmission_rpc as trpc
+
+        transient = (
+            asyncio.TimeoutError,
+            trpc.TransmissionTimeoutError,
+            trpc.TransmissionConnectError,
+            ConnectionError,
+            OSError,
+        )
+        last: Exception | None = None
+        for attempt in (1, 2):
+            try:
+                return await asyncio.wait_for(asyncio.to_thread(fn), timeout=budget)
+            except transient as exc:  # noqa: PERF203 - два подхода, не цикл
+                last = exc
+                self._reset_client()
+                journal.add(
+                    "transmission",
+                    "RPC не ответил — переподключаюсь",
+                    {"попытка": attempt, "ошибка": f"{type(exc).__name__}: {exc}"},
+                    level="warn",
+                )
+            except Exception:
+                self._reset_client()
+                raise
+        raise TransmissionError(
+            f"Transmission не ответил за {int(budget)} с: {type(last).__name__}"
+        )
+
     @staticmethod
     def _explain(exc: Exception) -> str:
         text = str(exc)
@@ -207,7 +254,7 @@ class Transmission:
             }
 
         try:
-            result = await asyncio.to_thread(run)
+            result = await self._run(run, budget=6.0)
         except Exception as exc:  # noqa: BLE001
             self._client = None
             return {"ok": False, "error": self._explain(exc)}
@@ -243,7 +290,7 @@ class Transmission:
                 log.debug("Transmission: каталог загрузок уже %s", target)
 
         try:
-            await asyncio.to_thread(run)
+            await self._run(run, budget=15.0)
             self._session_synced = True
         except Exception as exc:  # noqa: BLE001 - не смертельно: путь передаём явно
             log.warning("не удалось обновить настройки каталога Transmission: %s", exc)
@@ -308,7 +355,7 @@ class Transmission:
             }
 
         try:
-            result = await asyncio.to_thread(run)
+            result = await self._run(run)
             journal.add(
                 "transmission",
                 f"в очередь: {result.get('name') or torrent_path.name}",
@@ -377,7 +424,7 @@ class Transmission:
             return result
 
         try:
-            return await asyncio.to_thread(run)
+            return await self._run(run)
         except Exception as exc:  # noqa: BLE001
             log.warning("не удалось получить прогресс: %s", exc)
             return {}
@@ -410,7 +457,7 @@ class Transmission:
                 }
             return None
 
-        return await asyncio.to_thread(run)
+        return await self._run(run)
 
     async def remove(self, torrent_hash: str, *, delete_data: bool = False) -> dict[str, Any]:
         """Убирает раздачу из очереди.
@@ -444,7 +491,7 @@ class Transmission:
             return {"ok": True, "hash": torrent_hash, "delete_data": delete_data}
 
         try:
-            result = await asyncio.to_thread(run)
+            result = await self._run(run)
             journal.add(
                 "transmission",
                 "раздача убрана из очереди",
@@ -480,6 +527,6 @@ class Transmission:
             return items
 
         try:
-            return await asyncio.to_thread(run)
+            return await self._run(run)
         except Exception as exc:  # noqa: BLE001
             raise TransmissionError(self._explain(exc)) from exc
