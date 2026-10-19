@@ -407,6 +407,33 @@ class Agent:
             # новый поиск (для новой задачи есть кнопка «Новая задача»).
             active = current
 
+        # Исключение из этого правила: если задача уже качает раздачу, а человек
+        # пишет про ДРУГОЙ фильм, молча переделывать её нельзя. Иначе раздача
+        # остаётся в Transmission, а задача превращается в другую — так
+        # «Брестская крепость» стала «Ты все видишь», и скачивание пропало из
+        # вида. Заводим отдельную задачу, старую не трогаем.
+        if (
+            current is not None
+            and self._owns_live_download(current)
+            and not self._is_refinement(text, parsed, current)
+        ):
+            previous = str((current.params or {}).get("title") or current.user_query or "")
+            percent = ((current.params or {}).get("progress") or {}).get("percent")
+            journal.add(
+                "agent",
+                "в задаче идёт скачивание: завожу новую задачу, старую не меняю",
+                {"качается": previous, "новый запрос": text, "прогресс": percent},
+            )
+            turn.add(
+                f"Сейчас качается «{previous}»"
+                + (f" ({percent} %)" if percent is not None else "")
+                + " — эту задачу не трогаю.\n"
+                f"Начинаю отдельную: «{parsed.get('title') or self._clean_title_text(text)}».",
+                kind="text",
+            )
+            current = None
+            active = None
+
         # Дополнение к уточнению: сначала ответили списком названий, потом человек
         # добавил слово («возвращение»). Ищем внутри уже найденного, а не с нуля.
         if (
@@ -570,6 +597,20 @@ class Agent:
         if any(token in self.REFINE_STOPWORDS for token in tokens):
             return False
         return any(len(token) > 2 for token in tokens)
+
+    @staticmethod
+    def _owns_live_download(task: Task) -> bool:
+        """Задача прямо сейчас качает раздачу — её нельзя переделывать в другую.
+
+        В памяти задачи лежит хеш раздачи и последний прогресс. Пока прогресс не
+        дошёл до конца, раздача живёт в Transmission, и всё, что мы сделаем с
+        задачей (переименуем, превратим в периодическую), расходится с ней.
+        """
+        params = task.params or {}
+        if not str(params.get("transmission_hash") or ""):
+            return False
+        progress = params.get("progress") or {}
+        return not progress.get("done")
 
     def _is_refinement(self, text: str, parsed: dict[str, Any], active: Task) -> bool:
         """Это уточнение к активной задаче, а не новая задача?"""
@@ -4212,8 +4253,7 @@ class Agent:
         return "\n".join(lines)
 
 
-    @staticmethod
-    def _plan_from_episodes(entries: list[Any], plan: dict[str, Any]) -> dict[str, Any] | None:
+    def _plan_from_episodes(self, entries: list[Any], plan: dict[str, Any]) -> dict[str, Any] | None:
         """Пересобирает план серий по настоящему .torrent (когда индексы разошлись)."""
         pairs = self._as_pairs(plan.get("selected_episodes") or plan.get("episodes"))
         if not pairs:

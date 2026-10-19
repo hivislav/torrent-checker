@@ -291,6 +291,67 @@ def test_multi_episode_plan() -> None:
     check("есть кнопка постановки в очередь", "Поставить в Transmission" in labels, labels)
     agent.store.close()
 
+def test_plan_rebuild() -> None:
+    """План пересобирается по настоящему .torrent, когда файлов больше.
+
+    Настоящий сбой: в списке со страницы было 10 серий, в .torrent оказалось
+    11 файлов, агент шёл пересобирать план по сериям — и падал с
+    `NameError: name 'self' is not defined`, то есть кнопка «Скачать»
+    возвращала 500 вместо раздачи.
+    """
+    print("\n== пересборка плана по настоящему .torrent ==")
+    from core.models import Task
+
+    tmp = Path(tempfile.mkdtemp(prefix="rebuild-"))
+    settings = dataclasses.replace(
+        get_settings(), data_dir=tmp, db_path=tmp / "r.sqlite3", torrents_dir=tmp / "t"
+    )
+    agent = Agent(settings)
+
+    entries = parse_files(
+        [
+            {"index": index, "size": 1000, "name": name}
+            for index, name in enumerate(
+                [
+                    "Ted.Lasso.S04E01.1080p.mkv",
+                    "Ted.Lasso.S04E02.1080p.mkv",
+                    "Ted.Lasso.S04E03.1080p.mkv",
+                    "Ted.Lasso.S04E04.1080p.mkv",
+                    "Ted.Lasso.S04E05.1080p.mkv",
+                    "Ted.Lasso.S04E06.1080p.mkv",
+                    "Ted.Lasso.S04E07.1080p.mkv",
+                    "Ted.Lasso.S04E08.1080p.mkv",
+                    "Ted.Lasso.S04E09.1080p.mkv",
+                    "Ted.Lasso.S04E10.1080p.mkv",
+                    "sample.mkv",
+                ]
+            )
+        ]
+    )
+    plan = {
+        "kind": "episode",
+        "season": 4,
+        "total_files": 10,
+        "total_size": 10000,
+        "selected_episodes": [
+            {"season": 4, "episode": 1},
+            {"season": 4, "episode": 5},
+        ],
+    }
+    rebuilt = agent._plan_from_episodes(entries, plan)  # noqa: SLF001
+    check("план пересобрался", isinstance(rebuilt, dict), rebuilt)
+    if isinstance(rebuilt, dict):
+        check("индексы настоящие", rebuilt.get("wanted") == [0, 4], rebuilt.get("wanted"))
+        check("вес — только выбранные серии", rebuilt.get("size") == 2000, rebuilt.get("size"))
+        check("серии сохранены",
+              [item["episode"] for item in rebuilt.get("selected_episodes") or []] == [1, 5],
+              rebuilt.get("selected_episodes"))
+
+    empty = agent._plan_from_episodes(entries, {**plan, "selected_episodes": []})  # noqa: SLF001
+    check("без выбранных серий пересобирать нечего", empty is None, empty)
+    agent.store.close()
+
+
 def test_multi_season_pack() -> None:
     """Пачка «1-4 сезоны: 1-40 серии» — серии различаются по сезону.
 
@@ -408,6 +469,7 @@ def main() -> int:
     test_plan()
     test_selection_options()
     test_multi_episode_plan()
+    test_plan_rebuild()
     test_multi_season_pack()
     print("\n=== ИТОГ ===")
     if FAILS:

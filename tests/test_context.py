@@ -198,6 +198,92 @@ async def test_nothing_new_inside_task() -> None:
     agent.store.close()
 
 
+async def test_downloading_task_stays() -> None:
+    """Пока раздача качается, задачу нельзя превратить в другую.
+
+    Настоящий случай: «Брестская крепость» качалась, человек в том же чате
+    написал про другой фильм — и задача стала периодической «Ты все видишь».
+    Раздача осталась в Transmission, а в ассистенте её больше не было видно.
+    """
+    print("\n== качающую задачу не превращаем в другую ==")
+    agent = make_agent("live-")
+    task = Task(
+        id="live-task",
+        kind="oneshot",
+        state="downloading",
+        session_id="s1",
+        user_query="Брестская крепость",
+        params={
+            "title": "Брестская крепость",
+            "type": "movie",
+            "transmission_hash": "b333ced2",
+            "progress": {"percent": 2.3, "done": False},
+        },
+    )
+    await agent.store.save_task(task)
+
+    async def fake_parse(text, window, active):
+        return {"title": "Ты все видишь", "year": 2026, "intent": "find"}
+
+    async def fake_search(params):
+        return []
+
+    async def fake_selection(task_obj, turn):
+        turn.add("ищу дальше", kind="text", task_id=task_obj.id)
+
+    class FakeMCP:
+        """Заглушка трекера: настоящий MCP поднимает Chrome и портит цикл теста."""
+
+        ready = True
+
+        async def search_pages(self, query, pages=1):
+            return []
+
+        async def start(self):
+            return None
+
+        async def stop(self):
+            return None
+
+    agent._parse_query = fake_parse  # noqa: SLF001
+    agent._search = fake_search  # type: ignore[assignment]
+    agent._selection_step = fake_selection  # type: ignore[assignment]
+    agent.mcp = FakeMCP()  # type: ignore[assignment]
+
+    turn = await agent.handle_message(
+        "s1", "Ты все видишь документальный фильм", "chat", "live-task"
+    )
+    stored = await agent.store.get_task("live-task")
+    params = stored.params or {}
+    check("название качающей задачи не изменилось",
+          params.get("title") == "Брестская крепость", params.get("title"))
+    check("её скачивание не тронуто",
+          params.get("transmission_hash") == "b333ced2", params.get("transmission_hash"))
+    check("задача всё ещё качает", stored.state == "downloading", stored.state)
+    check("новая задача заведена отдельно",
+          turn.task is not None and turn.task.id != "live-task",
+          turn.task.id if turn.task else None)
+    text = " ".join(message.text for message in turn.messages).lower()
+    check("сказано, что сейчас качается", "качается" in text, text[:120])
+    check("сказано, что задачу не тронули", "не трогаю" in text, text[:120])
+    check("уточнение «проверяй раз в сутки» всё ещё работает",
+          agent._owns_live_download(stored) is True)  # noqa: SLF001
+
+    # А вот обычное уточнение к качающей задаче по-прежнему остаётся внутри неё.
+    async def fake_parse_refine(text, window, active):
+        return {"quality": "2160p", "intent": "find"}
+
+    agent._parse_query = fake_parse_refine  # noqa: SLF001
+    turn = await agent.handle_message("s1", "а можно 4K", "chat", "live-task")
+    stored = await agent.store.get_task("live-task")
+    check("уточнение качества осталось в той же задаче",
+          turn.task is not None and turn.task.id == "live-task",
+          turn.task.id if turn.task else None)
+    check("качество применилось",
+          (stored.params or {}).get("quality") == "2160p", stored.params.get("quality"))
+    agent.store.close()
+
+
 async def test_foreign_query() -> None:
     print("\n== чужой запрос не уточняет старую задачу ==")
     agent = make_agent("foreign-")
@@ -454,6 +540,7 @@ async def main() -> int:
     await test_task_chats()
     await test_answered_once()
     await test_nothing_new_inside_task()
+    await test_downloading_task_stays()
     await test_foreign_query()
     await test_prompt()
     test_refinement_rules()
