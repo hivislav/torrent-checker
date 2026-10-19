@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import re
+import atexit
 import sqlite3
 import sys
 from pathlib import Path
@@ -37,6 +38,30 @@ def check(name: str, condition: bool, detail: str = "") -> None:
         FAILS.append(name)
 
 
+def _cleanup(start_msg: int, start_tasks: set[str], start_queries: dict[str, str]) -> None:
+    """Убирает за тестом: созданные им задачи и все новые сообщения.
+
+    Уточнения теста попадают в реальную открытую задачу, поэтому её текст
+    (user_query) возвращаем к тому, что был до запуска.
+    """
+    try:
+        settings = get_settings()
+        conn = sqlite3.connect(str(settings.db_path))
+        conn.execute("DELETE FROM messages WHERE id > ?", (start_msg,))
+        for (task_id,) in conn.execute("SELECT id FROM tasks").fetchall():
+            if task_id in start_tasks:
+                continue
+            conn.execute("DELETE FROM messages WHERE task_id = ?", (task_id,))
+            conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+        for task_id, query in start_queries.items():
+            conn.execute("UPDATE tasks SET user_query = ? WHERE id = ?", (query, task_id))
+        conn.commit()
+        conn.close()
+        print("\n(тест убрал за собой: его задачи и сообщения удалены)")
+    except Exception as exc:  # noqa: BLE001 - уборка не должна ронять тест
+        print(f"\nне удалось убрать за собой: {exc}")
+
+
 def run() -> int:
     settings = get_settings()
     password = settings.site_password
@@ -45,7 +70,12 @@ def run() -> int:
     conn = sqlite3.connect(str(settings.db_path))
     start_msg = conn.execute("SELECT IFNULL(MAX(id), 0) FROM messages").fetchone()[0]
     start_tasks = {row[0] for row in conn.execute("SELECT id FROM tasks")}
+    # Живой тест пишет в настоящую базу: он ищет по-настоящему и уточняет
+    # открытую задачу. Поэтому за ним убираем — иначе у человека в картотеке
+    # остаются «Тед Лассо 1080p» и сообщения, которых он не писал.
+    start_queries = {row[0]: row[1] for row in conn.execute("SELECT id, user_query FROM tasks")}
     conn.close()
+    atexit.register(_cleanup, start_msg, start_tasks, start_queries)
 
     with sync_playwright() as p:
         browser = p.chromium.launch(channel="chrome", headless=True, args=["--no-sandbox"])
