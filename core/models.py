@@ -100,6 +100,9 @@ class Torrent:
     series_key: str = ""
     episodes_total: int | None = None
     uploaded_ts: float | None = None
+    # Экранка (CAM/TS/TC/SCR): снято с экрана, а не из релиза. В выдачу такие
+    # раздачи по умолчанию не попадают — см. core/parsing.is_screener.
+    screener: bool = False
 
     @property
     def quality(self) -> str:
@@ -219,9 +222,13 @@ class Action:
 
     id: str
     label: str
-    kind: str  # confirm | cancel | choose | create_periodic | download
+    # link — это не действие, а переход: клиент рисует ссылку (`url`), а не
+    # кнопку с запросом на сервер. Так на карточке живёт «Открыть на трекере».
+    kind: str  # confirm | cancel | choose | create_periodic | download | link | details
     payload: dict[str, Any] = field(default_factory=dict)
     style: str = "normal"  # normal | primary | danger
+    # Куда ведёт кнопка-ссылка (kind="link"): только внешний адрес трекера.
+    url: str = ""
     # Подпись группы: «Качество», «Озвучка», «Серии» — чтобы в одном сообщении
     # было видно, что к чему относится.
     group: str = ""

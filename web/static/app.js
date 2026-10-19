@@ -62,6 +62,30 @@
     return date.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
   }
 
+  // «18.10, 12:40» — для журнала проверок: там важен и день, а не только время.
+  function formatStamp(value) {
+    if (!value) return "";
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return "";
+    return `${date.toLocaleDateString("ru-RU", { day: "2-digit", month: "2-digit" })}, ` +
+      date.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
+  }
+
+  // «12:40» сегодня, «завтра в 12:40», «20.10 в 12:40» — иначе у задачи раз в
+  // сутки «следующая 11:30» читается как «через час».
+  function formatWhen(value) {
+    if (!value) return "";
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return "";
+    const time = date.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
+    const today = new Date();
+    const dayOf = (d) => `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+    const tomorrow = new Date(today.getTime() + 24 * 3600 * 1000);
+    if (dayOf(date) === dayOf(today)) return time;
+    if (dayOf(date) === dayOf(tomorrow)) return `завтра в ${time}`;
+    return `${date.toLocaleDateString("ru-RU", { day: "2-digit", month: "2-digit" })} в ${time}`;
+  }
+
   function clearIntro() {
     const intro = chat.querySelector(".chat__intro");
     if (intro) intro.remove();
@@ -188,7 +212,9 @@
   function renderActions(box, actions) {
     if (!box || !actions.length) return;
     box.innerHTML = "";
-    const picked = new Map(); // id -> episode
+    // id -> {season, episode}: серия без сезона в пачке на несколько сезонов
+    // означает сразу несколько файлов, поэтому запоминаем пару.
+    const picked = new Map();
     const sizes = new Map(); // id -> размер в байтах
 
     const groups = new Map();
@@ -233,6 +259,19 @@
       row.className = "msg__action-row";
 
       for (const action of items) {
+        // Кнопка-ссылка: уходит на трекер в новой вкладке, на сервер не ходит.
+        // Рисуем именно <a>: на телефоне это открывается в браузере, а не в PWA.
+        if (action.kind === "link" && action.url) {
+          const link = document.createElement("a");
+          link.className = "btn btn--tiny btn--link";
+          link.href = action.url;
+          link.target = "_blank";
+          link.rel = "noopener noreferrer";
+          link.textContent = action.label;
+          row.appendChild(link);
+          continue;
+        }
+
         const button = document.createElement("button");
         button.type = "button";
         button.className = "btn btn--tiny";
@@ -242,16 +281,20 @@
 
         if (action.multi) {
           button.classList.add("btn--multi");
+          const value = {
+            season: action.payload?.season ?? null,
+            episode: action.payload?.episode,
+          };
           if (action.selected) {
             button.classList.add("is-selected");
-            picked.set(action.id, action.payload.episode);
+            picked.set(action.id, value);
             sizes.set(action.id, action.payload.size || 0);
           }
           button.addEventListener("click", () => {
             const on = !button.classList.contains("is-selected");
             button.classList.toggle("is-selected", on);
             if (on) {
-              picked.set(action.id, action.payload.episode);
+              picked.set(action.id, value);
               sizes.set(action.id, action.payload.size || 0);
             } else {
               picked.delete(action.id);
@@ -267,8 +310,21 @@
           submitButton = button;
           button.addEventListener("click", () => {
             if (button.disabled) return;
-            const episodes = [...picked.values()].filter((value) => value !== undefined);
+            const episodes = [...picked.values()].filter(
+              (item) => item && item.episode !== undefined && item.episode !== null
+            );
             runAction({ ...action, payload: { ...action.payload, episodes } }, button);
+          });
+          row.appendChild(button);
+          continue;
+        }
+
+        // «Подробнее» — чтение, а не действие: открываем окно и НЕ отправляем
+        // ход в агента. Иначе прошлое сообщение с кнопками стало бы неактивным,
+        // и подтвердить скачивание было бы нечем.
+        if (action.kind === "details") {
+          button.addEventListener("click", () => {
+            showTorrentDetails(action.payload?.torrent_id, button);
           });
           row.appendChild(button);
           continue;
@@ -523,11 +579,37 @@
       line.textContent = task.last_result.slice(0, 120);
       card.appendChild(line);
     }
+    // Что именно отслеживаем: «1080p, сезон 3, жду серию 2» — иначе непонятно,
+    // за тем ли следит задача.
+    if (task.watch) {
+      const line = document.createElement("div");
+      line.className = "task-card__meta task-card__watch";
+      line.textContent = task.watch;
+      card.appendChild(line);
+    }
     if (task.last_error && task.state !== "cancelled") {
       const line = document.createElement("div");
       line.className = "task-card__meta";
       line.style.color = "var(--red)";
       line.textContent = task.last_error.slice(0, 160);
+      card.appendChild(line);
+    }
+
+    // Когда проверяли и что нашли: «12:40 — 0 новых · следующая 13:40».
+    // Без этого непонятно, живой мониторинг или он молча встал.
+    if (task.last_check || task.next_check_at) {
+      const line = document.createElement("div");
+      line.className = "task-card__meta task-card__checks";
+      const bits = [];
+      if (task.last_check) {
+        const when = formatWhen(task.last_check.at);
+        bits.push(`${when} — ${task.last_check.new === 0 ? "нового нет" : `новых: ${task.last_check.new}`}`);
+      }
+      if (task.next_check_at) {
+        const next = formatWhen(task.next_check_at);
+        if (next) bits.push(`следующая ${next}`);
+      }
+      line.textContent = "проверка: " + bits.join(" · ");
       card.appendChild(line);
     }
 
@@ -542,6 +624,12 @@
             actions.querySelector("button")
           );
         })
+      );
+    }
+    if (task.kind === "periodic" && task.checks_done) {
+      // Журнал проверок: когда проверяли и что нашли — без выхода из картотеки.
+      actions.appendChild(
+        smallButton("Журнал", "btn", () => showChecks(task.id, task.params?.title || task.user_query))
       );
     }
     if (!FINISHED_STATES.has(task.state)) {
@@ -679,17 +767,19 @@
 
         const actions = document.createElement("div");
         actions.className = "task-card__actions";
+        // «Подробнее» по уже скачанному: жанр, актёры, описание — чтобы решить,
+        // что смотреть и что удалять. Берём со страницы раздачи, а не из карточки
+        // загрузки: там только название.
+        if (item.torrent_id) {
+          actions.appendChild(
+            smallButton("Подробнее", "btn", (event) => {
+              showTorrentDetails(item.torrent_id, event.target);
+            })
+          );
+        }
         actions.appendChild(
-          smallButton("Удалить", "btn btn--danger", async (event) => {
-            event.target.disabled = true;
-            await runAction(
-              {
-                kind: "delete_download",
-                payload: { torrent_id: item.torrent_id || "", hash: item.hash || "" },
-              },
-              event.target
-            );
-            event.target.disabled = false;
+          smallButton("Удалить", "btn btn--danger", (event) => {
+            deleteDownload(item, event.target);
           })
         );
         row.appendChild(actions);
@@ -936,6 +1026,249 @@
   }
 
   // ------------------------------------------------------------------
+  // Окно «Подробности раздачи» / «Журнал проверок»
+  // ------------------------------------------------------------------
+  // Одно окно на два случая чтения. Кнопки действий тут не живут намеренно:
+  // скачивание и отмена остаются в чате, чтобы не было двух пультов.
+  function openInfo(title, content) {
+    $("info-title").textContent = title;
+    fillInfo(content);
+    $("info-modal").hidden = false;
+  }
+
+  function closeInfo() {
+    $("info-modal").hidden = true;
+  }
+
+  // ------------------------------------------------------------------
+  // Подтверждение опасного действия — окном, а не сообщением в чате.
+  // Кнопку «Удалить» нажимают в картотеке, а сообщение появлялось в чате:
+  // на телефоне чат под панелью, и второй шаг («Удалить навсегда») легко
+  // не заметить — со стороны это выглядит как «удаление не работает».
+  // ------------------------------------------------------------------
+  function confirmDialog({ title, text, confirmLabel, danger = true }) {
+    return new Promise((resolve) => {
+      $("confirm-title").textContent = title;
+      $("confirm-body").textContent = text;
+      const yes = $("confirm-yes");
+      const no = $("confirm-no");
+      yes.textContent = confirmLabel;
+      yes.classList.toggle("btn--danger", Boolean(danger));
+      yes.classList.toggle("btn--primary", !danger);
+      const finish = (value) => {
+        $("confirm-modal").hidden = true;
+        yes.removeEventListener("click", onYes);
+        no.removeEventListener("click", onNo);
+        document.removeEventListener("keydown", onKey);
+        resolve(value);
+      };
+      const onYes = () => finish(true);
+      const onNo = () => finish(false);
+      const onKey = (event) => {
+        if (event.key === "Escape") finish(false);
+      };
+      yes.addEventListener("click", onYes);
+      no.addEventListener("click", onNo);
+      document.addEventListener("keydown", onKey);
+      $("confirm-modal").hidden = false;
+      yes.focus();
+    });
+  }
+
+  // Удаление раздачи: сначала спрашиваем сервер (он проверяет, что удалять),
+  // потом подтверждаем окном и удаляем. Текст берём серверный — там точный
+  // вес, папка и оговорка про память агента.
+  async function deleteDownload(item, button) {
+    if (state.busy) return;
+    state.busy = true;
+    const label = button ? button.textContent : "";
+    if (button) {
+      button.disabled = true;
+      button.textContent = "проверяю…";
+    }
+    try {
+      const prepared = await api("/api/action", {
+        method: "POST",
+        body: {
+          kind: "delete_download",
+          payload: { torrent_id: item.torrent_id || "", hash: item.hash || "" },
+        },
+      });
+      const message = (prepared.messages || [])[0] || {};
+      const details = (message.payload || {}).download || {};
+      if (!Object.keys(details).length) {
+        // Сервер объяснит причину (запись уже удалена / не нашёл раздачу).
+        renderTurn(prepared);
+        return;
+      }
+      const confirmed = await confirmDialog({
+        title: "Удалить раздачу?",
+        text: message.text || "Удалить раздачу вместе с файлами?",
+        confirmLabel: "Удалить навсегда",
+      });
+      if (!confirmed) return;
+      const action = (message.actions || []).find((item) => item.kind === "confirm_delete");
+      const result = await api("/api/action", {
+        method: "POST",
+        body: { kind: "confirm_delete", payload: action ? action.payload : {} },
+      });
+      renderTurn(result);
+    } catch (error) {
+      renderMessage({
+        role: "agent",
+        text: `Не смог удалить: ${error.message}`,
+        kind: "error",
+      });
+    } finally {
+      state.busy = false;
+      if (button) {
+        button.disabled = false;
+        button.textContent = label;
+      }
+    }
+  }
+
+  function infoRow(label, value) {
+    if (!value) return null;
+    const row = document.createElement("div");
+    row.className = "info__row";
+    const name = document.createElement("span");
+    name.className = "info__label";
+    name.textContent = label;
+    const text = document.createElement("span");
+    text.className = "info__value";
+    text.textContent = value;
+    row.append(name, text);
+    return row;
+  }
+
+  function infoLink(url, label) {
+    const link = document.createElement("a");
+    link.className = "btn btn--tiny btn--link";
+    link.href = url;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    link.textContent = label;
+    return link;
+  }
+
+  function detailsBox(data, torrentId) {
+    const box = document.createElement("div");
+    const head = document.createElement("p");
+    head.className = "info__title";
+    head.textContent = data.title || `раздача #${torrentId}`;
+    box.appendChild(head);
+    if (data.original_title && data.original_title !== data.title) {
+      box.appendChild(infoRow("Оригинал", data.original_title));
+    }
+    const rows = [
+      ["Год", data.year],
+      ["Жанр", data.genre],
+      ["Режиссёр", data.director],
+      ["В ролях", data.cast],
+      ["Качество", data.quality],
+      ["Видео", data.video],
+      ["Аудио", data.audio],
+      ["Вес", data.size],
+      ["Сиды", `${data.seeds ?? 0} · пиры ${data.peers ?? 0}`],
+      ["Залит", data.upload_date],
+      ["Обновлён", data.update_date],
+    ];
+    for (const [name, value] of rows) {
+      const row = infoRow(name, value);
+      if (row) box.appendChild(row);
+    }
+    if (data.description) {
+      const text = document.createElement("p");
+      text.className = "info__text";
+      text.textContent = data.description;
+      box.appendChild(text);
+    }
+    if (data.url) {
+      const wrap = document.createElement("div");
+      wrap.className = "info__actions";
+      wrap.appendChild(infoLink(data.url, "Открыть на трекере · комментарии"));
+      box.appendChild(wrap);
+    }
+    return box;
+  }
+
+  function fillInfo(content) {
+    const body = $("info-body");
+    body.innerHTML = "";
+    if (typeof content === "string") {
+      const text = document.createElement("p");
+      text.className = "info__text";
+      text.textContent = content;
+      body.appendChild(text);
+    } else if (content) {
+      body.appendChild(content);
+    }
+  }
+
+  // Окно открывается СРАЗУ, до запроса к трекеру: страница раздачи идёт через
+  // шлюз Cloudflare и на холодном старте может отвечать секундами. Молчаливая
+  // кнопка «открываю…» без окна выглядит как «ничего не произошло».
+  async function showTorrentDetails(torrentId, button) {
+    if (!torrentId) return;
+    const label = button ? button.textContent : "";
+    if (button) {
+      button.disabled = true;
+      button.textContent = "открываю…";
+    }
+    openInfo("Подробности раздачи", "Читаю страницу раздачи на трекере…");
+    try {
+      const data = await api(`/api/torrent/${encodeURIComponent(torrentId)}/details`);
+      fillInfo(detailsBox(data, torrentId));
+    } catch (error) {
+      fillInfo(`Не получилось открыть раздачу: ${error.message}`);
+    } finally {
+      if (button) {
+        button.disabled = false;
+        button.textContent = label;
+      }
+    }
+  }
+
+  async function showChecks(taskId, title) {
+    try {
+      const data = await api(`/api/tasks/${encodeURIComponent(taskId)}`);
+      const box = document.createElement("div");
+      const head = document.createElement("p");
+      head.className = "info__title";
+      head.textContent = data.task?.params?.title || title || "задача";
+      box.appendChild(head);
+      const checks = data.checks || [];
+      if (!checks.length) {
+        const empty = document.createElement("p");
+        empty.className = "info__text";
+        empty.textContent = "проверок ещё не было";
+        box.appendChild(empty);
+      }
+      for (const check of checks) {
+        const row = document.createElement("div");
+        row.className = "info__row";
+        const name = document.createElement("span");
+        name.className = "info__label";
+        name.textContent = formatStamp(check.created_at);
+        const value = document.createElement("span");
+        value.className = "info__value";
+        const bits = [
+          `подходящих: ${check.found ?? 0}`,
+          `новых: ${check.new_count ?? 0}`,
+        ];
+        if (check.message) bits.push(check.message);
+        value.textContent = bits.join(" · ");
+        row.append(name, value);
+        box.appendChild(row);
+      }
+      openInfo("Журнал проверок", box);
+    } catch (error) {
+      openInfo("Журнал проверок", `Не получилось прочитать журнал: ${error.message}`);
+    }
+  }
+
+  // ------------------------------------------------------------------
   // Журнал отладки
   // ------------------------------------------------------------------
   const debugState = { open: false, filter: "all", last: null, events: [] };
@@ -1169,6 +1502,7 @@
     $("close-settings").addEventListener("click", closeSettings);
     $("save-settings").addEventListener("click", saveSettings);
     $("test-settings").addEventListener("click", testSettings);
+    $("info-close").addEventListener("click", closeInfo);
     $("logout").addEventListener("click", async () => {
       await api("/api/logout", { method: "POST" });
       window.location.reload();
@@ -1178,6 +1512,7 @@
       if (event.key === "Escape") {
         closeSettings();
         closeDebug();
+        closeInfo();
         closeOverlays();
       }
     });

@@ -224,6 +224,36 @@
     </div>
   </div>
 
+  <!-- ==================== Подробности раздачи / журнал проверок ==================== -->
+  <!-- Одно окно на два случая: подробности раздачи («Подробнее») и журнал
+       проверок периодической задачи. Оба — про чтение, поэтому без кнопок
+       действий: всё, что можно сделать, остаётся в чате и картотеке. -->
+  <div class="modal" id="info-modal" hidden>
+    <div class="modal__box modal__box--wide">
+      <div class="debug__head">
+        <h2 class="modal__title" id="info-title">Подробности</h2>
+        <div class="debug__tools">
+          <button class="btn btn--ghost btn--tiny" id="info-close">Закрыть</button>
+        </div>
+      </div>
+      <div class="info__body" id="info-body"></div>
+    </div>
+  </div>
+
+  <!-- ==================== Подтверждение удаления ==================== -->
+  <!-- Именно окно: кнопку «Удалить» жмут в картотеке, а подтверждение
+       сообщением в чате на телефоне оказывалось под панелью. -->
+  <div class="modal" id="confirm-modal" hidden>
+    <div class="modal__box">
+      <h2 class="modal__title" id="confirm-title">Удалить раздачу?</h2>
+      <p class="confirm__text" id="confirm-body"></p>
+      <div class="modal__actions">
+        <button class="btn btn--danger" id="confirm-yes">Удалить навсегда</button>
+        <button class="btn btn--ghost" id="confirm-no">Отмена</button>
+      </div>
+    </div>
+  </div>
+
   <template id="message-template">
     <article class="msg">
       <div class="msg__filmstrip" aria-hidden="true"></div>

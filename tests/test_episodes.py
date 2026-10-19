@@ -291,6 +291,116 @@ def test_multi_episode_plan() -> None:
     check("есть кнопка постановки в очередь", "Поставить в Transmission" in labels, labels)
     agent.store.close()
 
+def test_multi_season_pack() -> None:
+    """Пачка «1-4 сезоны: 1-40 серии» — серии различаются по сезону.
+
+    Настоящий случай с трекера: в раздаче четыре сезона по 10 серий, задача
+    про второй сезон. Раньше кнопки назывались просто «Серия 1…10» четыре
+    раза подряд, а выбор одной серии ставил в очередь по файлу из КАЖДОГО
+    сезона (четыре файла, 23 ГБ вместо 5).
+    """
+    print("\n== пачка на несколько сезонов ==")
+    import asyncio
+    import dataclasses
+    import tempfile
+
+    from core.agent import Agent
+    from core.config import get_settings
+    from core.models import Action, Task, Turn
+
+    tmp = Path(tempfile.mkdtemp(prefix="seasons-"))
+    settings = dataclasses.replace(
+        get_settings(), data_dir=tmp, db_path=tmp / "s.sqlite3", torrents_dir=tmp / "t"
+    )
+    agent = Agent(settings)
+    groups = []
+    index = 0
+    for season in (1, 2, 3, 4):
+        for episode in range(1, 11):
+            groups.append(
+                {
+                    "season": season,
+                    "episode": episode,
+                    "indexes": [index],
+                    "size": 5 << 30,
+                    "names": [f"From.S0{season}E{episode:02d}.mkv"],
+                }
+            )
+            index += 1
+    torrent = Torrent(
+        id="2146438",
+        title="Извне (1-4 сезоны: 1-40 серии из 40) / From / 2022-2026 / ПМ / 4K / WEB-DL (2160p)",
+        qualities=["2160p"],
+        voices=["ПМ"],
+        seasons=[1, 2, 3, 4],
+        episodes=[1, 40],
+        series_key="from",
+        size="233.73 ГБ",
+    )
+    task = Task(
+        id="seasons-task", kind="oneshot", state="awaiting_choice", session_id="s",
+        user_query="Извне второй сезон", params={"title": "Извне", "season": 2},
+    )
+    task.candidate = torrent.to_dict()
+    task.options = {"pool": [torrent.to_dict()]}
+    turn = Turn()
+    asyncio.run(agent._show_episode_picker(task, torrent, groups, None, turn))  # noqa: SLF001
+    message = turn.messages[-1]
+    labels = [action.label for action in message.actions if action.kind == "toggle_episode"]
+    print("  заголовок:", message.text.splitlines()[0])
+    print("  кнопки:", labels[:3], "… всего", len(labels))
+    check("в заголовке сезон задачи", "сезон 2" in message.text.splitlines()[0],
+          message.text.splitlines()[0])
+    check("показаны только серии второго сезона", len(labels) == 10, len(labels))
+    check("кнопки подписаны сезоном или без повторов",
+          len({label for label in labels}) == len(labels), labels)
+    check("id кнопок уникальны",
+          len({action.id for action in message.actions}) == len(message.actions))
+
+    # Отмечаем одну серию — план должен взять ровно один файл второго сезона.
+    episode_action = next(
+        action for action in message.actions
+        if action.kind == "toggle_episode" and action.payload.get("episode") == 1
+    )
+    plan_turn = asyncio.run(
+        agent.handle_action(
+            "s", "toggle_episode",
+            {"task_id": task.id, "season": episode_action.payload["season"],
+             "episode": episode_action.payload["episode"]},
+        )
+    )
+    stored = asyncio.run(agent.store.get_task(task.id))
+    assert stored is not None
+    print("  сохранённый выбор:", stored.options.get("selected_episodes"))
+    check("выбор запомнен с сезоном",
+          stored.options.get("selected_episodes") == [{"season": 2, "episode": 1}],
+          stored.options.get("selected_episodes"))
+
+    plan = agent._build_episodes_plan(stored, [{"season": 2, "episode": 1}])  # noqa: SLF001
+    print("  план:", {"wanted": plan["wanted"], "size": plan["size"], "names": plan["names"]})
+    check("в плане один файл", plan["wanted"] == [10], plan["wanted"])
+    check("вес — одна серия, а не четыре", plan["size"] == 5 << 30, plan["size"])
+    check("имя файла из второго сезона", plan["names"] == ["From.S02E01.mkv"], plan["names"])
+    check("сезон в плане — 2", plan["season"] == 2, plan["season"])
+
+    # Старый формат (просто число) тоже должен пониматься — но в сезоне задачи.
+    legacy = agent._build_episodes_plan(stored, [1])  # noqa: SLF001
+    check("старый выбор «серия 1» берёт сезон задачи",
+          legacy["wanted"] == [10], legacy["wanted"])
+
+    # «Весь сезон 2» — десять файлов второго сезона, а не вся пачка.
+    whole_turn = asyncio.run(
+        agent.handle_action("s", "download_all", {"task_id": task.id, "season": 2})
+    )
+    whole_plan = (asyncio.run(agent.store.get_task(task.id)).options or {}).get("plan") or {}
+    print("  весь сезон 2:", {"файлов": len(whole_plan.get("selected_episodes") or [])})
+    check("весь сезон — 10 серий", len(whole_plan.get("selected_episodes") or []) == 10,
+          whole_plan.get("selected_episodes"))
+    check("и это только второй сезон",
+          {item.get("season") for item in whole_plan.get("selected_episodes")} == {2},
+          whole_plan.get("selected_episodes"))
+    agent.store.close()
+
 
 def main() -> int:
     test_detect()
@@ -298,6 +408,7 @@ def main() -> int:
     test_plan()
     test_selection_options()
     test_multi_episode_plan()
+    test_multi_season_pack()
     print("\n=== ИТОГ ===")
     if FAILS:
         for name in FAILS:

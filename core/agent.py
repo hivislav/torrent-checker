@@ -33,6 +33,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -53,6 +54,7 @@ from core.matching import (
     find_new,
     is_pack,
     rank,
+    title_match,
 )
 from core.mcp_client import KinozalMCP, MCPError
 from core.models import Action, Message, Task, Torrent, Turn, new_id, now_iso
@@ -65,7 +67,7 @@ from core.episodes import (
     pick_episode,
     pick_new_episodes,
 )
-from core.parsing import normalize, parse_torrent
+from core.parsing import extract_qualities, normalize, parse_torrent, torrent_id_from_link
 from core.suggest import (
     MIN_SCORE,
     query_variants,
@@ -107,6 +109,9 @@ PARSE_SYSTEM = """Ты — разборщик запросов торрент-а
   "auto_download": true|false|null — true если просят сразу качать («качай», «скачивай», «сразу качай»),
                    false если просят только сообщать («сообщай», «только сообщай», «спроси разрешение»),
                    null если не сказано,
+  "screener": true|false|null — экранка: true если её прямо просят («экранку», «камрип»,
+              «сойдёт и экранка»), false если просят «не экранку», null если не сказано.
+              Экранки (CAM/TS/TC/SCR) по умолчанию не предлагаются — не заполняй без просьбы.
   "intent": "find" | "monitor" | "question"
 }
 
@@ -142,6 +147,11 @@ kinozal.me, скачивает торрент-файлы и ставит их в
 «Периодически» под полем ввода и написать запрос."""
 
 
+# Одна и та же подсказка на шагах выбора: про кнопку «Подробнее» легко не
+# догадаться, а читать про фильм нужно до выбора качества, а не после.
+DETAILS_HINT = "Кнопка «Подробнее» покажет жанр, описание и актёров."
+
+
 PARAM_TITLES = {
     "title": "название",
     "type": "тип",
@@ -152,7 +162,24 @@ PARAM_TITLES = {
     "season": "сезон",
     "episode_from": "серия",
     "year": "год",
+    "screener": "экранка",
 }
+
+# Параметры запроса, которые попадают в задачу и переживают уточнения.
+# Один список на все места (разбор, уточнение, правка задачи) — иначе легко
+# забыть ключ в одном из них и потерять уточнение.
+PARAM_KEYS = (
+    "title",
+    "original_title",
+    "quality",
+    "voice",
+    "season",
+    "episode_from",
+    "year",
+    "type",
+    "aliases",
+    "screener",
+)
 
 
 def _parse_iso(value: str | None) -> datetime | None:
@@ -183,6 +210,42 @@ def _plural(count: int, one: str, few: str, many: str) -> str:
     return f"{count} {many}"
 
 
+def _word_plural(count: int, one: str, few: str, many: str) -> str:
+    """Только слово без числа: «3 дня» → «дня» (для «3 дня назад»)."""
+    return _plural(count, one, few, many).split(" ", 1)[-1]
+
+
+def _shorten(text: str, limit: int) -> str:
+    """Длинный список актёров режем с многоточием: в окне он читается как стена."""
+    value = str(text or "").strip()
+    if len(value) <= limit:
+        return value
+    cut = value[:limit].rsplit(",", 1)[0]
+    return (cut or value[:limit]).rstrip(" ,") + " …"
+
+
+def _age_text(stamp: float | None) -> str:
+    """«сегодня», «вчера», «3 дня назад» или дата — возраст раздачи.
+
+    Возраст понятнее точной даты: по нему сразу видно, свежий это релиз или
+    раздача, которую залили полгода назад.
+    """
+    if not stamp:
+        return ""
+    moment = datetime.fromtimestamp(stamp, tz=timezone.utc)
+    days = int((datetime.now(timezone.utc) - moment).total_seconds() // 86400)
+    if days <= 0:
+        return "сегодня"
+    if days == 1:
+        return "вчера"
+    if days < 7:
+        return f"{days} {_word_plural(days, 'день', 'дня', 'дней')} назад"
+    if days < 60:
+        weeks = days // 7
+        return f"{weeks} {_word_plural(weeks, 'неделю', 'недели', 'недель')} назад"
+    return moment.strftime("%d.%m.%Y")
+
+
 class Agent:
     """Ядро системы. Один на процесс, потокобезопасен на уровне корутин."""
 
@@ -198,10 +261,19 @@ class Agent:
         self._started = False
         self._check_locks: dict[str, asyncio.Lock] = {}
         self._running_checks: set[str] = set()
+        # Подробности раздачи (жанр, актёры, описание) запрашиваются по кнопке,
+        # а не при каждом поиске: это ещё один поход через шлюз Cloudflare.
+        # Кэш на 10 минут — чтобы повторное нажатие не ходило на трекер.
+        self._details_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        self._details_cache_ttl = 600
         self.scheduler_task: asyncio.Task | None = None
         self.progress_task: asyncio.Task | None = None
         self.progress_tick_seconds = 5
         self.scheduler_tick_seconds = 20
+        # Сколько серий можно поставить в очередь без спроса. Больше — это уже
+        # «пачка» (у сериалов на трекере бывает 10-40 серий в одной раздаче),
+        # и лучше спросить: 20 файлов — это под сотню гигабайт.
+        self.auto_episodes_max = 3
 
     # ------------------------------------------------------------------
     # жизненный цикл
@@ -280,6 +352,15 @@ class Agent:
         user_message_id = await self._remember(
             session_id, Message(role="user", text=text, kind="text", task_id=task_id or "")
         )
+
+        # Ссылка на раздачу — самый быстрый путь: раздача уже известна, искать
+        # по названию (и спрашивать модель) не нужно вовсе.
+        link_id = torrent_id_from_link(text)
+        if link_id:
+            await self._start_from_link(session_id, text, link_id, turn)
+            await self._tag_turn(user_message_id, turn)
+            await self._remember_many(session_id, turn.messages)
+            return turn
 
         # Контекст — переписка именно этой задачи (как отдельный чат).
         current = await self.store.get_task(task_id) if task_id else None
@@ -607,8 +688,7 @@ class Agent:
         before = dict(task.params or {})
         merged = dict(before)
         changed: dict[str, Any] = {}
-        for key in ("title", "original_title", "quality", "voice", "season",
-                    "episode_from", "year", "type", "aliases"):
+        for key in PARAM_KEYS:
             value = parsed.get(key)
             if value in (None, "", "null", []):
                 continue
@@ -619,10 +699,14 @@ class Agent:
         parsed_fields = {
             key: value
             for key, value in (parsed or {}).items()
-            if key in ("title", "original_title", "quality", "voice", "season",
-                       "episode_from", "year", "type", "aliases")
-            and value not in (None, "", "null", [])
+            if key in PARAM_KEYS and value not in (None, "", "null", [])
         }
+        if task.kind == "periodic" and (changed or parsed_fields):
+            # У периодической задачи уточнение — это правка фильтров, а не
+            # разовый поиск: иначе «только 4к» уводило задачу в «не найдено»
+            # и она переставала следить за трекером.
+            await self._refine_periodic(task, changed, merged, text, before, turn)
+            return
         if not changed and parsed_fields:
             # В сообщении были параметры, просто уже такие же — показываем
             # текущий шаг, а не просим «уточнить, что поправить».
@@ -704,6 +788,113 @@ class Agent:
         turn.add(f"Уточнил: {summary}. Ищу заново.", kind="text", task_id=task.id)
         await self._selection_step(task, turn)
 
+    async def _refine_periodic(
+        self,
+        task: Task,
+        changed: dict[str, Any],
+        merged: dict[str, Any],
+        text: str,
+        before: dict[str, Any],
+        turn: Turn,
+    ) -> None:
+        """Уточнение внутри периодической задачи: меняем фильтры мониторинга.
+
+        Задача остаётся в работе и продолжает проверять трекер с новыми
+        условиями: «только 4к» — это уточнение качества, а не новый разовый
+        поиск. Проверку не запускаем, чтобы ответ был мгновенным (трекер с
+        Cloudflare отвечает не всегда быстро) — рядом кнопка «Проверить сейчас».
+        """
+        was_state = task.state
+        if "title" in changed or "original_title" in changed:
+            # Другой сериал — старая базовая линия («в 3 сезоне уже 24 серии»)
+            # к нему не относится, иначе задача будет ждать несуществующую серию.
+            for key in ("baseline_episodes", "baseline_ts", "next_episode", "seen_ids"):
+                task.params.pop(key, None)
+            merged = {key: value for key, value in merged.items()
+                      if key not in ("baseline_episodes", "baseline_ts", "next_episode", "seen_ids")}
+        task.params = merged
+        task.user_query = f"{task.user_query} | {text}"[:400]
+        task.last_error = ""
+        journal.add(
+            "agent",
+            "уточнение периодической задачи",
+            {"было": before, "стало": merged, "изменено": changed, "состояние": was_state},
+        )
+
+        if not changed:
+            # Уже так и настроено — показываем, что сейчас по задаче, и не
+            # трогаем состояние.
+            task.state = "monitoring" if was_state in ("monitoring", "failed", "not_found") else was_state
+            await self.store.save_task(task)
+            lines = ["Уже так и настроено — вот что сейчас по задаче."]
+            watch = self._watch_text(task)
+            if watch:
+                lines.append(f"• Ждём: {watch}")
+            next_at = _parse_iso(task.next_check_at)
+            if next_at is not None:
+                lines.append(f"• Следующая проверка {self._clock(next_at)}")
+            message = turn.add(
+                "\n".join(lines), kind="task", task_id=task.id,
+                payload={"task": task.to_dict()},
+            )
+            message.actions = self._task_actions(task)
+            return
+
+        if was_state == "awaiting_confirm":
+            # Задача ещё не взята в работу — показываем карточку заново.
+            task.options = {**(task.options or {}), "selected_episodes": []}
+            await self.store.save_task(task)
+            summary = ", ".join(
+                f"{PARAM_TITLES.get(key, key)}: {value}" for key, value in changed.items()
+            )
+            turn.add(f"Уточнил: {summary}.", kind="text", task_id=task.id)
+            try:
+                torrents = await self._search(task.params)
+            except MCPError as exc:
+                turn.add(f"Не смог обратиться к трекеру: {exc}", kind="error", task_id=task.id)
+                return
+            task.options = {**(task.options or {}), "pool": [t.to_dict() for t in torrents[:80]]}
+            await self._present_periodic(task, torrents, turn)
+            return
+
+        # Задача уже в работе (или упала из-за трекера): остаётся в работе.
+        task.state = "monitoring"
+        task.params.pop("pack_notified", None)
+        if not task.interval_minutes:
+            task.interval_minutes = self.settings.default_interval_minutes
+        if _parse_iso(task.next_check_at) is None:
+            self._schedule_next(task)
+        await self.store.save_task(task)
+
+        summary = ", ".join(
+            f"{PARAM_TITLES.get(key, key)}: {value}" for key, value in changed.items()
+        )
+        mode = "и сразу качать" if task.auto_download else "и сообщать о находках"
+        lines = [
+            f"Уточнил: {summary}.",
+            f"Задача «{task.title}» продолжает следить "
+            f"{self._human_interval(task.interval_minutes)} {mode}.",
+        ]
+        watch = self._watch_text(task)
+        if watch:
+            lines.append(f"• Ждём: {watch}")
+        next_at = _parse_iso(task.next_check_at)
+        if next_at is not None:
+            lines.append(f"• Следующая проверка {self._clock(next_at)}")
+        lines.append("Проверить сразу — кнопкой ниже.")
+        message = turn.add(
+            "\n".join(lines), kind="task", task_id=task.id, payload={"task": task.to_dict()}
+        )
+        message.actions = self._task_actions(task)
+        await self.events.publish(
+            {
+                "type": "task_updated",
+                "task_id": task.id,
+                "title": task.title,
+                "changed": changed,
+            }
+        )
+
     async def handle_action(self, session_id: str, kind: str, payload: dict[str, Any]) -> Turn:
         turn = Turn()
         task_id = str(payload.get("task_id") or "")
@@ -711,7 +902,7 @@ class Agent:
         turn.task = task
 
         CONT_SUFFIXES = (
-            "choose", "start_download", "pick_torrent", "toggle_episode",
+            "choose", "choose_episodes", "start_download", "pick_torrent", "toggle_episode",
             "download_selected", "download_all", "choose_episode", "confirm_download",
             "download_new", "periodic_auto", "periodic_notify", "make_periodic",
         )
@@ -815,6 +1006,23 @@ class Agent:
         elif kind == "start_download" and task:
             await self._start_download(task, turn,
                                        periodic_context=task.kind == "periodic")
+        elif kind == "choose_episodes" and task:
+            groups = [
+                group for group in (task.options or {}).get("episode_groups") or []
+                if group.get("episode") is not None
+            ]
+            torrent = Torrent.from_dict(task.candidate or {})
+            if not groups or not torrent.id:
+                turn.add(
+                    "Серий в этой раздаче я не вижу — начните задачу заново.",
+                    kind="error",
+                    task_id=task.id,
+                )
+            else:
+                path_str = (task.options or {}).get("torrent_path") or ""
+                await self._show_episode_picker(
+                    task, torrent, groups, Path(path_str) if path_str else None, turn
+                )
         elif kind == "choose_episode" and task:
             episode = payload.get("episode")
             season = payload.get("season")
@@ -845,26 +1053,37 @@ class Agent:
                 message.actions = self._episode_actions(task, plan)
         elif kind == "toggle_episode" and task:
             # Сам выбор переключает клиент; здесь только фиксируем состояние,
-            # чтобы оно пережило перезагрузку страницы.
-            episodes = {int(item) for item in (task.options or {}).get("selected_episodes") or []}
-            episode = int(payload.get("episode") or 0)
-            if episode:
-                episodes.symmetric_difference_update({episode})
-            task.options = {**(task.options or {}), "selected_episodes": sorted(episodes)}
+            # чтобы оно пережило перезагрузку страницы. Серия — это пара
+            # (сезон, серия): в пачке на несколько сезонов «Серия 1» без
+            # сезона означала бы четыре разных файла.
+            selected = {
+                (item["season"], item["episode"])
+                for item in self._as_pairs((task.options or {}).get("selected_episodes"))
+            }
+            key = self._pair_key(payload.get("season"), payload.get("episode"))
+            if key[1]:
+                selected.symmetric_difference_update({key})
+            ordered = sorted(selected, key=lambda item: (item[0] or 0, item[1]))
+            task.options = {
+                **(task.options or {}),
+                "selected_episodes": [
+                    {"season": season, "episode": episode} for season, episode in ordered
+                ],
+            }
             await self.store.save_task(task)
         elif kind == "download_selected" and task:
-            episodes = payload.get("episodes")
-            if not episodes:
-                episodes = (task.options or {}).get("selected_episodes") or []
-            episodes = sorted({int(item) for item in episodes if item})
-            if not episodes:
+            raw = payload.get("episodes")
+            if not raw:
+                raw = (task.options or {}).get("selected_episodes") or []
+            pairs = self._as_pairs(raw)
+            if not pairs:
                 turn.add(
                     "Отметьте серии кнопками выше — можно несколько.",
                     kind="text",
                     task_id=task.id,
                 )
             else:
-                plan = self._build_episodes_plan(task, episodes)
+                plan = self._build_episodes_plan(task, pairs)
                 if plan is None:
                     turn.add(
                         "Не нашёл файлов этих серий в раздаче — выберите заново.",
@@ -875,13 +1094,36 @@ class Agent:
                     task.options = {
                         **(task.options or {}),
                         "plan": plan,
-                        "selected_episodes": episodes,
+                        "selected_episodes": plan["selected_episodes"],
                     }
                     await self.store.save_task(task)
                     await self._start_download(task, turn)
         elif kind == "download_all" and task:
-            entries = self._entries_from_task(task)
-            plan = self._plan_files(task, entries)
+            season_filter = payload.get("season")
+            groups = [
+                group for group in (task.options or {}).get("episode_groups") or []
+                if group.get("episode") is not None
+            ]
+            season_pairs = [
+                self._pair_key(group.get("season"), group.get("episode"))
+                for group in groups
+            ]
+            whole_season = None
+            if season_filter not in (None, ""):
+                try:
+                    wanted_season = int(season_filter)
+                except (TypeError, ValueError):
+                    wanted_season = None
+                if wanted_season is not None:
+                    season_pairs = [pair for pair in season_pairs if pair[0] == wanted_season]
+                    whole_season = wanted_season
+            plan = self._build_episodes_plan(
+                task, [{"season": season, "episode": episode} for season, episode in season_pairs]
+            )
+            if plan is None:
+                # Сезон не разобрали — берём всю раздачу, как раньше.
+                entries = self._entries_from_task(task)
+                plan = self._plan_files(task, entries)
             plan = {
                 **plan,
                 "kind": "all",
@@ -889,13 +1131,7 @@ class Agent:
                 "size": plan.get("total_size"),
                 "episode": None,
                 "names": [],
-                "selected_episodes": sorted(
-                    {
-                        int(group.get("episode"))
-                        for group in (plan.get("episodes") or [])
-                        if isinstance(group, dict) and group.get("episode") is not None
-                    }
-                ),
+                "season": whole_season if whole_season is not None else plan.get("season"),
             }
             task.options = {**(task.options or {}), "plan": plan}
             await self.store.save_task(task)
@@ -943,7 +1179,27 @@ class Agent:
         tasks = await self.store.list_tasks(limit=limit)
         if not include_finished:
             tasks = [task for task in tasks if task.is_active]
-        return [task.to_dict() for task in tasks]
+        result: list[dict[str, Any]] = []
+        for task in tasks:
+            data = task.to_dict()
+            # Что именно отслеживает задача: фильтр, какую серию ждём, не ждёт
+            # ли повтора скачивание. Это ответ на вопрос «а он вообще следит
+            # за тем, чем надо?».
+            data["watch"] = self._watch_text(task)
+            # Последняя проверка видна в карточке задачи: «проверял 12:40 —
+            # 0 новых». Без этого непонятно, работает мониторинг или нет.
+            if task.checks_done:
+                checks = await self.store.list_checks(task.id, limit=1)
+                if checks:
+                    last = checks[0]
+                    data["last_check"] = {
+                        "at": last.get("created_at"),
+                        "found": int(last.get("found") or 0),
+                        "new": int(last.get("new_count") or 0),
+                        "message": str(last.get("message") or ""),
+                    }
+            result.append(data)
+        return result
 
     async def get_task(self, task_id: str) -> Task | None:
         return await self.store.get_task(task_id)
@@ -1211,6 +1467,15 @@ class Agent:
                 cleaned[key] = None
         auto = data.get("auto_download")
         cleaned["auto_download"] = auto if isinstance(auto, bool) else None
+        # Экранку просят редко и обычно словами, которые модель может не
+        # отметить (это не качество из списка) — ловим самые явные формы сами.
+        screener = data.get("screener")
+        if isinstance(screener, bool):
+            cleaned["screener"] = screener
+        elif re.search(r"экранк|кам[- ]?рип|телесинк", lowered):
+            cleaned["screener"] = True
+        else:
+            cleaned["screener"] = None
         cleaned["intent"] = data.get("intent") if isinstance(data.get("intent"), str) else None
         refine = data.get("refine")
         cleaned["refine"] = refine if isinstance(refine, bool) else None
@@ -1484,6 +1749,75 @@ class Agent:
                                                                  "название": task.title},
             )
 
+    async def _start_from_link(
+        self, session_id: str, text: str, torrent_id: str, turn: Turn
+    ) -> None:
+        """Задача по ссылке на раздачу — без поиска и без разбора запроса.
+
+        Человек часто присылает готовую ссылку («держи, …/details.php?id=123»).
+        Открываем страницу раздачи, собираем `Torrent` из её данных и сразу
+        показываем то же, что показали бы после поиска: выбор серий или
+        карточку подтверждения.
+        """
+        turn.add(f"Открываю раздачу по ссылке (id {torrent_id})…", kind="text")
+        try:
+            details = await self.mcp.details(torrent_id)
+        except MCPError as exc:
+            turn.add(f"Не смог открыть раздачу #{torrent_id}: {exc}", kind="error")
+            return
+
+        torrent = self._torrent_from_details(torrent_id, details)
+        if not torrent.title:
+            turn.add(
+                f"Страница раздачи #{torrent_id} не отдала название — возможно, "
+                "ссылка устарела или раздачу удалили.",
+                kind="error",
+            )
+            return
+
+        kind = "series" if (torrent.seasons or torrent.episodes) else "movie"
+        task = await self._task_from_params(
+            session_id,
+            text,
+            {"title": (torrent.series_title or torrent.title).strip(), "type": kind},
+            kind="oneshot",
+        )
+        task.options = {"pool": [torrent.to_dict()], "queries": [torrent_id]}
+        task.state = "searching"
+        await self.store.save_task(task)
+        await self._close_stale_tasks(session_id, "oneshot", keep_id=task.id)
+        journal.add(
+            "agent",
+            "задача заведена по ссылке на раздачу",
+            {"раздача": torrent.id, "название": torrent.title, "сидов": torrent.seeds},
+        )
+
+        turn.task = task
+        turn.add(f"По ссылке: «{torrent.title}»", kind="text", task_id=task.id)
+        await self._present_candidate(task, [torrent], turn)
+
+    @staticmethod
+    def _torrent_from_details(torrent_id: str, details: dict[str, Any]) -> Torrent:
+        """Раздача из страницы `details.php`: название, вес, сиды и качество."""
+        torrent = parse_torrent(
+            {
+                "id": torrent_id,
+                "title": str(details.get("title") or ""),
+                "size": details.get("size") or "",
+                "seeds": details.get("seeds") or 0,
+                "peers": details.get("peers") or 0,
+                "uploadDate": details.get("uploadDate") or "",
+                "uploader": details.get("uploader") or "",
+                "category": details.get("category") or "",
+            }
+        )
+        # Страница отдаёт качество отдельной строкой («WEB-DL (1080p)»), а в
+        # названии старых раздач его может не быть вовсе.
+        for label in extract_qualities(str(details.get("quality") or "")):
+            if label not in torrent.qualities:
+                torrent.qualities.append(label)
+        return torrent
+
     async def _start_oneshot(
         self, session_id: str, text: str, parsed: dict[str, Any], turn: Turn
     ) -> None:
@@ -1507,9 +1841,7 @@ class Agent:
                 **{
                     key: value
                     for key, value in parsed.items()
-                    if key in ("title", "original_title", "quality", "voice", "season",
-                               "episode_from", "year", "type", "aliases")
-                    and value not in (None, "", "null", [])
+                    if key in PARAM_KEYS and value not in (None, "", "null", [])
                 },
             }
             task.state = "searching"
@@ -1578,6 +1910,25 @@ class Agent:
             },
         )
         by_title = filter_candidates(pool, {"title": params.get("title") or ""})
+        # Экранки в by_title уже отфильтрованы правилом (core/matching.py).
+        # Но если по названию есть ТОЛЬКО они — об этом надо сказать, иначе
+        # человек решит, что раздачи нет вовсе.
+        screeners = [
+            item
+            for item in pool
+            if item.screener
+            and not params.get("screener")
+            and title_match(str(params.get("title") or ""), item)
+        ]
+        if screeners:
+            journal.add(
+                "agent",
+                "экранки убраны из выдачи",
+                {"сколько": len(screeners), "пример": screeners[0].title[:120]},
+            )
+        if not by_title and screeners:
+            await self._offer_screeners(task, screeners, turn)
+            return
         if not by_title:
             suggestions = (task.options or {}).get("suggestions") or []
             if suggestions:
@@ -1709,6 +2060,7 @@ class Agent:
             lines.append(line)
         lines.append("")
         lines.append("Кнопка выберет раздачу — и я поищу заново уже по ней.")
+        lines.append(DETAILS_HINT)
         message = turn.add(
             "\n".join(lines),
             kind="tickets",
@@ -1725,6 +2077,12 @@ class Agent:
                     group="Похожие названия",
                 )
             )
+        # О самом вероятном варианте можно прочитать сразу: иначе непонятно,
+        # чем «Дюна» отличается от «Планеты Дюна».
+        if suggestions:
+            message.actions.extend(
+                self._torrent_actions(task, torrent_id=str(suggestions[0].get("torrent_id") or ""))
+            )
         message.actions.append(
             Action(
                 id="cancel-title",
@@ -1736,6 +2094,56 @@ class Agent:
         )
         task.state = "awaiting_choice"
         await self.store.save_task(task)
+
+    async def _offer_screeners(self, task: Task, screeners: list[Torrent], turn: Turn) -> None:
+        """По названию есть только экранки: говорим прямо и даём выбор.
+
+        Молча сказать «ничего не нашлось» нельзя — раздача есть, и человек
+        будет искать её руками. Но и подсовывать CAM/TS без предупреждения
+        нельзя: это другой продукт по качеству.
+        """
+        best = rank(screeners, task.params)[0]
+        lines = [
+            f"По запросу «{task.title}» нашлись только экранки (CAM/TS/SCR) — "
+            "их я не предлагаю: картинка и звук сняты с экрана.",
+            "",
+            f"• {best.title}",
+            f"• {self._signals_line(best)}",
+            "",
+            "Если это единственный вариант — возьмите кнопкой ниже. "
+            "Хотите нормальную раздачу — можно следить за ней.",
+        ]
+        task.state = "awaiting_choice"
+        await self.store.save_task(task)
+        message = turn.add("\n".join(lines), kind="tickets", task_id=task.id,
+                           payload={"task": task.to_dict(), "screeners": len(screeners)})
+        message.actions = [
+            Action(
+                id="allow-screeners",
+                label="Показать экранку",
+                kind="choose",
+                payload={"task_id": task.id, "dimension": "screener", "value": "1"},
+                style="primary",
+            ),
+            *self._torrent_actions(task, torrent=best),
+            Action(
+                id="screeners-periodic",
+                label="Следить за нормальной раздачей",
+                kind="make_periodic",
+                payload={
+                    "task_id": task.id,
+                    "interval_minutes": self.settings.default_interval_minutes,
+                    "auto_download": False,
+                },
+            ),
+            Action(
+                id="cancel-screeners",
+                label="Отмена",
+                kind="cancel",
+                payload={"task_id": task.id},
+                style="danger",
+            ),
+        ]
 
     async def _offer_suggestions(self, task: Task, suggestions: list[dict], turn: Turn) -> None:
         """«Не найдено — возможно, вы имели в виду…» с кнопками."""
@@ -1821,11 +2229,19 @@ class Agent:
         else:
             lines = [f"Под эти условия ничего не подошло: {self._filters_text(params)}.", ""]
         if q_options["qualities"]:
-            lines.append(
-                "• качество: " + ", ".join(self._quality_label(v) for v in q_options["qualities"][:6])
+            # Те же сигналы, что и в вопросе о качестве: видно, что даёт
+            # каждый вариант, а не просто список слов.
+            lines.append("• качество:")
+            lines.extend(
+                self._option_summaries(
+                    q_pool, "quality", q_options["qualities"], params
+                )
             )
         if v_options["voices"]:
-            lines.append("• озвучка: " + ", ".join(v_options["voices"][:6]))
+            lines.append("• озвучка:")
+            lines.extend(
+                self._option_summaries(v_pool, "voice", v_options["voices"], params)
+            )
         if not (q_options["qualities"] or v_options["voices"]):
             lines.append("С учётом остальных условий вариантов нет — попробуйте убрать фильтры.")
         else:
@@ -1875,6 +2291,11 @@ class Agent:
                     payload={"task_id": task.id, "dimension": "voice", "value": ""},
                 )
             )
+        # Подробности о лучшей из найденных — здесь же, чтобы можно было
+        # понять, тот ли это фильм, не начиная скачивание.
+        message.actions.extend(
+            self._torrent_actions(task, torrent=self._best_torrent(by_title, params))
+        )
         message.actions.append(
             Action(
                 id="cancel-options",
@@ -1941,7 +2362,15 @@ class Agent:
                         line += f", {years}"
                     lines.append(line)
                 lines.append("")
-        lines.append(f"Доступно с учётом остальных условий: {shown}.")
+        # Под каждым вариантом — вес, сиды и возраст лучшей раздачи: иначе
+        # «1080p» и «1080p» выглядят одинаково, хотя одна мёртвая, а другая 40 ГБ.
+        summary = self._option_summaries(found, dimension, values, task.params)
+        if summary:
+            lines.append("Доступно с учётом остальных условий:")
+            lines.extend(summary)
+        else:
+            lines.append(f"Доступно с учётом остальных условий: {shown}.")
+        lines.append(DETAILS_HINT)
         text = "\n".join(lines)
         group = "Качество" if dimension == "quality" else "Озвучка"
         message = turn.add(text, kind="tickets", task_id=task.id, payload={"task": task.to_dict()})
@@ -1972,6 +2401,11 @@ class Agent:
                         group="Похожие названия",
                     )
                 )
+        # «Подробнее» о лучшей раздаче прямо на этом шаге: решить, нужен ли
+        # этот фильм, хочется до выбора качества, а не после.
+        message.actions.extend(
+            self._torrent_actions(task, torrent=self._best_torrent(found, task.params))
+        )
         message.actions.append(
             Action(
                 id="cancel-choose",
@@ -1997,6 +2431,8 @@ class Agent:
             bits.append(f"озвучка {params['voice']}")
         if params.get("episode_from"):
             bits.append(f"серия {params['episode_from']}")
+        if params.get("screener"):
+            bits.append("с экранкой")
         return ", ".join(bits) or "без уточнений"
 
     async def _listing_entries(self, torrent: Torrent) -> list[dict[str, Any]] | None:
@@ -2165,41 +2601,139 @@ class Agent:
                     )
                 )
 
-    def _build_episodes_plan(self, task: Task, episodes: list[int]) -> dict | None:
-        """План по выбранным сериям: файлы, вес, номера."""
+    # ------------------------------------------------------------------
+    # Серии: один вид на все места (сезон + номер)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _pair_key(season: Any, episode: Any) -> tuple[int | None, int]:
+        """(сезон, серия) — ключ, по которому сверяем выбор и файлы."""
+        try:
+            season_value = int(season) if season is not None and season != "" else None
+        except (TypeError, ValueError):
+            season_value = None
+        try:
+            episode_value = int(episode)
+        except (TypeError, ValueError):
+            episode_value = 0
+        return season_value, episode_value
+
+    @classmethod
+    def _as_pairs(cls, value: Any) -> list[dict[str, Any]]:
+        """Серии в одном виде: `[{'season': 2, 'episode': 1}, …]`.
+
+        В старых задачах серии лежали просто числами. Число без сезона значит
+        «эта серия в сезоне задачи» (а если сезона нет — в любом): иначе для
+        пачки «1-4 сезоны» выбор «серия 1» раскрывался в четыре файла.
+        """
+        pairs: list[dict[str, Any]] = []
+        seen: set[tuple[int | None, int]] = set()
+        for item in value or []:
+            if isinstance(item, dict):
+                season, episode = item.get("season"), item.get("episode")
+            elif isinstance(item, (list, tuple)) and len(item) == 2:
+                season, episode = item[0], item[1]
+            else:
+                season, episode = None, item
+            key = cls._pair_key(season, episode)
+            if not key[1] or key in seen:
+                continue
+            seen.add(key)
+            pairs.append({"season": key[0], "episode": key[1]})
+        return pairs
+
+    @staticmethod
+    def _episodes_text(pairs: list[dict[str, Any]]) -> str:
+        """«сезон 2, серия 1» / «сезон 2, серии 1, 3» / «серии 2×1, 3×4»."""
+        if not pairs:
+            return ""
+        seasons = {item.get("season") for item in pairs}
+        numbers = sorted({int(item["episode"]) for item in pairs})
+        if len(seasons) == 1:
+            season = next(iter(seasons))
+            if len(numbers) == 1:
+                body = f"серия {numbers[0]}"
+            elif numbers == list(range(numbers[0], numbers[-1] + 1)) and len(numbers) > 2:
+                body = f"серии {numbers[0]}–{numbers[-1]}"
+            else:
+                body = "серии " + ", ".join(str(number) for number in numbers)
+            return f"сезон {season}, {body}" if season is not None else body
+        listed = ", ".join(
+            f"{item.get('season')}×{item['episode']}" if item.get("season") is not None
+            else str(item["episode"])
+            for item in sorted(pairs, key=lambda pair: (pair.get("season") or 0, int(pair["episode"])))
+        )
+        return "серии " + listed
+
+    def _build_episodes_plan(self, task: Task, episodes: Any) -> dict | None:
+        """План по выбранным сериям: файлы, вес, номера.
+
+        Выбор сверяется по паре (сезон, серия). Раньше сверялся только номер:
+        в пачке «1-4 сезоны» одно нажатие «Серия 1» ставило в очередь
+        S01E01, S02E01, S03E01 и S04E01 — четыре файла вместо одного.
+        """
         groups = (task.options or {}).get("episode_groups") or []
+        wanted_pairs = self._as_pairs(episodes)
+        if not wanted_pairs:
+            return None
+        task_season = task.params.get("season")
+        wanted_keys: set[tuple[int | None, int]] = set()
+        for pair in wanted_pairs:
+            season = pair["season"]
+            if season is None and task_season not in (None, ""):
+                try:
+                    season = int(task_season)
+                except (TypeError, ValueError):
+                    season = None
+            wanted_keys.add((season, int(pair["episode"])))
+
+        matched: list[dict[str, Any]] = []
+        for group in groups:
+            group_season, group_episode = self._pair_key(
+                group.get("season"), group.get("episode")
+            )
+            for season, episode in wanted_keys:
+                if episode != group_episode:
+                    continue
+                if season is not None and group_season is not None and season != group_season:
+                    continue
+                matched.append(group)
+                break
+        if not matched:
+            return None
+
         wanted: list[int] = []
         size = 0
         names: list[str] = []
-        seasons: set[int] = set()
-        for group in groups:
-            if int(group.get("episode") or 0) not in episodes:
-                continue
+        selected: list[dict[str, Any]] = []
+        for group in matched:
             wanted.extend(int(index) for index in (group.get("indexes") or []))
             size += int(group.get("size") or 0)
             names.extend(str(name) for name in (group.get("names") or []))
-            if group.get("season") is not None:
-                seasons.add(int(group["season"]))
-        if not wanted:
-            return None
+            selected.append(
+                {
+                    "season": self._pair_key(group.get("season"), group.get("episode"))[0],
+                    "episode": int(group.get("episode") or 0),
+                }
+            )
+        selected.sort(key=lambda item: (item.get("season") or 0, item["episode"]))
         total_size = sum(int(group.get("size") or 0) for group in groups)
-        season = sorted(seasons)[0] if len(seasons) == 1 else None
+        seasons = {item["season"] for item in selected if item["season"] is not None}
         return {
             "kind": "episode",
             "wanted": sorted(set(wanted)),
             "size": size,
             "names": names,
-            "season": season,
-            "episode": max(episodes),
-            "selected_episodes": sorted(episodes),
-            "episodes": [{"season": season, "episode": item} for item in sorted(episodes)],
+            "season": next(iter(seasons)) if len(seasons) == 1 else None,
+            "episode": max(item["episode"] for item in selected),
+            "selected_episodes": selected,
+            "episodes": selected,
             "total_size": total_size,
             "pack": True,
             "total_files": len(wanted),
         }
 
     async def _confirm_selected_episodes(
-        self, task: Task, episodes: list[int], turn: Turn
+        self, task: Task, episodes: Any, turn: Turn
     ) -> None:
         """Полная карточка по выбранным сериям (для альтернатив и проверок)."""
         plan = self._build_episodes_plan(task, episodes)
@@ -2210,7 +2744,11 @@ class Agent:
                 task_id=task.id,
             )
             return
-        task.options = {**(task.options or {}), "plan": plan, "selected_episodes": episodes}
+        task.options = {
+            **(task.options or {}),
+            "plan": plan,
+            "selected_episodes": plan["selected_episodes"],
+        }
         task.state = "awaiting_confirm"
         await self.store.save_task(task)
         message = turn.add(
@@ -2279,8 +2817,13 @@ class Agent:
 
         `path` может быть None: состав раздачи пришёл со страницы трекера,
         а .torrent скачается уже после нажатия «Скачать».
+
+        В пачке на несколько сезонов («1-4 сезоны: 1-40 серии») показываем
+        только сезон задачи: иначе список — это 40 кнопок «Серия 1…10»,
+        повторённых четыре раза, и понять, что выбрал, невозможно.
         """
-        selected = [int(item) for item in (getattr(task, "options", {}) or {}).get("selected_episodes") or []]
+        selected = self._as_pairs((getattr(task, "options", {}) or {}).get("selected_episodes"))
+        selected_keys = {(item["season"], item["episode"]) for item in selected}
         task.options = {
             **(task.options or {}),
             "episode_groups": [
@@ -2297,18 +2840,44 @@ class Agent:
         }
         if path is not None:
             task.options["torrent_path"] = str(path)
-        seasons = {group.get("season") for group in groups if group.get("season")}
-        head = f"В раздаче {_plural(len(groups), 'серия', 'серии', 'серий')}"
-        if len(seasons) == 1:
-            head += f" (сезон {seasons.pop()})"
+
+        pack_seasons = sorted(
+            {int(group["season"]) for group in groups if group.get("season") is not None}
+        )
+        task_season = task.params.get("season")
+        try:
+            task_season = int(task_season) if task_season not in (None, "") else None
+        except (TypeError, ValueError):
+            task_season = None
+        # Какой сезон показываем: сезон задачи, если он есть в этой пачке.
+        shown_season = task_season if task_season in pack_seasons else None
+        visible = [
+            group for group in groups
+            if shown_season is None or self._pair_key(group.get("season"), group.get("episode"))[0] == shown_season
+        ] or groups
+        multi_season = len({self._pair_key(group.get("season"), group.get("episode"))[0] for group in visible}) > 1
+
+        head = f"В раздаче {_plural(len(visible), 'серия', 'серии', 'серий')}"
+        if shown_season is not None:
+            head += f" (сезон {shown_season})"
+            if len(pack_seasons) > 1:
+                head += f", а в пачке сезоны {pack_seasons[0]}–{pack_seasons[-1]}"
+        elif len(pack_seasons) > 1:
+            head += f" (сезоны {pack_seasons[0]}–{pack_seasons[-1]})"
         head += " — что качаем?"
         storage = self.transmission.storage_info()
         info = storage.to_dict()
-        lines = [
-            head,
-            "",
-            "• Весь сезон — " + human_bytes(sum(int(group.get("size") or 0) for group in groups)),
-        ]
+        lines = [head, ""]
+        # Что за раздача и живая ли она — до выбора серий, а не после.
+        lines.extend(self._torrent_warnings(torrent))
+        signals = self._signals_line(torrent)
+        if signals:
+            lines.append(f"• Раздача: {signals}")
+        season_size = sum(int(group.get("size") or 0) for group in visible)
+        lines.append(
+            ("• Весь сезон — " if shown_season is not None else "• Вся раздача — ")
+            + human_bytes(season_size)
+        )
         if storage.ok:
             lines.append(
                 f"• Диск «{info['volume']}»: свободно {info['free_human']} "
@@ -2320,23 +2889,25 @@ class Agent:
         lines.append("• Куда: " + str(self.settings.transmission_download_dir))
         message = turn.add("\n".join(lines), kind="tickets", task_id=task.id,
                            payload={"task": task.to_dict(), "torrent": torrent.to_dict()})
-        for group in groups[:24]:
-            episode = int(group.get("episode") or 0)
+        for group in visible[:40]:
+            season, episode = self._pair_key(group.get("season"), group.get("episode"))
             label = f"Серия {episode} · {human_bytes(int(group.get('size') or 0))}"
+            if multi_season and season is not None:
+                label = f"{season}×{episode} · {human_bytes(int(group.get('size') or 0))}"
             message.actions.append(
                 Action(
-                    id=f"ep-{episode}",
+                    id=f"ep-{season if season is not None else 'x'}-{episode}",
                     label=label,
                     kind="toggle_episode",
                     payload={
                         "task_id": task.id,
                         "episode": episode,
-                        "season": group.get("season"),
+                        "season": season,
                         "size": int(group.get("size") or 0),
                     },
                     group="Серии",
                     multi=True,
-                    selected=episode in selected,
+                    selected=(season, episode) in selected_keys,
                 )
             )
         message.actions.append(
@@ -2352,12 +2923,13 @@ class Agent:
         message.actions.append(
             Action(
                 id="whole-pack",
-                label="Весь сезон",
+                label=f"Весь сезон {shown_season}" if shown_season is not None else "Весь сезон",
                 kind="download_all",
-                payload={"task_id": task.id},
+                payload={"task_id": task.id, "season": shown_season},
                 group="Действие",
             )
         )
+        message.actions.extend(self._torrent_actions(task))
         message.actions.append(
             Action(
                 id="cancel-episodes",
@@ -2869,7 +3441,12 @@ class Agent:
                     "episode": picked["episode"],
                     "season": picked["season"] if picked["season"] is not None else season,
                     # Что именно скачаем — по этим сериям пишется память агента.
-                    "selected_episodes": [picked["episode"]],
+                    "selected_episodes": [
+                        {
+                            "season": picked["season"] if picked["season"] is not None else season,
+                            "episode": picked["episode"],
+                        }
+                    ],
                 }
             if pack:
                 return {**base, "kind": "choose", "reason": "missing_episode"}
@@ -2952,6 +3529,118 @@ class Agent:
         )
         return actions
 
+    # ------------------------------------------------------------------
+    # Что видно о раздаче: сигналы, предупреждения, ссылка на трекер
+    # ------------------------------------------------------------------
+    def _torrent_link(self, torrent_id: str) -> str:
+        """Адрес страницы раздачи на трекере — туда, где комментарии."""
+        base = str(getattr(self.settings, "kinozal_base_url", "") or "https://kinozal.me")
+        return f"{base.rstrip('/')}/details.php?id={str(torrent_id).strip()}"
+
+    @staticmethod
+    def _signals_line(torrent: Torrent) -> str:
+        """«36,8 ГБ · 12 сидов · 2 дня назад» — короткие факты о раздаче.
+
+        Одна строка, по которой видно, стоит ли брать: вес, живые сиды и
+        возраст. Без неё «1080p» и «1080p» выглядят одинаково.
+        """
+        bits: list[str] = []
+        if torrent.size:
+            bits.append(_comma(torrent.size))
+        if torrent.seeds or torrent.peers:
+            bits.append(_plural(torrent.seeds, "сид", "сида", "сидов"))
+        else:
+            bits.append("без сидов")
+        age = _age_text(torrent.uploaded_ts)
+        if age:
+            bits.append(age)
+        return " · ".join(bits)
+
+    @staticmethod
+    def _torrent_warnings(torrent: Torrent) -> list[str]:
+        """Что важно знать до скачивания: мёртвая раздача, экранка."""
+        warnings: list[str] = []
+        if torrent.screener:
+            warnings.append("⚠ Экранка (CAM/TS): снято с экрана — картинка и звук хуже релиза.")
+        if not (torrent.seeds or torrent.peers):
+            warnings.append("⚠ Сидов нет — качать будет нечем. Лучше взять другую раздачу.")
+        elif torrent.seeds <= 2:
+            warnings.append(f"⚠ Мало сидов ({torrent.seeds}) — скорость будет низкой.")
+        return warnings
+
+    def _option_summaries(
+        self,
+        found: list[Torrent],
+        dimension: str,
+        values: list[str],
+        params: dict[str, Any] | None = None,
+    ) -> list[str]:
+        """Под каждым вариантом — что он реально даёт: вес, сиды, возраст.
+
+        «1080p — 5 раздач, лучшая: 36,8 ГБ · 12 сидов · 2 дня назад». Так
+        выбор качества перестаёт быть выбором вслепую.
+        """
+        params = params or {}
+        lines: list[str] = []
+        for value in values[:8]:
+            if dimension == "quality":
+                subset = [item for item in found if quality_match(value, item.qualities)]
+                label = self._quality_label(value)
+            else:
+                subset = [item for item in found if voice_match(value, item.voices)]
+                label = value
+            if not subset:
+                lines.append(f"• {label} — вариантов нет")
+                continue
+            best = rank(subset, params)[0]
+            detail = self._signals_line(best)
+            line = f"• {label} — {_plural(len(subset), 'раздача', 'раздачи', 'раздач')}"
+            if detail:
+                line += f", лучшая: {detail}"
+            lines.append(line)
+        return lines
+
+    async def torrent_details(self, torrent_id: str) -> dict[str, Any]:
+        """Подробности раздачи для кнопки «Подробнее»: жанр, актёры, описание.
+
+        Запрашивается только по нажатию: обычный поиск не должен ждать ещё
+        один запрос через шлюз Cloudflare. Ответ кэшируется на 10 минут.
+        """
+        torrent_id = str(torrent_id or "").strip()
+        if not torrent_id.isdigit():
+            raise MCPError(f"«{torrent_id}» не похоже на номер раздачи")
+
+        cached = self._details_cache.get(torrent_id)
+        now = time.monotonic()
+        if cached and now - cached[0] < self._details_cache_ttl:
+            return cached[1]
+
+        data = await self.mcp.details(torrent_id)
+        result = {
+            "id": torrent_id,
+            "title": str(data.get("title") or ""),
+            "original_title": str(data.get("originalTitle") or ""),
+            "year": str(data.get("year") or ""),
+            "genre": str(data.get("genre") or ""),
+            "director": str(data.get("director") or ""),
+            "cast": _shorten(str(data.get("cast") or ""), 300),
+            "description": str(data.get("description") or ""),
+            "quality": str(data.get("quality") or ""),
+            "video": str(data.get("video") or ""),
+            "audio": str(data.get("audio") or ""),
+            "size": str(data.get("size") or ""),
+            "seeds": int(data.get("seeds") or 0),
+            "peers": int(data.get("peers") or 0),
+            "upload_date": str(data.get("uploadDate") or ""),
+            "update_date": str(data.get("updateDate") or ""),
+            "url": self._torrent_link(torrent_id),
+        }
+        # Кэш не растёт бесконечно: держим последние 50 раздач.
+        if len(self._details_cache) > 50:
+            self._details_cache.clear()
+        self._details_cache[torrent_id] = (now, result)
+        return result
+
     def _confirm_card_text(self, task: Task, torrent: Torrent, plan: dict[str, Any]) -> str:
         """Полная информация перед скачиванием: что, сколько и куда."""
         storage = self.transmission.storage_info()
@@ -2961,26 +3650,47 @@ class Agent:
         fits = storage.ok and storage.free >= needed + reserve
 
         lines = [f"Раздача: {torrent.title}", ""]
+        # Мёртвую раздачу видно до подтверждения, а не через час ожидания.
+        warnings = self._torrent_warnings(torrent)
+        for warning in warnings:
+            lines.append(warning)
+        if warnings:
+            lines.append("")
+        crowd: list[str] = []
+        if torrent.seeds or torrent.peers:
+            crowd.append(f"Сиды: {torrent.seeds}")
+            if torrent.peers:
+                crowd.append(f"пиры: {torrent.peers}")
+        if torrent.comments:
+            crowd.append(f"обсуждали {torrent.comments}")
+        if crowd:
+            lines.append("• " + " · ".join(crowd))
         if torrent.qualities:
             lines.append("• Качество: " + ", ".join(torrent.qualities[:3]))
         if torrent.voices:
             lines.append("• Озвучка: " + ", ".join(torrent.voices[:3]))
-        selected_episodes = [int(item) for item in (plan.get("selected_episodes") or [])]
+        selected_episodes = self._as_pairs(plan.get("selected_episodes"))
         if plan.get("season") or plan.get("episode") or selected_episodes:
-            season = plan.get("season")
-            season_text = f"Сезон {season}" if season else "Сезон —"
-            if len(selected_episodes) > 1:
-                listed = ", ".join(str(item) for item in selected_episodes)
-                episode_text = f"серии {listed}"
-            elif plan.get("episode"):
-                episode_text = f"серия {plan['episode']}"
-            else:
-                episode_text = "серия —"
-            lines.append(f"• {season_text}, {episode_text}")
+            text = self._episodes_text(selected_episodes)
+            if not text:
+                season = plan.get("season")
+                text = f"сезон {season}, серия {plan.get('episode')}" if season \
+                    else f"серия {plan.get('episode')}"
+            lines.append(f"• {text[0].upper()}{text[1:]}")
         if torrent.year:
             lines.append(f"• Год: {torrent.year}")
         if torrent.size:
-            lines.append(f"• На трекере: {_comma(torrent.size)}")
+            # Возраст и автор — рядом с весом: по ним видно, свежий это релиз
+            # и кто его залил.
+            line = f"• На трекере: {_comma(torrent.size)}"
+            age = _age_text(torrent.uploaded_ts)
+            if age:
+                line += f" · залит {age}"
+            elif torrent.upload_date:
+                line += f" · залит {_comma(torrent.upload_date)}"
+            if torrent.uploader:
+                line += f" · залил {torrent.uploader}"
+            lines.append(line)
 
         names = plan.get("names") or []
         if plan.get("kind") == "single" and len(names) == 1:
@@ -3018,33 +3728,41 @@ class Agent:
     @staticmethod
     def _plan_from_episodes(entries: list[Any], plan: dict[str, Any]) -> dict[str, Any] | None:
         """Пересобирает план серий по настоящему .torrent (когда индексы разошлись)."""
-        episodes = sorted({int(item) for item in (plan.get("selected_episodes") or [])})
-        if not episodes:
+        pairs = self._as_pairs(plan.get("selected_episodes") or plan.get("episodes"))
+        if not pairs:
             return None
-        season = plan.get("season")
+        fallback_season = plan.get("season")
         wanted: list[int] = []
         names: list[str] = []
         size = 0
         seasons: set[int] = set()
-        for episode in episodes:
+        selected: list[dict[str, Any]] = []
+        for pair in pairs:
+            season = pair["season"] if pair["season"] is not None else fallback_season
+            episode = pair["episode"]
             picked = pick_episode(entries, season=season, episode=episode)
             if not picked:
                 continue
             wanted.extend(picked.get("indexes") or [])
             size += int(picked.get("size") or 0)
             names.extend(picked.get("names") or [])
-            if picked.get("season") is not None:
-                seasons.add(int(picked["season"]))
+            picked_season = picked.get("season") if picked.get("season") is not None else season
+            if picked_season is not None:
+                seasons.add(int(picked_season))
+            selected.append({"season": picked_season, "episode": int(picked.get("episode") or episode)})
         if not wanted:
             return None
+        selected.sort(key=lambda item: (item.get("season") or 0, item["episode"]))
         return {
             **plan,
             "kind": "episode",
             "wanted": sorted(set(wanted)),
             "size": size,
             "names": names,
-            "season": next(iter(seasons)) if len(seasons) == 1 else season,
-            "selected_episodes": episodes,
+            "season": next(iter(seasons)) if len(seasons) == 1 else None,
+            "episode": max(item["episode"] for item in selected),
+            "selected_episodes": selected,
+            "episodes": selected,
             "total_files": len(entries),
             "total_size": sum(entry.size for entry in entries),
         }
@@ -3139,6 +3857,7 @@ class Agent:
                     payload={"task_id": task.id},
                 )
             )
+        actions.extend(self._torrent_actions(task))
         actions.append(
             Action(
                 id="cancel-download",
@@ -3149,6 +3868,51 @@ class Agent:
             )
         )
         return actions
+
+    def _torrent_actions(
+        self,
+        task: Task,
+        torrent: Torrent | None = None,
+        torrent_id: str = "",
+    ) -> list[Action]:
+        """Кнопки «посмотреть раздачу»: подробности и страница на трекере.
+
+        Работают на любом шаге: пока раздача не выбрана, передаём ту, о которой
+        идёт речь (лучшую из найденных на этом шаге) — «что это за фильм»
+        хочется прочитать ДО выбора качества, а не после.
+
+        «Подробнее» открывается клиентом (`/api/torrent/<id>/details`): это не
+        действие над задачей, поэтому в чат ничего не пишется.
+        """
+        identifier = (
+            torrent_id
+            or (torrent.id if torrent is not None else "")
+            or str((task.candidate or {}).get("id") or "")
+        ).strip()
+        if not identifier:
+            return []
+        return [
+            Action(
+                id=f"details-{identifier}",
+                label="Подробнее",
+                kind="details",
+                payload={"task_id": task.id, "torrent_id": identifier},
+                group="Раздача",
+            ),
+            Action(
+                id=f"open-{identifier}",
+                label="Открыть на трекере",
+                kind="link",
+                url=self._torrent_link(identifier),
+                group="Раздача",
+            ),
+        ]
+
+    def _best_torrent(self, torrents: list[Torrent], params: dict[str, Any] | None = None) -> Torrent | None:
+        """Лучшая раздача из списка — о ней и показываем подробности."""
+        if not torrents:
+            return None
+        return rank(torrents, params or {})[0]
 
     async def _report_storage_problem(
         self, task: Task, torrent: Torrent, result: dict[str, Any], turn: Turn
@@ -3290,7 +4054,11 @@ class Agent:
                 progress = (await self.transmission.progress([torrent_hash])).get(torrent_hash) or {}
             except Exception:  # noqa: BLE001 - прогресс не критичен
                 progress = {}
-        finished = bool(progress.get("done")) or not progress
+        # «Готово» ставим только когда Transmission прямо сказал, что всё
+        # скачано. Раньше отсутствие данных о прогрессе (RPC ещё не ответил
+        # про только что добавленную раздачу) считалось завершением — задача
+        # уходила в «готово» и больше не опрашивалась, хотя файл качался.
+        finished = bool(progress) and bool(progress.get("done"))
         if progress:
             task.params["progress"] = progress
             plan = {**plan, "progress": progress}
@@ -3321,6 +4089,14 @@ class Agent:
     async def _auto_download(self, task: Task, torrent: Torrent, turn: Turn) -> None:
         """Скачивание без диалога (периодическая задача в режиме «качать сразу»)."""
         result = await self._download(task, torrent)
+        if result.get("ok") and result.get("needs_choice"):
+            # Пачка без выбранной серии: показываем выбор, а не качаем всё.
+            groups = result.get("groups") or []
+            path_str = str(result.get("path") or "")
+            await self._show_episode_picker(
+                task, torrent, groups, Path(path_str) if path_str else None, turn
+            )
+            return
         if result.get("ok") and result.get("skipped"):
             turn.add(
                 f"«{torrent.title}» — {result['reason']}. Продолжаю следить.",
@@ -3360,16 +4136,10 @@ class Agent:
         progress = result.get("progress") or {}
         in_progress = bool(progress) and not progress.get("done")
         lines = [("Качается: " if in_progress else "Готово: ") + f"«{torrent.title}»"]
-        picked = [int(item) for item in (plan.get("selected_episodes") or [])]
-        if len(picked) > 1:
-            season = f"сезон {plan['season']}, " if plan.get("season") else ""
-            lines.append(
-                f"Качаю {season}серии " + ", ".join(str(item) for item in picked)
-                + f" — {human_bytes(plan.get('size'))}"
-            )
-        elif plan.get("episode"):
-            season = f"сезон {plan['season']}, " if plan.get("season") else ""
-            lines.append(f"Качаю {season}серию {plan['episode']} — {human_bytes(plan.get('size'))}")
+        picked = self._as_pairs(plan.get("selected_episodes") or plan.get("episodes"))
+        if picked:
+            what = self._episodes_text(picked)
+            lines.append(f"Качаю {what} — {human_bytes(plan.get('size'))}")
         elif plan.get("size"):
             lines.append(f"Качаю: {human_bytes(plan.get('size'))}")
         if result.get("transmission"):
@@ -3469,31 +4239,24 @@ class Agent:
         raw_selected = plan.get("selected_episodes") or (
             [plan["episode"]] if plan.get("episode") is not None else []
         )
-        episodes: list[int] = []
-        for item in raw_selected:
-            value = item.get("episode") if isinstance(item, dict) else item
-            try:
-                if value is not None:
-                    episodes.append(int(value))
-            except (TypeError, ValueError):
-                continue
-
-        if not episodes:
+        pairs = self._as_pairs(raw_selected)
+        if not pairs:
             await self.store.record_download(
                 task, torrent, str(path), transmission_hash, torrent_name=torrent_name
             )
             return
 
-        season = plan.get("season")
-        try:
-            season_value = int(season) if season is not None else None
-        except (TypeError, ValueError):
-            season_value = None
-        for episode in sorted(set(episodes)):
+        fallback_season = plan.get("season")
+        for pair in pairs:
+            season_value = pair["season"] if pair["season"] is not None else fallback_season
+            try:
+                season_value = int(season_value) if season_value is not None else None
+            except (TypeError, ValueError):
+                season_value = None
             try:
                 recorded = replace(
                     torrent,
-                    episodes=[episode],
+                    episodes=[int(pair["episode"])],
                     seasons=[season_value] if season_value is not None else torrent.seasons,
                     episodes_total=torrent.episodes_total,
                 )
@@ -3510,7 +4273,58 @@ class Agent:
         `episode_from` и не ниже той, что идёт за уже скачанной. Если раздача —
         пачка на 14 выпусков, где сейчас 1–2, а нужна третья, то при появлении
         «1–3» скачается только третий файл.
+
+        Порядок важен из-за суточного лимита торрент-файлов: сначала состав
+        раздачи спрашиваем у страницы трекера (`get_file_list`, лимит не
+        тратит) и только если нужная серия там правда есть — качаем `.torrent`.
+        Иначе каждая проверка «на всякий случай» съедала бы по одному файлу
+        лимита, даже когда качать нечего.
         """
+        params = task.params or {}
+        try:
+            season = int(params["season"]) if params.get("season") is not None else None
+        except (TypeError, ValueError):
+            season = None
+        next_episode = int(params.get("next_episode") or 0)
+        if not next_episode:
+            # Прогресс берём из базы (удалённые серии тоже учитываются).
+            progress: dict[int, int] = {}
+            if torrent.series_key:
+                progress = await self.store.episodes_by_season(torrent.series_key)
+            next_episode = self._next_episode(params, progress)
+
+        # 1) Бесплатная проверка: что реально лежит в раздаче.
+        preview_entries = parse_files(await self._listing_entries(torrent) or [])
+        numbered = [entry for entry in preview_entries if entry.episode is not None]
+        if next_episode and numbered:
+            # Решаем только когда номера серий видны в именах файлов. Если их
+            # нет (бывает «Ставка на любовь .mkv»), судить по странице нельзя —
+            # идём обычным путём и смотрим настоящий .torrent.
+            preview = pick_new_episodes(
+                numbered, after_episode=next_episode - 1, season=season
+            )
+            if not preview:
+                # Нужной серии в раздаче нет — .torrent не тратим, лимит цел.
+                journal.add(
+                    "agent",
+                    f"в раздаче пока нет серии {next_episode}: .torrent не качаю",
+                    {"раздача": torrent.title, "файлов на странице": len(preview_entries)},
+                )
+                return {
+                    "ok": True,
+                    "skipped": True,
+                    "reason": f"серий с {next_episode} в раздаче пока нет",
+                    "path": None,
+                    "plan": {"kind": "episode", "wanted": [], "size": 0},
+                }
+            journal.add(
+                "agent",
+                f"на странице есть серии {preview.get('episodes')}: качаю .torrent",
+                {"next_episode": next_episode, "размер": preview.get("size")},
+            )
+
+        # 2) Только теперь тратим торрент-файл: он нужен, чтобы поставить
+        #    раздачу в очередь с точными индексами файлов.
         path, error, reason = await self._fetch_torrent(torrent, refresh=True)
         if path is None:
             self._mark_problem(task, error)
@@ -3526,22 +4340,52 @@ class Agent:
         entries = parse_files(file_list(path))
         plan = self._plan_files(task, entries, torrent)
 
-        params = task.params or {}
-        try:
-            season = int(params["season"]) if params.get("season") is not None else None
-        except (TypeError, ValueError):
-            season = None
-        next_episode = int(params.get("next_episode") or 0)
-        if not next_episode:
-            # Прогресс берём из базы (удалённые серии тоже учитываются).
-            progress: dict[int, int] = {}
-            if torrent.series_key:
-                progress = await self.store.episodes_by_season(torrent.series_key)
-            next_episode = self._next_episode(params, progress)
-
         picked = None
         if next_episode:
             picked = pick_new_episodes(entries, after_episode=next_episode - 1, season=season)
+        if picked and len(picked.get("episodes") or []) > self.auto_episodes_max:
+            # Новых серий сразу много (догнали пачку) — не ставим всё молча.
+            picked_episodes = {
+                int(item) for item in (picked.get("episodes") or []) if item is not None
+            }
+            all_groups = [
+                {
+                    "season": group.get("season"),
+                    "episode": group.get("episode"),
+                    "indexes": group.get("indexes"),
+                    "size": group.get("size"),
+                    "names": group.get("names"),
+                }
+                for group in (plan.get("episodes") or [])
+            ]
+            new_groups = [
+                group for group in all_groups
+                if int(group.get("episode") or 0) in picked_episodes
+                and (season is None or group.get("season") in (None, season))
+            ]
+            task.options = {**(task.options or {}), "episode_groups": all_groups}
+            task.candidate = torrent.to_dict()
+            new_size = human_bytes(sum(int(group.get("size") or 0) for group in new_groups))
+            journal.add(
+                "agent",
+                "новых серий много: спрашиваю, а не качаю всё",
+                {"новых": len(new_groups), "вес": new_size,
+                 "серий в раздаче": len(all_groups), "порог": self.auto_episodes_max},
+            )
+            return {
+                "ok": True,
+                "skipped": True,
+                "needs_choice": True,
+                "reason": (
+                    f"новых серий {_plural(len(new_groups), 'серия', 'серии', 'серий')} "
+                    f"на {new_size}"
+                ),
+                "path": str(path),
+                "plan": plan,
+                "groups": all_groups,
+                "new_groups": new_groups,
+                "torrent": torrent,
+            }
         if picked:
             journal.add(
                 "agent",
@@ -3557,7 +4401,9 @@ class Agent:
                 "episode": picked["episode"],
                 "season": season,
                 "selected_episodes": [
-                    int(item) for item in (picked.get("episodes") or []) if item is not None
+                    {"season": season, "episode": int(item)}
+                    for item in (picked.get("episodes") or [])
+                    if item is not None
                 ],
             }
         elif plan["kind"] == "choose" and plan.get("pack") and next_episode:
@@ -3569,6 +4415,42 @@ class Agent:
                 "reason": f"серий с {next_episode} в раздаче пока нет",
                 "path": str(path),
                 "plan": plan,
+            }
+        elif plan["kind"] == "choose" and plan.get("pack") and len(plan.get("episodes") or []) > 1:
+            # Раздача — пачка серий, а какую брать, нигде не сказано (задача
+            # заведена без серии и без качества). Вслепую качать всю пачку
+            # нельзя: это легко десятки и сотни гигабайт. Спрашиваем.
+            episodes = plan.get("episodes") or []
+            groups = [
+                {
+                    "season": group.get("season"),
+                    "episode": group.get("episode"),
+                    "indexes": group.get("indexes"),
+                    "size": group.get("size"),
+                    "names": group.get("names"),
+                }
+                for group in episodes
+            ]
+            task.options = {**(task.options or {}), "episode_groups": groups}
+            task.candidate = torrent.to_dict()
+            total = human_bytes(sum(int(group.get("size") or 0) for group in episodes))
+            journal.add(
+                "agent",
+                f"пачка без выбранной серии: не качаю вслепую ({torrent.title[:60]})",
+                {"серий": len(episodes), "вес": total, "файлов": len(entries)},
+            )
+            return {
+                "ok": True,
+                "skipped": True,
+                "needs_choice": True,
+                "reason": (
+                    f"в раздаче {_plural(len(episodes), 'серия', 'серии', 'серий')} "
+                    f"на {total} — скажи, какие качать"
+                ),
+                "path": str(path),
+                "plan": plan,
+                "groups": groups,
+                "torrent": torrent,
             }
         elif plan["kind"] == "choose":
             # Серий в раздаче не разобрать вовсе — берём всю пачку, как раньше.
@@ -3854,8 +4736,17 @@ class Agent:
         Transmission не присылает события — только отвечает, поэтому прогресс
         забираем опросом. Задача остаётся в «скачивании», пока файл не дойдёт до
         100%, и только потом уходит в завершённые.
+
+        Смотрим и задачи в «готово»: если их раздача всё ещё качается (бывает,
+        когда состояние выставили по неполным данным), возвращаем в
+        «скачивание» — иначе интерфейс говорит «готова», а файл льётся.
         """
-        tasks = await self.store.list_tasks(limit=200, states=["downloading"])
+        tasks = await self.store.list_tasks(limit=200, states=["downloading", "done"])
+        tasks = [
+            task for task in tasks
+            if task.state == "downloading"
+            or not ((task.params or {}).get("progress") or {}).get("done")
+        ]
         if not tasks:
             return
         hashes = [
@@ -3878,6 +4769,16 @@ class Agent:
 
             task.params["progress"] = state
             task.last_result = self._progress_text(state)
+            if task.state == "done" and not state.get("done"):
+                # Раздача ещё качается — задача не завершена.
+                task.state = "downloading"
+                await self.store.save_task(task)
+                journal.add(
+                    "agent",
+                    "задача возвращена в «скачивание»: торрент ещё не готов",
+                    {"задача": task.id, "процент": state.get("percent")},
+                )
+                continue
             if state.get("done"):
                 task.state = "done"
                 await self.store.save_task(task)
@@ -3974,6 +4875,10 @@ class Agent:
                 await self.store.add_check(task.id, 0, 0, f"ошибка: {exc}")
                 log.warning("проверка %s: %s", task.id, exc)
                 return
+            # Прошлая ошибка не должна висеть вечно: если трекер снова
+            # отвечает, старая причина (например, суточный лимит) уже может
+            # быть неактуальной. Скачивание запишет свою ошибку заново.
+            task.last_error = ""
 
             by_title = filter_candidates(torrents, {"title": params.get("title") or ""})
             matched = filter_candidates(by_title, params)
@@ -4027,21 +4932,23 @@ class Agent:
                     "новых": len(fresh),
                     "новинки": [item.title for item in fresh[:3]] or None,
                     "автоскачивание": task.auto_download,
+                    "ждём серию": next_episode or None,
                 },
             )
+            # Отложенное скачивание: в прошлый раз трекер не отдал .torrent
+            # (например, кончился суточный лимит). Пробуем снова на каждой
+            # проверке, даже если нового ничего не появилось — иначе человек
+            # жмёт «Проверить», а агент молчит.
+            retried = await self._retry_pending(task, turn, manual=manual)
             if not fresh:
                 await self.store.save_task(task)
                 if not matched:
                     # Совсем ничего нет (сериал ещё не вышел) — раз в сутки
                     # сообщаем, что мониторинг продолжается.
                     await self._notify_nothing(task, manual=manual)
-                if manual:
-                    turn.add(
-                        f"Проверил «{task.title}»: нового нет "
-                        f"(всего подходящих раздач: {len(matched)}).",
-                        kind="text",
-                        task_id=task.id,
-                    )
+                if manual and not retried:
+                    turn.add(self._checked_text(task, len(matched), 0), kind="text",
+                             task_id=task.id)
                 return
 
             task.params["seen_ids"] = list(seen | {t.id for t in fresh})[-200:]
@@ -4050,16 +4957,147 @@ class Agent:
 
             if task.auto_download:
                 for torrent in fresh[:3]:
+                    # Эту раздачу уже скачал повтор отложенного — второй раз
+                    # не ставим, иначе в очереди окажутся две копии.
+                    if retried and torrent.id == retried:
+                        continue
                     await self._download_quiet(task, torrent)
             else:
                 await self._notify_new(task, fresh)
 
             if manual:
-                turn.add(
-                    f"Проверил «{task.title}»: нового {len(fresh)}.",
-                    kind="text",
-                    task_id=task.id,
-                )
+                turn.add(self._checked_text(task, len(matched), len(fresh)), kind="text",
+                         task_id=task.id)
+
+    def _checked_text(self, task: Task, found: int, new: int) -> str:
+        """Ответ на «Проверить сейчас»: что смотрели и чего ждём.
+
+        «Нового нет» само по себе ничего не объясняет: человек не понимает,
+        ждёт ли задача 3-ю серию, или сломана.
+        """
+        head = f"Проверил «{task.title}»: "
+        head += "нового нет" if not new else f"нового {new}"
+        head += f" (подходящих раздач: {found})."
+        watch = self._watch_text(task)
+        if watch:
+            head += f"\n• {watch}"
+        next_at = _parse_iso(task.next_check_at)
+        if next_at is not None:
+            head += f"\n• следующая проверка {self._clock(next_at)}"
+        return head
+
+    @staticmethod
+    def _clock(stamp: datetime) -> str:
+        """«18:21» / «завтра в 18:21» / «20.10 в 18:21» в местном времени.
+
+        Одного времени мало: у задачи раз в сутки «следующая проверка в 12:20»
+        читается как «через час», хотя это завтра.
+        """
+        local = stamp.astimezone()
+        now = datetime.now().astimezone()
+        days = (local.date() - now.date()).days
+        clock = local.strftime("%H:%M")
+        if days <= 0:
+            return f"в {clock}"
+        if days == 1:
+            return f"завтра в {clock}"
+        return f"{local.strftime('%d.%m')} в {clock}"
+
+    def _watch_text(self, task: Task) -> str:
+        """Одной строкой: что именно отслеживает задача.
+
+        Видно и фильтр, и какую серию ждём, и что скачивание ждёт повтора.
+        """
+        bits: list[str] = []
+        params = task.params or {}
+        if params.get("quality"):
+            bits.append(self._quality_label(str(params["quality"])))
+        if params.get("voice"):
+            bits.append(str(params["voice"]))
+        if params.get("season"):
+            bits.append(f"сезон {params['season']}")
+        if task.kind == "periodic":
+            episodes = params.get("next_episode")
+            if params.get("episode_from") and not episodes:
+                episodes = params.get("episode_from")
+            if episodes:
+                bits.append(f"жду серию {episodes}")
+        if not bits and task.kind == "periodic":
+            # Ни качества, ни сезона не задано — задача ловит любую новую
+            # раздачу по названию. Так и пишем, чтобы строка не была пустой.
+            bits.append("любая новая раздача")
+        text = ", ".join(bits)
+        pending = (task.params or {}).get("pending_download") or {}
+        if pending:
+            note = "скачивание ждёт повтора"
+            error = str(pending.get("error") or "")[:90]
+            if error:
+                note += f" ({error})"
+            text = f"{text}; {note}" if text else note
+        return text
+
+    async def _remember_pending(self, task: Task, torrent: Torrent, error: str) -> None:
+        """Запоминает раздачу, которую не удалось скачать: повторим сами.
+
+        Иначе после сброса суточного лимита .torrent человек жмёт «Проверить»,
+        а задача отвечает «нового нет» — ведь раздача уже считается найденной.
+        """
+        task.params["pending_download"] = {
+            "torrent": torrent.to_dict(),
+            "error": str(error)[:200],
+            "at": now_iso(),
+        }
+
+    def _clear_pending(self, task: Task) -> None:
+        task.params.pop("pending_download", None)
+
+    async def _retry_pending(self, task: Task, turn: Turn, *, manual: bool = False) -> str:
+        """Повторяет отложенное скачивание.
+
+        Возвращает id раздачи, если повтор удался (тогда в общем цикле её
+        скачивать уже не нужно), иначе пустую строку.
+        """
+        pending = (task.params or {}).get("pending_download") or {}
+        raw = pending.get("torrent")
+        if not raw:
+            return ""
+        # Не тянем одну и ту же неудачу вечно: если с прошлой попытки прошла
+        # неделя, раздача скорее всего уже не актуальна.
+        stamp = _parse_iso(str(pending.get("at") or ""))
+        if stamp is not None and datetime.now(timezone.utc) - stamp > timedelta(days=7):
+            self._clear_pending(task)
+            await self.store.save_task(task)
+            journal.add("agent", f"отложенное скачивание устарело: {task.title}", {})
+            return ""
+        try:
+            torrent = Torrent.from_dict(raw)
+        except TypeError:
+            self._clear_pending(task)
+            return ""
+        if not torrent.id:
+            self._clear_pending(task)
+            return ""
+        journal.add("agent", f"повторяю отложенное скачивание: {torrent.title}",
+                    {"раздача": torrent.id, "прошлая ошибка": pending.get("error")})
+        if task.auto_download:
+            await self._download_quiet(task, torrent)
+        else:
+            await self._notify_new(task, [torrent])
+            return torrent.id
+        ok = not (task.params or {}).get("pending_download")
+        if ok:
+            task.last_error = ""
+            await self.store.save_task(task)
+            return torrent.id
+        if manual:
+            reason = str(pending.get("error") or "трекер молчит").rstrip(".")
+            turn.add(
+                f"Повторить скачивание не удалось: {reason}. "
+                "Попробую на следующей проверке.",
+                kind="error",
+                task_id=task.id,
+            )
+        return ""
 
     async def _download_quiet(self, task: Task, torrent: Torrent) -> None:
         """Скачивание по периодической задаче: без диалога, с уведомлением."""
@@ -4067,11 +5105,39 @@ class Agent:
             result = await self._download(task, torrent)
         except Exception as exc:  # noqa: BLE001
             log.exception("тихое скачивание не удалось")
+            await self._remember_pending(task, torrent, str(exc))
+            await self.store.save_task(task)
             await self._notify_error(task, torrent, str(exc))
             return
         if not result["ok"]:
-            await self._notify_error(task, torrent, result["error"])
+            await self._remember_pending(task, torrent, str(result.get("error") or ""))
+            task.last_error = str(result.get("error") or "")
+            await self.store.save_task(task)
+            await self._notify_error(task, torrent, result.get("error") or "не удалось скачать")
             return
+        # Раздача — пачка серий, а какую брать, не сказано: спрашиваем, а не
+        # качаем десятки гигабайт «на всякий случай».
+        if result.get("needs_choice"):
+            self._clear_pending(task)
+            task.last_error = ""
+            await self.store.save_task(task)
+            await self._ask_which_episodes(task, torrent, result)
+            return
+        # Раздача есть, а нужной серии в ней нет: качать нечего и врать про
+        # «скачал» нельзя. Снимаем отложенное и ждём настоящей серии.
+        if result.get("skipped"):
+            self._clear_pending(task)
+            task.last_error = ""
+            await self.store.save_task(task)
+            journal.add(
+                "agent",
+                f"по задаче «{task.title}» качать пока нечего",
+                {"раздача": torrent.title, "причина": result.get("reason")},
+            )
+            return
+        self._clear_pending(task)
+        task.last_error = ""
+        await self.store.save_task(task)
         text = (
             f"Новая серия по задаче «{task.title}»: скачал и поставил в очередь.\n"
             f"• {torrent.title}\n{describe(torrent)}"
@@ -4099,6 +5165,73 @@ class Agent:
             "Скачано по задаче",
             f"{task.title}: {torrent.title}"[:200],
         )
+
+    async def _ask_which_episodes(
+        self, task: Task, torrent: Torrent, result: dict[str, Any]
+    ) -> None:
+        """Пачка серий без выбранной серии: спрашиваем, а не качаем всё.
+
+        «Проверяй и скачивай» без указания серии и качества не значит «залей
+        всю пачку на 120 ГБ». Уведомление повторяется только когда пачка
+        выросла — иначе задача писала бы об одном и том же каждый раз.
+        """
+        groups = result.get("groups") or []
+        if not groups:
+            return
+        newest = max(int(group.get("episode") or 0) for group in groups)
+        marker = {"id": torrent.id, "episodes": len(groups), "newest": newest}
+        if (task.params or {}).get("pack_notified") == marker:
+            return
+        task.params["pack_notified"] = marker
+        await self.store.save_task(task)
+        new_groups = result.get("new_groups") or groups
+        total = human_bytes(sum(int(group.get("size") or 0) for group in groups))
+        fresh_size = human_bytes(sum(int(group.get("size") or 0) for group in new_groups))
+        text = (
+            f"По задаче «{task.title}» — раздача с сериями: "
+            f"{_plural(len(groups), 'серия', 'серии', 'серий')} на {total}"
+        )
+        if len(new_groups) < len(groups):
+            text += f", из них новых {len(new_groups)} на {fresh_size}"
+        text += (
+            f".\n• {torrent.title}\n\n"
+            "Всю пачку сразу не качаю: это может быть сотня гигабайт. "
+            "Выберите серии или нажмите «Скачать всю пачку»."
+        )
+        message = Message(
+            role="agent", text=text, kind="notice", task_id=task.id,
+            payload={"task": task.to_dict(), "torrent": torrent.to_dict()},
+        )
+        message.actions = [
+            Action(
+                id="pack-all",
+                label="Скачать всю пачку",
+                kind="download_all",
+                payload={"task_id": task.id, "season": task.params.get("season")},
+                style="primary",
+            ),
+            *self._torrent_actions(task, torrent=torrent),
+        ]
+        message.actions.append(
+            Action(
+                id="pick-episodes",
+                label="Выбрать серии",
+                kind="choose_episodes",
+                payload={"task_id": task.id},
+            )
+        )
+        await self._remember_many(task.session_id, [message])
+        await self.events.publish(
+            {
+                "type": "notification",
+                "level": "info",
+                "task_id": task.id,
+                "title": "Нужно выбрать серии",
+                "text": text,
+                "message": message.to_dict(),
+            }
+        )
+        await self.desktop.send("По задаче нужна серия", torrent.title[:120])
 
     async def _notify_nothing(self, task: Task, *, manual: bool = False) -> None:
         """По задаче на трекере вообще пусто — сообщаем не чаще раза в сутки.
@@ -4311,9 +5444,7 @@ class Agent:
         clean = {
             key: value
             for key, value in params.items()
-            if key in ("title", "original_title", "quality", "voice", "season",
-                       "episode_from", "year", "type", "aliases")
-            and value not in (None, "", "null", [])
+            if key in PARAM_KEYS and value not in (None, "", "null", [])
         }
         clean.setdefault("seen_ids", [])
         task = Task(

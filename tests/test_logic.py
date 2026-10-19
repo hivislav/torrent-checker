@@ -19,7 +19,7 @@ from core.matching import (  # noqa: E402
     is_pack,
     rank,
 )
-from core.parsing import parse_torrent  # noqa: E402
+from core.parsing import is_screener, parse_torrent, torrent_id_from_link  # noqa: E402
 
 FAILS: list[str] = []
 
@@ -117,6 +117,52 @@ def test_filtering() -> None:
           [t.id for t in movie_only])
 
 
+def test_screeners() -> None:
+    print("\n== экранки не попадают в выдачу ==")
+    cases = {
+        "Дюна / Dune / 2024 / ДБ / CAMRip (720p)": True,
+        "Дюна / Dune / 2024 / ДБ / TS": True,
+        "Дюна / Dune / 2024 / ДБ / TC (1080p)": True,
+        "Дюна / Dune / 2024 / ДБ / DVDScr": True,
+        "Дюна / Dune / 2024 / ДБ / Экранка": True,
+        "Дюна / Dune / 2024 / ДБ / WEB-DL (1080p)": False,
+        "Дюна / Dune / 2024 / ДБ / BDRip (1080p)": False,
+        # «Cam» — это фильм, а не пометка: оригинальное название не экранка.
+        "Камера / Cam / 2018 / ДБ / WEB-DL (1080p)": False,
+        # Коллекция с «TS» в названии сериала, но качество нормальное.
+        "Тед Лассо (4 сезон: 1-10 серии из 10) / Ted Lasso / 2026 / ПМ / WEB-DL (1080p)": False,
+    }
+    for title, expected in cases.items():
+        got = is_screener(title)
+        check(f"экранка: {'да' if expected else 'нет'} — {title[:46]}", got == expected, got)
+
+    pool = [
+        parse_torrent(make("40", "Дюна: Часть вторая / Dune / 2024 / ДБ / WEB-DL (1080p)", seeds=40)),
+        parse_torrent(make("41", "Дюна: Часть вторая / Dune / 2024 / ДБ / CAMRip (720p)", seeds=90)),
+    ]
+    kept = filter_candidates(pool, {"title": "Дюна"})
+    check("в выдаче осталась только нормальная раздача", [t.id for t in kept] == ["40"],
+          [t.id for t in kept])
+    with_screeners = filter_candidates(pool, {"title": "Дюна", "screener": "1"})
+    check("по просьбе экранки остаются", {t.id for t in with_screeners} == {"40", "41"},
+          [t.id for t in with_screeners])
+
+
+def test_links() -> None:
+    print("\n== ссылка на раздачу вместо названия ==")
+    cases = {
+        "держи https://kinozal.me/details.php?id=1234567 смотри": "1234567",
+        "kinozal.me/details.php?id=7654321": "7654321",
+        "http://kinozal.tv/download.php?id=42": "42",
+        "смотри https://kinozal.me/browse.php?s=дюна&id=99": "99",
+        "Дюна 2024 1080p": "",
+        "https://youtube.com/watch?v=1&id=2": "",
+    }
+    for text, expected in cases.items():
+        got = torrent_id_from_link(text)
+        check(f"ссылка: «{text[:42]}» → {expected or 'нет'}", got == expected, got)
+
+
 def test_new_episodes() -> None:
     print("\n== что считать новой серией ==")
     baseline_pack = parse_torrent(
@@ -183,6 +229,8 @@ def test_new_episodes() -> None:
 def main() -> int:
     test_parsing()
     test_filtering()
+    test_screeners()
+    test_links()
     test_new_episodes()
     print("\n=== ИТОГ ===")
     if FAILS:

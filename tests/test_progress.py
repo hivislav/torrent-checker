@@ -150,6 +150,41 @@ async def main() -> int:
     check("исчезнувшая раздача не висит в «скачивании»", gone.state == "done", gone.state)
 
     check("прогресс спрашивали у Transmission", fake.calls >= 2, fake.calls)
+
+    print("\n== «готова», хотя торрент ещё качается ==")
+    # Бывает, что после постановки в очередь RPC ещё не знает прогресс: раньше
+    # пустой ответ считался завершением, задача уходила в «готово» и больше не
+    # опрашивалась — а файл качался.
+    fake.state["h3"] = {
+        "hash": "h3", "name": "Проба3", "percent": 0.9, "done": False,
+        "rate": 1531904, "rate_human": "1,5 МБ/с", "eta_seconds": None, "eta_human": "",
+        "size": 24947720192, "size_human": "23,2 ГБ",
+        "downloaded_human": "211,9 МБ", "left_human": "23 ГБ", "status": "downloading",
+    }
+    stale = Task(
+        id="dl3", kind="oneshot", state="done", session_id="s",
+        user_query="проба3", params={"title": "Проба3", "transmission_hash": "h3"},
+    )
+    stale.last_result = "скачано: Проба3"
+    await agent.store.save_task(stale)
+    await agent.refresh_progress()
+    revived = await agent.store.get_task("dl3")
+    assert revived is not None
+    print("  состояние:", revived.state, "|", revived.last_result)
+    check("задача возвращена в «скачивание»", revived.state == "downloading", revived.state)
+    check("видно процент", "0.9%" in (revived.last_result or ""), revived.last_result)
+
+    # А по-настоящему завершённую задачу второй раз не трогаем.
+    fake.state["h1"] = {
+        "hash": "h1", "name": "Проба", "percent": 100.0, "done": True,
+        "rate": 0, "rate_human": "", "eta_seconds": None, "eta_human": "",
+        "size": 4 * 1024**3, "size_human": "4 ГБ",
+        "downloaded_human": "4 ГБ", "left_human": "0 Б", "status": "seeding",
+    }
+    await agent.refresh_progress()
+    again = await agent.store.get_task("dl")
+    assert again is not None
+    check("завершённая задача остаётся завершённой", again.state == "done", again.state)
     agent.store.close()
 
     print("\n=== ИТОГ ===")

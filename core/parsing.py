@@ -317,6 +317,78 @@ def extract_seasons_episodes(title: str) -> tuple[list[int], list[int], int | No
 
 
 # ----------------------------------------------------------------------
+# Экранки
+# ----------------------------------------------------------------------
+# CAM/TS/TC/SCR — это копия, снятая с экрана: картинка и звук хуже релиза.
+# Фанат такие не качает (разве что фильм больше нигде не найти), поэтому в
+# выдачу по умолчанию они не попадают — см. core/matching.filter_candidates.
+SCREENER_MARKERS = re.compile(
+    r"cam[- ]?rip|hd[- ]?ts|ts[- ]?rip|telesync|telecine|screener|dvdscr|"
+    r"ppv[- ]?rip|vhs[- ]?rip|экранк|кам[- ]?рип|телесинк|с экрана",
+    re.I,
+)
+# Короткие метки (TS/TC/SCR) узнаём только отдельным словом и только в зоне
+# качества: иначе «Cam» в оригинальном названии фильма выкинуло бы раздачу.
+SCREENER_SHORT = re.compile(r"(?<![0-9a-zа-яё])(?:ts|tc|scr)(?![0-9a-zа-яё])", re.I)
+
+
+def is_screener(title: str) -> bool:
+    """Это экранка? Смотрим только зону качества — после года в названии."""
+    segments = _split_segments(str(title or ""))
+    if not segments:
+        return bool(SCREENER_MARKERS.search(str(title or "")))
+    year_index = next(
+        (
+            index
+            for index, segment in enumerate(segments)
+            if re.fullmatch(r"(?:19|20)\d{2}(?:\s*[-–]\s*(?:19|20)\d{2})?", segment.strip())
+        ),
+        None,
+    )
+    # Название и оригинальное название экранкой не считаются никогда: пометка
+    # стоит в хвосте — там, где озвучка и качество.
+    zone = segments[year_index + 1 :] if year_index is not None else (segments[1:] or segments)
+    for segment in zone:
+        if SCREENER_MARKERS.search(segment):
+            return True
+        if not SCREENER_SHORT.search(segment):
+            continue
+        quality_segment = any(
+            pattern.search(segment) for _, pattern in RESOLUTION_PATTERNS + SOURCE_PATTERNS
+        )
+        rest = SCREENER_SHORT.sub(" ", segment).strip(" ()[],./-–")
+        if quality_segment or not rest:
+            return True
+    return False
+
+
+# ----------------------------------------------------------------------
+# Ссылки на раздачу
+# ----------------------------------------------------------------------
+LINK_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"kinozal\.(?:me|tv|cc|su|info)/details\.php\?[^\s]*?\bid=(\d+)", re.I),
+    re.compile(r"kinozal\.(?:me|tv|cc|su|info)/download\.php\?[^\s]*?\bid=(\d+)", re.I),
+    re.compile(r"kinozal\.(?:me|tv|cc|su|info)/[^\s?#]*\?[^\s]*?\bid=(\d+)", re.I),
+)
+
+
+def torrent_id_from_link(text: str) -> str:
+    """id раздачи из присланной ссылки: «держи, …/details.php?id=1234567».
+
+    Готовую ссылку искать по названию бессмысленно: раздача уже известна, и
+    её можно открыть напрямую.
+    """
+    raw = str(text or "")
+    if "kinozal" not in raw.lower():
+        return ""
+    for pattern in LINK_PATTERNS:
+        match = pattern.search(raw)
+        if match:
+            return match.group(1)
+    return ""
+
+
+# ----------------------------------------------------------------------
 # Названия
 # ----------------------------------------------------------------------
 def split_titles(title: str) -> tuple[str, str, str]:
@@ -509,6 +581,7 @@ def parse_torrent(raw: dict) -> Torrent:
         episodes_total=total,
         series_key=series_key(ru, original),
         uploaded_ts=parse_upload_date(str(raw.get("uploadDate") or raw.get("upload_date") or "")),
+        screener=is_screener(title),
     )
     if not torrent.series_title:
         torrent.series_title = original

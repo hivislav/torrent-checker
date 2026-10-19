@@ -54,6 +54,10 @@ async def run(args: argparse.Namespace) -> int:
         for message in turn.messages:
             print(f"\n[{message.role}] {message.text}")
             for action in message.actions:
+                # Ссылка — это адрес, а не действие: печатаем адрес, а не payload.
+                if action.kind == "link":
+                    print(f"    ↗ «{action.label}»: {action.url}")
+                    continue
                 print(f"    → кнопка «{action.label}» ({action.kind}: {action.payload})")
 
         # Простейший сценарий подтверждения прямо в терминале.

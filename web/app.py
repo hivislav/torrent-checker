@@ -198,6 +198,21 @@ async def downloads(limit: int = 50, session: str = Depends(current_session)) ->
     return {"downloads": await agent.downloads(limit)}
 
 
+@app.get("/api/torrent/{torrent_id}/details")
+async def torrent_details(
+    torrent_id: str, session: str = Depends(current_session)
+) -> dict[str, Any]:
+    """Подробности раздачи для кнопки «Подробнее».
+
+    Отдельный маршрут (а не сообщение в чат): клиент открывает их по клику,
+    поэтому поиск и подтверждение не ждут лишнего запроса к трекеру.
+    """
+    try:
+        return await agent.torrent_details(torrent_id)
+    except Exception as exc:  # noqa: BLE001 - любая причина = «не открылось»
+        raise HTTPException(status_code=502, detail=str(exc)[:300]) from exc
+
+
 @app.get("/api/debug")
 async def debug_events(
     limit: int = 200,

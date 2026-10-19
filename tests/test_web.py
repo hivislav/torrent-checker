@@ -147,13 +147,26 @@ def run() -> int:
             page.on("request", lambda req: status_calls.append(req.url)
                     if "/api/status" in req.url else None)
             card.locator("button", has_text="Удалить").first.click()
-            # Подтверждение ищем по имени нашей раздачи: в истории чата могут
-            # остаться старые подтверждения с такой же кнопкой.
-            confirm = page.locator("#chat .msg").filter(has_text=test_name).filter(
-                has_text="Удалить навсегда"
-            ).last
+            # Подтверждение — окно (а не сообщение в чате): кнопку жмут
+            # в картотеке, и на телефоне сообщение под панелью не видно.
+            confirm = page.locator("#confirm-modal:not([hidden])")
             confirm.wait_for(state="visible", timeout=20000)
-            confirm.locator("button", has_text="Удалить навсегда").first.click()
+            body = page.locator("#confirm-body").inner_text()
+            check("подтверждение удаления — окно", confirm.count() == 1)
+            check("в окне название раздачи", test_name in body, body[:120])
+
+            # «Отмена» ничего не удаляет: файл и карточка на месте.
+            page.click("#confirm-no")
+            page.wait_for_timeout(600)
+            check("после «Отмены» окно закрылось",
+                  page.locator("#confirm-modal[hidden]").count() == 1)
+            check("после «Отмены» файлы целы", test_dir.exists())
+            check("после «Отмены» карточка на месте",
+                  page.locator("#download-list .task-card", has_text=test_name).count() == 1)
+
+            card.locator("button", has_text="Удалить").first.click()
+            page.locator("#confirm-modal:not([hidden])").wait_for(state="visible", timeout=20000)
+            page.click("#confirm-yes")
             page.wait_for_timeout(1500)
             page.wait_for_function(
                 """name => [...document.querySelectorAll('#download-list .task-card')]

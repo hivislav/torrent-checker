@@ -45,23 +45,99 @@ def episode_span(torrent: Torrent) -> tuple[int, int] | None:
 
 
 def title_tokens(value: str) -> list[str]:
+    """Слова названия, по которым сравниваем.
+
+    Слова из одного-двух букв («на», «в», «и», «у») выбрасываются: они ничего
+    не значат и находятся в любом названии. Из-за них «Ставка на любовь»
+    совпадала с «Крепостная … Желанная любовь» (там есть «на» внутри
+    «крепостная» и слово «любовь»), и периодическая задача считала, что
+    3-й сезон уже вышел целиком.
+    """
     tokens = [normalize(word) for word in str(value).replace("/", " ").split()]
-    return [token for token in tokens if len(token) >= 2]
+    return [token for token in tokens if len(token) >= 3]
+
+
+def _title_words(value: str) -> list[str]:
+    """Название по словам: сравниваем слова, а не подстроки.
+
+    Подстрока ловит мусор: «na» находится внутри «krepostnaya». Дефисное слово
+    описано в двух видах — целиком («Пин-код» → «pinkod») и по частям
+    («Человек-паук» → «chelovek», «pauk»): иначе запрос «человек паук» не
+    находил «Человек-паук».
+    """
+    words: list[str] = []
+    for chunk in re.split(r"[^0-9a-zа-яё\-]+", str(value or "").lower().replace("ё", "е")):
+        joined = normalize(chunk)
+        if not joined:
+            continue
+        words.append(joined)
+        if "-" in chunk:
+            for part in chunk.split("-"):
+                part_word = normalize(part)
+                if part_word and part_word not in words:
+                    words.append(part_word)
+    return words
+
+
+# Окончания в том виде, в каком они получаются после transliteration в
+# normalize: «ставки» → «stavki», «игры» → «igry». Длинные — первыми, иначе
+# «ами» съестся как «и».
+_ENDINGS = (
+    "yami", "ami", "ogo", "ego", "omu", "emu", "ymi", "imi", "ami", "yah", "ah",
+    "yam", "am", "ov", "ev", "oy", "ey", "oyu", "eyu", "y", "i", "a", "ya", "e",
+    "u", "yu", "ь",
+)
+
+
+def _stem(word: str) -> str:
+    """Грубая основа слова: снимаем окончание, чтобы «игра» ≈ «игры»."""
+    for ending in _ENDINGS:
+        if word.endswith(ending) and len(word) - len(ending) >= 3:
+            return word[: -len(ending)]
+    return word
+
+
+def _token_present(token: str, words: list[str]) -> bool:
+    """Слово запроса есть в названии.
+
+    Сравниваем основы («ставка» ≈ «ставки», «игра» ≈ «игры»), а длинные слова
+    дополнительно и по началу («Ростов» ⊂ «Ростов-на-Дону»). Короткие слова —
+    только целиком: иначе «Оно» совпадёт с «Онора».
+    """
+    stem = _stem(token)
+    for word in words:
+        if _stem(word) == stem:
+            return True
+        if len(stem) >= 4 and word.startswith(stem):
+            return True
+    return False
 
 
 def title_match(query: str, torrent: Torrent) -> bool:
-    """Похоже ли название раздачи на то, что просили."""
+    """Похоже ли название раздачи на то, что просили.
+
+    Правило: значимые слова запроса обязаны быть в названии. Допускается
+    пропуск ОДНОГО слова, но только если в запросе их хотя бы три и первое
+    на месте: «битва экстрасенсов реванш» находит «Новая битва экстрасенсов»,
+    а «ставка на любовь» больше не находит «Крепостная … Желанная любовь»
+    (там было совпадение по предлогу «на» и слову «любовь» — и периодическая
+    задача считала, что сезон уже вышел целиком).
+    """
     tokens = title_tokens(query)
     if not tokens:
         return True
-    haystack = normalize(torrent.title)
-    if not haystack:
+    words = _title_words(torrent.title)
+    if not words:
         return False
-    present = [token for token in tokens if token in haystack]
-    if len(tokens) == 1:
-        return bool(present)
-    # Все слова или почти все (трекер иногда дописывает слова в название).
-    return len(present) >= max(1, len(tokens) - 1)
+    present = [token for token in tokens if _token_present(token, words)]
+    if len(present) == len(tokens):
+        return True
+    return (
+        len(tokens) >= 3
+        and len(present) == len(tokens) - 1
+        and present
+        and present[0] == tokens[0]
+    )
 
 
 def filter_candidates(
@@ -78,12 +154,17 @@ def filter_candidates(
     year = params.get("year")
     wanted_type = str(params.get("type") or "").strip().lower()
     skip_ids = skip_ids or set()
+    # Экранки (CAM/TS/TC/SCR) по умолчанию в выдачу не попадают: их просят
+    # только если фильм больше нигде не найти — тогда это сказано в запросе.
+    keep_screeners = bool(params.get("screener"))
 
     result: list[Torrent] = []
     for torrent in torrents:
         if skip_ids and torrent.id in skip_ids:
             continue
         if not title_match(str(params.get("title") or ""), torrent):
+            continue
+        if torrent.screener and not keep_screeners:
             continue
         # Сериал vs фильм: у сериала в названии есть сезон или серия.
         is_series = bool(torrent.seasons or torrent.episodes)

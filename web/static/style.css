@@ -430,6 +430,19 @@ body {
 .btn--tiny { padding: 4px 8px; font-size: 10.5px; }
 .btn--ghost { background: transparent; }
 
+/* Кнопка-ссылка (уходит на трекер): тот же вид, но это <a>, а не действие. */
+.btn--link {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  text-decoration: none;
+}
+.btn--link::after {
+  content: "↗";
+  font-size: 10px;
+  opacity: .8;
+}
+
 .link-btn {
   margin-left: auto;
   background: none;
@@ -783,7 +796,16 @@ body {
   color: var(--amber-bright);
   background: rgba(224, 162, 83, .16);
 }
+/* Галочка в квадратике: по одной подсветке рамки не видно, что серия отмечена
+   (особенно на телефоне и в солнечную погоду). */
 .btn--multi.is-selected::before {
+  content: "✓";
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 9px;
+  line-height: 1;
+  color: #1a1207;
   background: var(--amber-bright);
   border-color: var(--amber-bright);
 }
@@ -1051,6 +1073,62 @@ body {
   max-height: 88vh;
   display: flex;
   flex-direction: column;
+}
+
+/* ---------- Подтверждение удаления ---------- */
+.confirm__text {
+  margin: 0 0 4px;
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--ink-dim);
+  white-space: pre-wrap;
+  max-height: 46vh;
+  overflow-y: auto;
+}
+
+/* ---------- Подробности раздачи и журнал проверок ---------- */
+.info__body {
+  overflow-y: auto;
+  padding-right: 4px;
+}
+.info__title {
+  margin: 0 0 10px;
+  font-size: 14px;
+  line-height: 1.4;
+  color: var(--ink);
+}
+.info__row {
+  display: flex;
+  gap: 10px;
+  padding: 4px 0;
+  border-bottom: 1px dashed rgba(120, 90, 50, .18);
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+.info__label {
+  flex: 0 0 92px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  padding-top: 1px;
+}
+.info__value { color: var(--ink-dim); word-break: break-word; }
+.info__text {
+  margin: 12px 0 0;
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--ink-dim);
+  white-space: pre-wrap;
+}
+.info__actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 14px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--line-soft);
 }
 
 .debug__head {
