@@ -15,6 +15,9 @@
     lastTaskId: null,
     // Открытая задача = открытый чат. У каждой задачи своя переписка и контекст.
     taskId: null,
+    // Правка открытой задачи: поле ввода появляется только после кнопки
+    // «Редактировать». До этого задача — только для просмотра.
+    editing: false,
     introHTML: null,
   };
 
@@ -110,6 +113,8 @@
   async function openConversation(taskId) {
     if (state.busy) return;
     state.taskId = taskId || null;
+    state.editing = false;
+    syncComposer();
     clearChat();
     const known = (state.tasks || []).find((task) => task.id === taskId);
     showCurrentTask(known ? known.params?.title || known.user_query || "" : "");
@@ -155,8 +160,10 @@
 
   function startNewTask() {
     state.taskId = null;
+    state.editing = false;
     clearChat();
     showCurrentTask("");
+    syncComposer();
     $("input").focus();
     refreshTasks();
   }
@@ -385,6 +392,10 @@
   // ------------------------------------------------------------------
   async function send(text) {
     if (state.busy) return;
+    // В задаче «только для просмотра» поля ввода нет; страхуемся на случай
+    // Enter из адресной строки или отложенного события.
+    const mode = composerMode();
+    if (mode === "locked" || mode === "readonly") return;
     const value = (text || "").trim();
     if (!value) return;
 
@@ -401,13 +412,20 @@
     renderPending();
 
     try {
+      const openTask = currentTask();
+      // В задаче режим уже задан её типом: правим периодическую — она и остаётся
+      // периодической, кнопки «разово/периодически» тут не показываются.
+      const mode = openTask
+        ? (openTask.kind === "periodic" ? "periodic" : "oneshot")
+        : state.mode;
       const payload = await api("/api/chat", {
         method: "POST",
-        body: { text: value, mode: state.mode, task_id: state.taskId || null },
+        body: { text: value, mode, task_id: state.taskId || null },
       });
       const created = payload.task && payload.task.id;
       if (created && created !== state.taskId) {
         state.taskId = created;
+        state.editing = false;
         clearChat();
         showCurrentTask(payload.task.params?.title || payload.task.user_query || "");
       } else if (payload.start_new) {
@@ -417,6 +435,7 @@
         startNewTask();
       }
       renderTurn(payload);
+      syncComposer();
     } catch (error) {
       removePending();
       renderMessage({ role: "agent", text: `Ошибка: ${error.message}`, kind: "error" });
@@ -833,6 +852,7 @@
     } catch (error) {
       console.warn("не удалось обновить задачи", error);
     }
+    syncComposer();
   }
 
   // ------------------------------------------------------------------
@@ -1531,17 +1551,81 @@
   // ------------------------------------------------------------------
   // Управление
   // ------------------------------------------------------------------
+  const MODE_HINTS = {
+    oneshot: "Разово: найду сейчас и скачаю после вашего «да»",
+    periodic: "Периодически: буду проверять трекер и сообщать о новом",
+  };
+
   function setMode(mode) {
     state.mode = mode;
     document.querySelectorAll(".mode-btn").forEach((button) => {
       button.classList.toggle("is-active", button.dataset.mode === mode);
     });
-    const hints = {
-      oneshot: "Разово: найду сейчас и скачаю после вашего «да»",
-      periodic: "Периодически: буду проверять трекер и сообщать о новом",
-    };
-    $("composer-hint").textContent = hints[mode] + " · Enter — отправить";
+    if (composerMode() === "new") {
+      $("composer-hint").textContent = MODE_HINTS[mode] + " · Enter — отправить";
+    }
     $("input").focus();
+  }
+
+  // ------------------------------------------------------------------
+  // Композер: что доступно в открытой задаче
+  // ------------------------------------------------------------------
+  function currentTask() {
+    if (!state.taskId) return null;
+    return (state.tasks || []).find((task) => task.id === state.taskId) || null;
+  }
+
+  // new — чистый лист; editing — правим задачу; readonly — задача ещё
+  // выбирается (правки по кнопке); locked — только просмотр.
+  function composerMode() {
+    const task = currentTask();
+    if (!task) return "new";
+    if (!task.editable) return "locked";
+    return state.editing ? "editing" : "readonly";
+  }
+
+  function lockedHint(task) {
+    const stateName = task ? task.state : "";
+    if (stateName === "downloading") return "идёт скачивание — только просмотр · новая задача — кнопкой «Новая задача»";
+    if (stateName === "done") return "задача скачана — только просмотр · новая задача — кнопкой «Новая задача»";
+    if (stateName === "cancelled") return "задача отменена — только просмотр · новая задача — кнопкой «Новая задача»";
+    if (stateName === "failed") return "задача завершилась ошибкой — только просмотр · новая задача — кнопкой «Новая задача»";
+    if (stateName === "not_found") return "ничего не нашлось — только просмотр · новая задача — кнопкой «Новая задача»";
+    return "задача только для просмотра · новая задача — кнопкой «Новая задача»";
+  }
+
+  function syncComposer() {
+    const modes = document.querySelector(".composer__modes");
+    const row = $("composer-row");
+    const edit = $("composer-edit");
+    const hint = $("composer-hint");
+    const sendButton = $("send");
+    if (!modes || !row || !edit || !hint || !sendButton) return;
+    const mode = composerMode();
+    const task = currentTask();
+    if (mode === "locked") state.editing = false;
+    const showInput = mode === "new" || mode === "editing";
+    modes.hidden = mode !== "new";
+    row.hidden = !showInput;
+    edit.hidden = mode !== "readonly";
+    sendButton.disabled = !showInput;
+    // В просмотре верхняя строка композера может остаться пустой (на десктопе
+    // кнопка «Новая задача» живёт в картотеке) — убираем лишний отступ.
+    const top = document.querySelector(".composer__top");
+    if (top) top.classList.toggle("is-empty", modes.hidden && edit.hidden);
+    if (mode === "new") {
+      hint.textContent = MODE_HINTS[state.mode] + " · Enter — отправить";
+    } else if (mode === "editing") {
+      const kind = task && task.kind === "periodic" ? "периодической" : "разовой";
+      hint.textContent = `правка ${kind} задачи · Enter — отправить`;
+    } else if (mode === "readonly") {
+      const periodic = task && task.kind === "periodic";
+      hint.textContent = periodic
+        ? "задача следит за трекером · «Редактировать», чтобы поменять условия"
+        : "задача ещё выбирается · «Редактировать», чтобы поменять условия";
+    } else {
+      hint.textContent = lockedHint(task);
+    }
   }
 
   function autoGrow() {
@@ -1585,6 +1669,14 @@
     $("panel-new-task").addEventListener("click", () => {
       startNewTask();
       closePanel();
+    });
+
+    // Правка задачи: поле ввода появляется только по этой кнопке — сама
+    // кнопка исчезает, дальше обычный флоу (агент отвечает на сообщения).
+    $("composer-edit").addEventListener("click", () => {
+      state.editing = true;
+      syncComposer();
+      $("input").focus();
     });
     setupPullToRefresh();
     setupHeaderReload();
@@ -1851,6 +1943,7 @@
     rememberIntro();
     bind();
     setMode("oneshot");
+    syncComposer();
     await openLatestConversation();
     await refreshStatus();
     connectEvents();

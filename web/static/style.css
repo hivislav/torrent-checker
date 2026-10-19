@@ -852,6 +852,11 @@ body {
   gap: 10px;
   margin-bottom: 10px;
 }
+.composer__top.is-empty { margin-bottom: 0; }
+@media (max-width: 900px) {
+  /* На телефоне в этой строке остаётся «＋ Новая задача» — отступ нужен. */
+  .composer__top.is-empty { margin-bottom: 10px; }
+}
 
 .panel__foot {
   flex: none;
@@ -946,11 +951,34 @@ body {
 .mode-btn.is-active .mode-btn__icon { color: var(--amber-bright); }
 .mode-btn.is-active .mode-btn__hint { color: var(--amber); }
 
+/* Кнопка «Редактировать»: в просмотре задачи вместо поля ввода. */
+.composer__edit {
+  flex: 1;
+  max-width: 520px;
+  padding: 10px 14px;
+  font-family: var(--serif);
+  font-size: 13px;
+  letter-spacing: .06em;
+  color: var(--amber-bright);
+  background: rgba(224, 162, 83, .08);
+  border: 1px dashed rgba(224, 162, 83, .45);
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background .15s, border-color .15s;
+}
+.composer__edit:hover {
+  background: rgba(224, 162, 83, .16);
+  border-color: rgba(224, 162, 83, .7);
+}
+.composer__edit[hidden] { display: none; }
+
 .composer__row {
   display: flex;
   gap: 10px;
   align-items: stretch;
 }
+.composer__row[hidden] { display: none; }
+.composer__modes[hidden] { display: none; }
 
 .composer__input {
   flex: 1;

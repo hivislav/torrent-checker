@@ -97,6 +97,29 @@ def run() -> int:
         check("появились кнопки действий", len(actions) > 0, actions)
         page.screenshot(path=str(SHOTS / "02-answer.png"), animations="disabled")
 
+        print("\n== композер: правка только по кнопке ==")
+        # Правило владельца: недоступные для правки задачи — только просмотр,
+        # без поля ввода и без кнопок «разово/периодически». У задачи в выборе
+        # вместо них кнопка «Редактировать», которая и открывает поле.
+        check("поле ввода скрыто", not page.locator("#composer-row").is_visible())
+        check("кнопки режима скрыты", not page.locator(".composer__modes").is_visible())
+        edit_button = page.locator("#composer-edit")
+        check("есть кнопка «Редактировать»", edit_button.is_visible(),
+              page.locator("#composer-hint").inner_text())
+        if edit_button.is_visible():
+            edit_button.click()
+            page.wait_for_timeout(300)
+            check("после «Редактировать» появилось поле ввода",
+                  page.locator("#composer-row").is_visible())
+            check("кнопка «Редактировать» исчезла", not edit_button.is_visible())
+            check("кнопки режима не вернулись", not page.locator(".composer__modes").is_visible())
+            page.click("#panel-new-task")
+            page.wait_for_timeout(500)
+            check("в новой задаче поле и режимы на месте",
+                  page.locator("#composer-row").is_visible()
+                  and page.locator(".composer__modes").is_visible())
+            check("и кнопки «Редактировать» нет", not edit_button.is_visible())
+
         print("\n== панель задач ==")
         # Карточка появляется не мгновенно: агент дописывает задачу, а панель
         # обновляется раз в 5 секунд.
@@ -131,9 +154,11 @@ def run() -> int:
             test_torrent.write_bytes(b"d4:infod4:name0:e")
             conn = sqlite3.connect(str(settings.db_path))
             conn.execute("DELETE FROM downloads WHERE torrent_id = ?", (test_id,))
+            # done_at обязателен: «Скачано на диск» показывает только докачанное,
+            # иначе карточка в списке не появится вовсе.
             conn.execute(
-                "INSERT INTO downloads (torrent_id, title, name, size, torrent_path, added_at) "
-                "VALUES (?,?,?,?,?, datetime('now'))",
+                "INSERT INTO downloads (torrent_id, title, name, size, torrent_path, "
+                "added_at, done_at) VALUES (?,?,?,?,?, datetime('now'), datetime('now'))",
                 (test_id, test_name, test_name, "8 МБ", str(test_torrent)),
             )
             conn.commit()

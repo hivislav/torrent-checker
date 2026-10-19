@@ -291,7 +291,9 @@ async def test_locked_tasks_start_new() -> None:
     check("второго «не понял, что искать» нет", len(turn.messages) == 1,
           [m.text[:40] for m in turn.messages])
 
-    # 3) Мониторинг: текст тоже заводит новую задачу.
+    # 3) Периодическая в мониторинге: к ней пускает кнопка «Редактировать»,
+    #    поэтому правка идёт внутри задачи (в интерфейсе поле ввода появляется
+    #    только после нажатия этой кнопки).
     watching = Task(
         id="watch-task",
         kind="periodic",
@@ -304,14 +306,15 @@ async def test_locked_tasks_start_new() -> None:
     agent._parse_query = fake_parse  # noqa: SLF001
     turn = await agent.handle_message("s1", "Ты все видишь", "chat", "watch-task")
     stored = await agent.store.get_task("watch-task")
-    check("мониторинг не изменился",
-          stored.state == "monitoring" and (stored.params or {}).get("title") == "Ставка на любовь",
-          (stored.state, (stored.params or {}).get("title")))
-    check("для мониторинга тоже новая задача",
-          turn.task is not None and turn.task.id != "watch-task",
+    check("мониторинг правится внутри задачи",
+          turn.task is not None and turn.task.id == "watch-task",
           turn.task.id if turn.task else None)
-    text = " ".join(message.text for message in turn.messages).lower()
-    check("сказано, что задача уже в работе", "в работе" in text, text[:140])
+    check("название задачи обновилось",
+          (stored.params or {}).get("title") == "Ты все видишь",
+          (stored.params or {}).get("title"))
+    check("задача осталась в мониторинге", stored.state == "monitoring", stored.state)
+    check("мониторинг помечен как редактируемый",
+          stored.to_dict().get("editable") is True, stored.to_dict().get("editable"))
 
     # 4) Закрытая задача (отменена) — то же самое.
     closed = Task(
@@ -420,15 +423,42 @@ async def test_foreign_query() -> None:
     await agent.store.save_task(fresh)
     check("свежая задача активна", (await agent._active_task("s3")) is not None)  # noqa: SLF001
 
-    # Свежую задачу новый поиск не закрывает, старую — закрывает.
-    await agent._close_stale_tasks("s3", "oneshot", keep_id="other")  # noqa: SLF001
-    still = await agent.store.get_task("fresh-task")
-    check("свежая задача переживает новый поиск", still is not None and still.state == "awaiting_choice",
+    # Новый поиск не закрывает прежние задачи: человек ушёл на другую задачу —
+    # старая остаётся в работе, пока он сам её не отменит (правило владельца).
+    async def fake_parse_new(text, window, active):
+        return {"title": "Дюна", "intent": "find"}
+
+    async def fake_search_empty(params):
+        return []
+
+    async def fake_selection_quiet(task_obj, turn):
+        turn.add("ищу дальше", kind="text", task_id=task_obj.id)
+
+    class FakeMCP:
+        ready = True
+
+        async def search_pages(self, query, pages=1):
+            return []
+
+        async def start(self):
+            return None
+
+        async def stop(self):
+            return None
+
+    agent._parse_query = fake_parse_new  # noqa: SLF001
+    agent._search = fake_search_empty  # type: ignore[assignment]
+    agent._selection_step = fake_selection_quiet  # type: ignore[assignment]
+    agent.mcp = FakeMCP()  # type: ignore[assignment]
+    await agent.handle_message("s2", "Дюна", "chat")
+    still = await agent.store.get_task("stale-task")
+    check("старая задача остаётся в работе после нового поиска",
+          still is not None and still.state == "awaiting_choice",
           still.state if still else None)
-    await agent._close_stale_tasks("s2", "oneshot", keep_id="other")  # noqa: SLF001
-    gone = await agent.store.get_task("stale-task")
-    check("старая задача закрывается", gone is not None and gone.state == "cancelled",
-          gone.state if gone else None)
+    fresh_still = await agent.store.get_task("fresh-task")
+    check("и свежая тоже",
+          fresh_still is not None and fresh_still.state == "awaiting_choice",
+          fresh_still.state if fresh_still else None)
 
     # Кнопки закрытой задачи не должны запускать работу.
     closed = Task(

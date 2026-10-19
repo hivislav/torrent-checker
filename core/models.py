@@ -50,6 +50,18 @@ ACTIVE_STATES = {
 }
 FINISHED_STATES = {"done", "not_found", "failed", "cancelled"}
 
+# Пока задача в выборе — её можно править. Периодическая в мониторинге тоже
+# правится: человек меняет условия проверки. Скачивание и закрытые задачи —
+# только просмотр (интерфейс даже не показывает поле ввода).
+EDITABLE_STATES = ("searching", "awaiting_choice", "awaiting_confirm", "awaiting_setup")
+
+
+def task_editable(task: "Task") -> bool:
+    """Можно ли править задачу текстом (в интерфейсе — после «Редактировать»)."""
+    if task.state == "monitoring":
+        return task.kind == "periodic"
+    return task.state in EDITABLE_STATES
+
 STATE_TITLES: dict[str, str] = {
     "searching": "поиск",
     "awaiting_choice": "выбор варианта",
@@ -173,7 +185,10 @@ class Task:
         return str(params.get("title") or self.user_query or "без названия")
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        # `editable` — единственный источник правды для интерфейса: показывать
+        # поле ввода и кнопку «Редактировать» или оставить задачу только для
+        # просмотра.
+        return {**asdict(self), "editable": task_editable(self)}
 
     @classmethod
     def from_row(cls, row: dict[str, Any]) -> "Task":

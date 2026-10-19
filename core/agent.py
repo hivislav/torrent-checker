@@ -57,7 +57,16 @@ from core.matching import (
     title_match,
 )
 from core.mcp_client import KinozalMCP, MCPError
-from core.models import Action, Message, Task, Torrent, Turn, new_id, now_iso
+from core.models import (
+    Action,
+    Message,
+    Task,
+    Torrent,
+    Turn,
+    new_id,
+    now_iso,
+    task_editable,
+)
 from core.notify import DesktopNotifier, EventBus
 from core.push import WebPush
 from core.episodes import (
@@ -614,13 +623,13 @@ class Agent:
         return not progress.get("done")
 
     def _can_edit(self, task: Task) -> bool:
-        """Задачу ещё можно править текстом — она в процессе выбора.
+        """Задачу ещё можно править текстом (правило — core.models.task_editable).
 
-        Пока идёт поиск, выбор качества/озвучки/серий или подтверждение, человек
-        вправе уточнять («нет, 4K», «проверяй раз в сутки»). Но как только задача
-        в работе или закрыта, правок в ней нет: текст заводит новую задачу.
+        Пока идёт поиск, выбор качества/озвучки/серий или подтверждение — можно.
+        Периодическую в мониторинге — тоже: так человек меняет условия проверки.
+        Скачивание и закрытые задачи — только просмотр: текст заводит новую.
         """
-        return task.state in self.RESUME_STATES
+        return task_editable(task)
 
     # Как назвать состояние в объяснении «правки в неё не вношу».
     STATE_WORDS = {
@@ -2164,33 +2173,6 @@ class Agent:
                 return task
         return None
 
-    async def _close_stale_tasks(
-        self, session_id: str, kind: str, keep_id: str = ""
-    ) -> None:
-        """Закрывает прежние незакрытые задачи того же типа перед новым поиском.
-
-        Иначе старая карточка остаётся «текущей», и её кнопки утаскивают
-        новый запрос в чужую раздачу. Свежие задачи (моложе TTL) не трогаем:
-        человек мог отойти на минуту и вернуться к своей карточке.
-        """
-        ttl = max(1, int(getattr(self.settings, "active_task_ttl_minutes", 30) or 30))
-        deadline = datetime.now(timezone.utc) - timedelta(minutes=ttl)
-        for task in await self.store.list_tasks(limit=50):
-            if task.id == keep_id or task.session_id != session_id:
-                continue
-            if task.kind != kind or task.state not in self.RESUME_STATES:
-                continue
-            stamp = _parse_iso(task.updated_at) or _parse_iso(task.created_at)
-            if stamp is None or stamp >= deadline:
-                continue
-            task.state = "cancelled"
-            task.next_check_at = None
-            await self.store.save_task(task)
-            journal.add(
-                "agent", "закрыл прежнюю задачу перед новой", {"задача": task.id,
-                                                                 "название": task.title},
-            )
-
     async def _start_from_link(
         self, session_id: str, text: str, torrent_id: str, turn: Turn
     ) -> None:
@@ -2227,7 +2209,6 @@ class Agent:
         task.options = {"pool": [torrent.to_dict()], "queries": [torrent_id]}
         task.state = "searching"
         await self.store.save_task(task)
-        await self._close_stale_tasks(session_id, "oneshot", keep_id=task.id)
         journal.add(
             "agent",
             "задача заведена по ссылке на раздачу",
@@ -2291,7 +2272,6 @@ class Agent:
             await self.store.save_task(task)
         else:
             task = await self._task_from_params(session_id, text, parsed, kind="oneshot")
-        await self._close_stale_tasks(session_id, "oneshot", keep_id=task.id)
         turn.task = task
         turn.add(
             f"Ищу «{task.title}»"
