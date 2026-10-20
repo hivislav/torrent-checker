@@ -886,8 +886,12 @@ body {
 .new-task {
   display: inline-flex;
   align-items: center;
+  justify-content: center;
   gap: 6px;
   flex: none;
+  /* Высоту задаём сами: в просмотре задачи рядом нет кнопок режима, и от
+     `align-items: stretch` кнопка схлопывалась до высоты текста. */
+  min-height: 44px;
   padding: 0 14px;
   font-family: var(--serif);
   font-size: 12px;

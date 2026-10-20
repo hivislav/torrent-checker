@@ -5680,32 +5680,75 @@ class Agent:
         return ""
 
     async def _download_quiet(self, task: Task, torrent: Torrent) -> None:
-        """Скачивание по периодической задаче: без диалога, с уведомлением."""
+        """Новая серия по периодической задаче: качаем отдельной задачей.
+
+        Периодическая задача — это только мониторинг. Нашла то, что ждала, —
+        заводит разовую задачу-потомка и отдаёт скачивание ей. Так прогресс
+        виден в «в работе», загрузку можно отменить кнопкой, а карточка
+        мониторинга остаётся карточкой мониторинга.
+
+        Завести другую задачу — единственное, что периодической задаче можно:
+        без этого скачивание жило внутри мониторинга и нигде не отображалось.
+        """
+        child = await self._child_download_task(task, torrent)
+        journal.add(
+            "agent",
+            f"периодическая задача завела скачивание: {torrent.title}",
+            {
+                "задача": task.id,
+                "новая задача": child.id,
+                "серия": (child.params or {}).get("next_episode"),
+            },
+        )
         try:
-            result = await self._download(task, torrent)
+            result = await self._download(child, torrent)
         except Exception as exc:  # noqa: BLE001
             log.exception("тихое скачивание не удалось")
+            await self._drop_child(child)
             await self._remember_pending(task, torrent, str(exc))
             await self.store.save_task(task)
             await self._notify_error(task, torrent, str(exc))
             return
         if not result["ok"]:
+            await self._drop_child(child)
             await self._remember_pending(task, torrent, str(result.get("error") or ""))
             task.last_error = str(result.get("error") or "")
             await self.store.save_task(task)
             await self._notify_error(task, torrent, result.get("error") or "не удалось скачать")
             return
+        if result.get("transmission_error") and not str(result.get("transmission_hash") or ""):
+            # Раздача не встала в очередь (Transmission молчит или отказал):
+            # оставлять задачу «качается» нельзя — прогресса не будет никогда.
+            await self._drop_child(child)
+            await self._remember_pending(task, torrent, str(result["transmission_error"]))
+            task.last_error = str(result["transmission_error"])
+            await self.store.save_task(task)
+            await self._notify_error(task, torrent, str(result["transmission_error"]))
+            return
         # Раздача — пачка серий, а какую брать, не сказано: спрашиваем, а не
-        # качаем десятки гигабайт «на всякий случай».
+        # качаем десятки гигабайт «на всякий случай». Спрашиваем уже в задаче-
+        # потомке: выбор серий — это её скачивание.
         if result.get("needs_choice"):
             self._clear_pending(task)
             task.last_error = ""
+            child.state = "awaiting_choice"
+            child.last_result = "жду выбора серий"
+            await self.store.save_task(child)
+            sent = await self._ask_which_episodes(child, torrent, result, marker_task=task)
+            if not sent:
+                # Об этой пачке уже спрашивали — не заводим пустую задачу.
+                await self._drop_child(child)
+            else:
+                task.last_result = (
+                    f"нашёл серию {(child.params or {}).get('next_episode') or ''}: "
+                    "спрашиваю, какие серии качать"
+                ).strip()
             await self.store.save_task(task)
-            await self._ask_which_episodes(task, torrent, result)
             return
         # Раздача есть, а нужной серии в ней нет: качать нечего и врать про
         # «скачал» нельзя. Снимаем отложенное и ждём настоящей серии.
         if result.get("skipped"):
+            await self._drop_child(child)
             self._clear_pending(task)
             task.last_error = ""
             await self.store.save_task(task)
@@ -5715,18 +5758,50 @@ class Agent:
                 {"раздача": torrent.title, "причина": result.get("reason")},
             )
             return
+
+        # Успех: скачивание живёт отдельной задачей, мониторинг продолжается.
+        found = (child.params or {}).get("next_episode")
         self._clear_pending(task)
         task.last_error = ""
-        await self.store.save_task(task)
-        text = (
-            f"Новая серия по задаче «{task.title}»: скачал и поставил в очередь.\n"
-            f"• {torrent.title}\n{describe(torrent)}"
+        await self._finish_child(child, torrent, result)
+        # У задачи-потомка своя переписка: открыл карточку — сразу видно, что
+        # именно качается и по чьей задаче.
+        await self._remember_many(
+            child.session_id,
+            [
+                Message(
+                    role="agent",
+                    text=(
+                        f"Качаю по задаче «{task.title}»"
+                        + (f": серия {found}." if found else ".")
+                        + f"\n• {torrent.title}\n{describe(torrent)}"
+                    ),
+                    kind="task",
+                    task_id=child.id,
+                    payload={"task": child.to_dict(), "torrent": torrent.to_dict()},
+                )
+            ],
         )
+        if found:
+            task.last_result = f"нашёл серию {found} — качает отдельная задача"
+        else:
+            task.last_result = "нашёл новую раздачу — качает отдельная задача"
+        await self._advance_next_episode(task, torrent)
+        await self.store.save_task(task)
+
+        lines = [f"Новая серия по задаче «{task.title}»: нашёл{'' if not found else f' серию {found}'} и поставил качать."]
+        lines.append(f"• {torrent.title}")
+        lines.append(describe(torrent))
+        lines.append("Скачивание ведёт отдельная задача — она в работе, со своим прогрессом и кнопкой отмены.")
+        if (task.params or {}).get("next_episode"):
+            lines.append(f"Мониторинг продолжается: жду серию {task.params['next_episode']}.")
         if result.get("transmission_error"):
-            text += f"\nTransmission: {result['transmission_error']}"
+            lines.append(f"Transmission: {result['transmission_error']}")
+        text = "\n".join(lines)
         message = Message(
             role="agent", text=text, kind="notice", task_id=task.id,
-            payload={"task": task.to_dict(), "torrent": torrent.to_dict()},
+            payload={"task": task.to_dict(), "torrent": torrent.to_dict(),
+                     "download_task": child.to_dict()},
         )
         message.actions = self._task_actions(task)
         await self._remember_many(task.session_id, [message])
@@ -5735,35 +5810,127 @@ class Agent:
                 "type": "notification",
                 "level": "success",
                 "task_id": task.id,
-                "title": "Скачано по задаче",
+                "title": "Скачивание по задаче",
                 "text": text,
                 "message": message.to_dict(),
             }
         )
-        await self.desktop.send("Скачано по задаче", torrent.title[:120])
+        await self.desktop.send("Скачивание по задаче", torrent.title[:120])
         await self.push.send(
-            "Скачано по задаче",
+            "Скачивание по задаче",
             f"{task.title}: {torrent.title}"[:200],
         )
 
+    async def _child_download_task(self, task: Task, torrent: Torrent) -> Task:
+        """Разовая задача-потомок: она качает и показывает прогресс.
+
+        Название берём от сериала и серии («Звёзды в джунглях — серия 3»), чтобы
+        в картотеке было видно, что именно льётся, а не «Звёзды в джунглях»
+        рядом с такой же карточкой мониторинга.
+        """
+        params = task.params or {}
+        season = params.get("season", torrent.season)
+        episode = params.get("next_episode")
+        title = f"{task.title} — серия {episode}" if episode else task.title
+        child = Task(
+            id=new_id(),
+            kind="oneshot",
+            state="searching",
+            session_id=task.session_id,
+            user_query=title,
+            candidate=torrent.to_dict(),
+            params={
+                "title": title,
+                "original_title": params.get("original_title"),
+                "quality": params.get("quality") or torrent.quality,
+                "voice": params.get("voice") or torrent.voice,
+                "season": season,
+                "episode_from": params.get("episode_from"),
+                "next_episode": episode,
+                "year": params.get("year"),
+                "type": params.get("type"),
+                "series_key": torrent.series_key or params.get("series_key"),
+                "torrent_id": torrent.id,
+                # Откуда пришла задача: видно в журнале и в карточке.
+                "source_periodic": task.id,
+                "seen_ids": [],
+            },
+        )
+        child.params = {
+            key: value for key, value in child.params.items() if value not in (None, "", [])
+        }
+        await self.store.save_task(child)
+        return child
+
+    async def _finish_child(self, child: Task, torrent: Torrent, result: dict[str, Any]) -> None:
+        """Потомок становится обычным скачиванием: хеш, прогресс, план."""
+        child.state = "downloading"
+        child.candidate = torrent.to_dict()
+        child.last_result = "поставлено в очередь"
+        child.last_error = ""
+        child.params["transmission_hash"] = str(result.get("transmission_hash") or "")
+        child.params["torrent_id"] = torrent.id
+        child.options = {
+            **(child.options or {}),
+            "plan": result.get("plan") or {},
+            "torrent_path": result.get("path") or "",
+        }
+        await self.store.save_task(child)
+
+    async def _drop_child(self, child: Task) -> None:
+        """Скачивание не состоялось — пустую задачу-потомка убираем совсем."""
+        try:
+            await self.store.delete_task(child.id)
+        except Exception:  # noqa: BLE001 - уборка не должна мешать отчёту
+            log.warning("не удалось убрать задачу-потомка %s", child.id)
+
+    async def _advance_next_episode(self, task: Task, torrent: Torrent) -> None:
+        """Пересчитывает «какую серию ждём» по базе скачанного.
+
+        Раньше номер считался только в начале проверки, поэтому после скачивания
+        третьей серии карточка ещё полсуток писала «жду серию 3».
+        """
+        params = task.params or {}
+        series = str(params.get("series_key") or torrent.series_key or "")
+        if not series:
+            return
+        progress = await self.store.episodes_by_season(series)
+        for season_key, episode in (params.get("baseline_episodes") or {}).items():
+            try:
+                progress[int(season_key)] = max(progress.get(int(season_key), 0), int(episode))
+            except (TypeError, ValueError):
+                continue
+        params["next_episode"] = self._next_episode(params, progress)
+
     async def _ask_which_episodes(
-        self, task: Task, torrent: Torrent, result: dict[str, Any]
-    ) -> None:
+        self,
+        task: Task,
+        torrent: Torrent,
+        result: dict[str, Any],
+        *,
+        marker_task: Task | None = None,
+    ) -> bool:
         """Пачка серий без выбранной серии: спрашиваем, а не качаем всё.
 
         «Проверяй и скачивай» без указания серии и качества не значит «залей
         всю пачку на 120 ГБ». Уведомление повторяется только когда пачка
         выросла — иначе задача писала бы об одном и том же каждый раз.
+
+        `marker_task` — где хранить отметку «об этой пачке уже спрашивали».
+        Для периодической задачи выбор идёт в задаче-потомке (она живёт один
+        раз), а сравнение должно быть по карточке мониторинга: иначе один и тот
+        же вопрос приходил бы каждую проверку.
         """
         groups = result.get("groups") or []
         if not groups:
-            return
+            return False
         newest = max(int(group.get("episode") or 0) for group in groups)
         marker = {"id": torrent.id, "episodes": len(groups), "newest": newest}
-        if (task.params or {}).get("pack_notified") == marker:
-            return
-        task.params["pack_notified"] = marker
-        await self.store.save_task(task)
+        owner = marker_task or task
+        if (owner.params or {}).get("pack_notified") == marker:
+            return False
+        owner.params["pack_notified"] = marker
+        await self.store.save_task(owner)
         new_groups = result.get("new_groups") or groups
         total = human_bytes(sum(int(group.get("size") or 0) for group in groups))
         fresh_size = human_bytes(sum(int(group.get("size") or 0) for group in new_groups))
@@ -5812,6 +5979,7 @@ class Agent:
             }
         )
         await self.desktop.send("По задаче нужна серия", torrent.title[:120])
+        return True
 
     async def _notify_nothing(self, task: Task, *, manual: bool = False) -> None:
         """По задаче на трекере вообще пусто — сообщаем не чаще раза в сутки.

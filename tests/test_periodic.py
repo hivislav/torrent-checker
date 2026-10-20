@@ -286,6 +286,33 @@ async def test_auto_download() -> None:
     check("в память записана серия 3", [e["episode"] for e in episodes] == [3],
           [e["episode"] for e in episodes])
 
+    # Скачивание живёт отдельной разовой задачей: иначе прогресса не видно.
+    children = [
+        item for item in await agent.store.list_tasks(limit=50)
+        if (item.params or {}).get("source_periodic") == task.id
+    ]
+    print("  задача-потомок:", [(item.id[:6], item.state, item.title) for item in children])
+    check("периодическая завела задачу-потомка", len(children) == 1,
+          [(item.id, item.state) for item in children])
+    child = children[0] if children else None
+    check("потомок качает, а не мониторит", bool(child) and child.state == "downloading",
+          child.state if child else None)
+    check("у потомка есть хеш для прогресса",
+          bool(child) and bool((child.params or {}).get("transmission_hash")),
+          (child.params or {}).get("transmission_hash") if child else None)
+    check("в названии потомка видно серию",
+          bool(child) and "серия 3" in child.title, child.title if child else None)
+    check("мониторинг остался мониторингом",
+          task.state == "monitoring" and not (task.params or {}).get("transmission_hash"),
+          (task.state, (task.params or {}).get("transmission_hash")))
+    # Та самая недоработка: после скачивания третьей ждём уже четвёртую.
+    check("сразу после скачивания ждём 4-ю серию",
+          task.params.get("next_episode") == 4, task.params.get("next_episode"))
+    chat = await agent.store.history_for_task(task.id)
+    notice = next((row["text"] for row in reversed(chat) if "поставил качать" in (row["text"] or "")), "")
+    check("в уведомлении сказано про отдельную задачу",
+          "отдельная задача" in notice, notice[:120])
+
     print("\n  -- проверка без изменений --")
     before = len(transmission.added)
     await agent.check_task(task)
@@ -667,27 +694,57 @@ async def test_pack_needs_choice() -> None:
     check("скачалась одна серия, а не пачка", added == [None], added)
     check("в очередь ушла одиночная серия", mcp.downloads <= 2, mcp.downloads)
 
-    rows = await agent.store.history_for_task(task.id)
-    notices = [row for row in rows if row["role"] == "agent" and ("раздача с сериями" in (row["text"] or "") or "пачка серий" in (row["text"] or ""))]
+    # Периодическая задача сама не качает: она заводит разовую задачу-потомка,
+    # и весь диалог про пачку живёт уже в ней (она же и будет качать).
+    children = [
+        item for item in await agent.store.list_tasks(limit=50)
+        if (item.params or {}).get("source_periodic") == task.id
+    ]
+    waiting = [item for item in children if item.state == "awaiting_choice"]
+    print("  задачи-потомки:", [(item.id[:6], item.state) for item in children])
+    check("периодическая завела задачу-потомка", bool(children),
+          [(item.id, item.state) for item in children])
+    check("одна из них ждёт выбора серий", len(waiting) == 1,
+          [item.state for item in children])
+    child = waiting[0] if waiting else None
+
+    rows = await agent.store.history_for_task(child.id) if child else []
+    notices = [
+        row for row in rows
+        if row["role"] == "agent"
+        and ("раздача с сериями" in (row["text"] or "") or "пачка серий" in (row["text"] or ""))
+    ]
     print("  уведомление:", (notices[0]["text"].splitlines()[0] if notices else "нет"))
     check("пришло уведомление про пачку", bool(notices), [r["text"][:60] for r in rows])
     labels = [action["label"] for action in (notices[0]["actions"] if notices else [])]
     check("есть кнопки «Скачать всю пачку» и «Выбрать серии»",
           "Скачать всю пачку" in labels and "Выбрать серии" in labels, labels)
+    targets = [
+        action["payload"].get("task_id")
+        for action in (notices[0]["actions"] if notices else [])
+        if action["payload"].get("task_id")
+    ]
+    check("кнопки ведут в задачу-потомка",
+          bool(child) and bool(targets) and all(target == child.id for target in targets),
+          targets)
 
-    # Второй раз то же самое не повторяем.
-    before = len([row for row in await agent.store.history_for_task(task.id)
-                  if ("раздача с сериями" in (row["text"] or "") or "пачка серий" in (row["text"] or ""))])
+    # Второй раз про ту же пачку не спрашиваем и пустых потомков не плодим.
     await agent.check_task(await agent.store.get_task(task.id))
-    after = len([row for row in await agent.store.history_for_task(task.id)
-                 if ("раздача с сериями" in (row["text"] or "") or "пачка серий" in (row["text"] or ""))])
-    check("уведомление не дублируется", before == after, (before, after))
+    children_after = [
+        item for item in await agent.store.list_tasks(limit=50)
+        if (item.params or {}).get("source_periodic") == task.id
+    ]
+    waiting_after = [item for item in children_after if item.state == "awaiting_choice"]
+    check("уведомление не дублируется", len(waiting_after) == 1,
+          [(item.id[:6], item.state) for item in children_after])
 
     # Кнопка «Выбрать серии» показывает тот же выбор серий, что и в разовых задачах.
     task = await agent.store.get_task(task.id)
-    groups = (task.options or {}).get("episode_groups") or []
+    check("мониторинг остался мониторингом", task.state == "monitoring", task.state)
+    child = await agent.store.get_task(child.id)
+    groups = (child.options or {}).get("episode_groups") or []
     check("серии пачки сохранены для выбора", len(groups) == 20, len(groups))
-    turn = await agent.handle_action("s1", "choose_episodes", {"task_id": task.id})
+    turn = await agent.handle_action("s1", "choose_episodes", {"task_id": child.id})
     labels = [action.label for message in turn.messages for action in message.actions
               if action.kind == "toggle_episode"]
     print("  кнопки после «Выбрать серии»:", labels[:3], "… всего", len(labels))
