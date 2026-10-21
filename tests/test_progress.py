@@ -40,6 +40,8 @@ class FakeTransmission:
         self.download_dir = download_dir
         self.state: dict[str, dict] = {}
         self.calls = 0
+        # «Демон занят записью»: спросить прогресс не удалось (None).
+        self.busy = False
 
     def storage_info(self):  # noqa: D102
         return SimpleNamespace(
@@ -54,6 +56,8 @@ class FakeTransmission:
 
     async def progress(self, hashes):  # noqa: D102
         self.calls += 1
+        if self.busy:
+            return None
         return {
             item: self.state[item] for item in hashes if item in self.state
         }
@@ -207,8 +211,63 @@ async def test_hidden_until_done() -> None:
     agent.store.close()
 
 
-async def main() -> int:
-    print("\n== прогресс загрузки ==")
+async def test_busy_and_missing() -> None:
+    """«То появляется в работе, то исчезает» — так быть не должно.
+
+    Настоящий случай: пока Transmission писал на диск, опрос прогресса падал,
+    возвращал пустой ответ, и задача уезжала в «готово» с подписью «раздача
+    больше не в очереди». Через пять секунд демон отвечал, и задача
+    возвращалась обратно. Теперь «спросить не удалось» ничего не меняет, а
+    одна пропажа неподтверждённой раздачи не закрывает задачу.
+    """
+    print("\n== занятой демон не выкидывает задачу из работы ==")
+    agent, fake = build_agent()
+    task = await make_task(agent)
+    fake.state["h1"] = {
+        "hash": "h1", "name": "Проба", "percent": 25.0, "done": False,
+        "rate": 0, "rate_human": "", "eta_seconds": None, "eta_human": "",
+        "size": 4 * 1024**3, "size_human": "4 ГБ",
+        "downloaded_human": "1 ГБ", "left_human": "3 ГБ", "status": "downloading",
+    }
+    await agent.refresh_progress()
+    updated = await agent.store.get_task("dl")
+    check("качается — задача в работе", updated.state == "downloading", updated.state)
+
+    print("  -- демон занят записью: спросить не удалось --")
+    fake.busy = True
+    await agent.refresh_progress()
+    updated = await agent.store.get_task("dl")
+    check("состояние не изменилось", updated.state == "downloading", updated.state)
+    check("подпись осталась про прогресс", "25" in (updated.last_result or ""),
+          updated.last_result)
+    check("в память не записано «раздачи нет»",
+          "не в очереди" not in (updated.last_result or ""), updated.last_result)
+
+    print("  -- раздача пропала из очереди один раз --")
+    fake.busy = False
+    fake.state.clear()
+    await agent.refresh_progress()
+    updated = await agent.store.get_task("dl")
+    check("одна пропажа ничего не закрывает", updated.state == "downloading", updated.state)
+
+    print("  -- пропала второй раз --")
+    await agent.refresh_progress()
+    updated = await agent.store.get_task("dl")
+    check("вторая пропажа закрывает задачу", updated.state == "done", updated.state)
+    check("и честно сказано, что раздачи нет",
+          "не в очереди" in (updated.last_result or ""), updated.last_result)
+
+    print("  -- раздача вернулась в очередь --")
+    fake.state["h1"] = {
+        "hash": "h1", "name": "Проба", "percent": 60.0, "done": False,
+        "rate": 0, "rate_human": "", "eta_seconds": None, "eta_human": "",
+        "size": 4 * 1024**3, "size_human": "4 ГБ",
+        "downloaded_human": "2,4 ГБ", "left_human": "1,6 ГБ", "status": "downloading",
+    }
+    await agent.refresh_progress()
+    updated = await agent.store.get_task("dl")
+    check("задача снова в работе", updated.state == "downloading", updated.state)
+    agent.store.close()
 
 
 async def main() -> int:
@@ -265,6 +324,12 @@ async def main() -> int:
         user_query="проба2", params={"title": "Проба2", "transmission_hash": "h2"},
     )
     await agent.store.save_task(fake2_task)
+    # «Готово» ставим со второго пустого опроса: сразу после перезапуска
+    # Transmission сессия ещё грузится, и одна пропажа ничего не значит.
+    await agent.refresh_progress()
+    gone = await agent.store.get_task("dl2")
+    assert gone is not None
+    check("одна пропажа ещё не закрывает задачу", gone.state == "downloading", gone.state)
     await agent.refresh_progress()
     gone = await agent.store.get_task("dl2")
     assert gone is not None
@@ -310,6 +375,7 @@ async def main() -> int:
 
     await test_hidden_until_done()
     await test_cancel_stops_download()
+    await test_busy_and_missing()
     print("\n=== ИТОГ ===")
     if FAILS:
         for name in FAILS:

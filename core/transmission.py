@@ -533,11 +533,16 @@ class Transmission:
             )
             raise TransmissionError(self._explain(exc)) from exc
 
-    async def progress(self, hashes: list[str]) -> dict[str, dict[str, Any]]:
+    async def progress(self, hashes: list[str]) -> dict[str, dict[str, Any]] | None:
         """Прогресс раздач по хешам: процент, скорость, остаток, статус.
 
         Transmission RPC не умеет присылать события — только отвечать на запросы,
         поэтому прогресс приходится опрашивать. Один вызов на все нужные раздачи.
+
+        `None` — спросить не удалось (демон занят диском или молчит). Это важно
+        отличать от «раздачи в очереди нет»: иначе опрос во время записи
+        выглядит как «торрент удалён», и задача уезжает в «готово», а через
+        пять секунд возвращается обратно.
         """
         wanted = {item for item in hashes if item}
         if not wanted:
@@ -584,10 +589,10 @@ class Transmission:
         except TransmissionBusy as exc:
             # Демон занят записью — это не ошибка, просто ждём следующего опроса.
             log.debug("прогресс отложен: %s", exc)
-            return {}
+            return None
         except Exception as exc:  # noqa: BLE001
             log.warning("не удалось получить прогресс: %s", exc)
-            return {}
+            return None
 
     async def find_by_hash(self, torrent_hash: str) -> dict[str, Any] | None:
         """Раздача в очереди по хешу: имя, файлы, каталог, размер."""

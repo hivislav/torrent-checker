@@ -1478,7 +1478,7 @@ class Agent:
         progress: dict[str, Any] = {}
         if torrent_hash:
             try:
-                progress = (await self.transmission.progress([torrent_hash])).get(torrent_hash) or {}
+                progress = ((await self.transmission.progress([torrent_hash])) or {}).get(torrent_hash) or {}
             except Exception:  # noqa: BLE001 - отмена не должна падать
                 progress = {}
         if progress.get("done"):
@@ -1587,7 +1587,7 @@ class Agent:
 
         hashes = [str(row.get("transmission_hash") or "") for row in records]
         hashes += [str(item.get("hash") or "") for item in queue]
-        progress = await self.transmission.progress([item for item in hashes if item])
+        progress = await self.transmission.progress([item for item in hashes if item]) or {}
 
         # «Скачано на диск» — это то, что уже докачано. Пока Transmission не
         # сказал «готово», раздача живёт только в «В работе» (там прогресс).
@@ -4746,7 +4746,7 @@ class Agent:
         if torrent_hash:
             task.params["transmission_hash"] = torrent_hash
             try:
-                progress = (await self.transmission.progress([torrent_hash])).get(torrent_hash) or {}
+                progress = ((await self.transmission.progress([torrent_hash])) or {}).get(torrent_hash) or {}
             except Exception:  # noqa: BLE001 - прогресс не критичен
                 progress = {}
         # «Готово» ставим только когда Transmission прямо сказал, что всё
@@ -5474,18 +5474,31 @@ class Agent:
             if (task.params or {}).get("transmission_hash")
         ]
         progress = await self.transmission.progress([item for item in hashes if item])
+        if progress is None:
+            # Спросить не удалось (демон занят записью). Состояния не трогаем:
+            # иначе задача «то в работе, то в завершённых».
+            return
 
         for task in tasks:
             torrent_hash = str((task.params or {}).get("transmission_hash") or "")
             state = progress.get(torrent_hash)
             if state is None:
-                # Раздачи нет в очереди: удалена вручную или Transmission недоступен.
+                # Раздачи нет в очереди. Один пустой опрос ничего не значит —
+                # сразу после перезапуска Transmission сессия ещё грузится, —
+                # поэтому «готово» ставим только со второго раза подряд.
+                misses = int((task.params or {}).get("missing_polls") or 0) + 1
+                task.params["missing_polls"] = misses
+                if misses < 2:
+                    await self.store.save_task(task)
+                    continue
+                task.params.pop("missing_polls", None)
                 task.params.pop("progress", None)
                 task.state = "done"
                 task.last_result = "раздача больше не в очереди"
                 await self.store.save_task(task)
                 continue
 
+            task.params.pop("missing_polls", None)
             task.params["progress"] = state
             task.last_result = self._progress_text(state)
             if task.state == "done" and not state.get("done"):
