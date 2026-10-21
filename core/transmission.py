@@ -245,17 +245,20 @@ class Transmission:
                 last = exc
                 pause = self._mark_busy(exc)
                 self._reset_client()
-                journal.add(
-                    "transmission",
-                    "RPC не ответил — пауза перед следующей попыткой",
-                    {
-                        "попытка": attempt,
-                        "ждал": f"{limit:g} с",
-                        "пауза": f"{pause:.0f} с",
-                        "ошибка": f"{type(exc).__name__}: {exc}",
-                    },
-                    level="warn",
-                )
+                # В журнал — только начало заминки. Дальше панель опрашивает
+                # демон каждые несколько секунд, и каждый такой таймаут
+                # превращался в новую запись: журнал тонул в одинаковых строках.
+                if self._timeouts == 1:
+                    journal.add(
+                        "transmission",
+                        "RPC не ответил — жду, пока демон освободится",
+                        {
+                            "ждал": f"{limit:g} с",
+                            "пауза": f"{pause:.0f} с",
+                            "ошибка": f"{type(exc).__name__}: {exc}",
+                        },
+                        level="warn",
+                    )
             except Exception:
                 self._reset_client()
                 raise
@@ -578,6 +581,10 @@ class Transmission:
 
         try:
             return await self._run(run)
+        except TransmissionBusy as exc:
+            # Демон занят записью — это не ошибка, просто ждём следующего опроса.
+            log.debug("прогресс отложен: %s", exc)
+            return {}
         except Exception as exc:  # noqa: BLE001
             log.warning("не удалось получить прогресс: %s", exc)
             return {}

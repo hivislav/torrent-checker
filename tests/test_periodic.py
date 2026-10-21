@@ -752,6 +752,55 @@ async def test_pack_needs_choice() -> None:
     agent.store.close()
 
 
+async def test_notify_buttons_stay_alive() -> None:
+    """«Только сообщать»: кнопка «Скачать» в уведомлении должна работать.
+
+    Настоящий случай: задача нашла раздачу, но при нажатии «Проверить сейчас»
+    уведомление создавалось в этом же ходу и тут же помечалось отвеченным —
+    кнопка была неактивной с рождения. Плюс по нажатию должно заводиться
+    скачивание отдельной задачей, как и при автоскачивании.
+    """
+    print("\n== уведомление «только сообщать»: кнопка «Скачать» живая ==")
+    agent, mcp, transmission = build_agent()
+    task = await create_task(agent, auto=False)
+    assert task is not None
+    mcp.episodes = 3
+    await agent.handle_action("s1", "check_now", {"task_id": task.id})
+    rows = await agent.store.history_for_task(task.id)
+    fresh = [
+        row for row in rows
+        if row.get("actions")
+        and any(action["kind"] == "download_new" for action in row["actions"])
+    ]
+    print("  уведомлений с кнопкой «Скачать»:", len(fresh))
+    check("кнопка «Скачать» в уведомлении есть", bool(fresh),
+          [str(r["text"])[:60] for r in rows])
+    if fresh:
+        payload = fresh[-1].get("payload") or {}
+        check("кнопки уведомления активны", payload.get("resolved") is not True,
+              payload.get("resolved"))
+        torrent_id = next(
+            action["payload"]["torrent_id"]
+            for action in fresh[-1]["actions"]
+            if action["kind"] == "download_new"
+        )
+        before = len(transmission.added)
+        await agent.handle_action(
+            "s1", "download_new", {"task_id": task.id, "torrent_id": torrent_id}
+        )
+        check("по кнопке раздача встала в очередь", len(transmission.added) > before,
+              transmission.added[before:])
+        children = [
+            item for item in await agent.store.list_tasks(limit=50)
+            if (item.params or {}).get("source_periodic") == task.id
+        ]
+        print("  задача-потомок:", [(item.id[:6], item.state) for item in children])
+        check("качает отдельная задача", len(children) == 1,
+              [(item.id, item.state) for item in children])
+    agent.store.close()
+
+
+
 async def test_refine_periodic() -> None:
     print("\n== уточнение внутри периодической задачи ==")
     from core.models import Turn
@@ -1060,6 +1109,7 @@ async def main() -> int:
     await test_pending_retry()
     await test_listing_before_torrent()
     await test_pack_needs_choice()
+    await test_notify_buttons_stay_alive()
     await test_refine_periodic()
     await test_strict_conditions()
     await test_make_periodic_in_place()

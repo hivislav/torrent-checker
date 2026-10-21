@@ -594,17 +594,32 @@ class Store:
 
         return await self._call(run)
 
-    async def resolve_actions(self, task_id: str) -> int:
+    async def last_row_id(self) -> int:
+        """Последний id сообщения вообще — граница «что было до этого хода»."""
+
+        def run(conn: sqlite3.Connection) -> int:
+            return int(conn.execute("SELECT IFNULL(MAX(id), 0) FROM messages").fetchone()[0])
+
+        return int(await self._call(run))
+
+    async def resolve_actions(self, task_id: str, *, before_id: int | None = None) -> int:
         """Помечает последний вопрос задачи как отвеченный.
 
         Кнопки в сообщении нажимаются один раз: как только действие выполнено,
         этот вопрос закрыт, и после перезагрузки страницы кнопки снова не
         активны.
+
+        `before_id` — граница хода: сообщения, созданные в этом же ходу, не
+        трогаем. Иначе уведомление «нашлось новое» вместе с кнопкой «Скачать»,
+        появившееся во время «Проверить сейчас», тут же помечалось отвеченным —
+        и кнопка была мёртвой с рождения.
         """
         rows = await self.history_for_task(task_id, limit=200)
         for row in reversed(rows):
             actions = row.get("actions") or []
             if not actions:
+                continue
+            if before_id is not None and int(row["id"]) >= before_id:
                 continue
             payload = row.get("payload") or {}
             if payload.get("resolved"):

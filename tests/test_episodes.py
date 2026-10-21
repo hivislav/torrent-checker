@@ -352,6 +352,95 @@ def test_plan_rebuild() -> None:
     agent.store.close()
 
 
+def test_pack_seasons_and_big_lists() -> None:
+    """Многолетняя пачка: сначала сезон, потом серии; список не обрезается молча.
+
+    Настоящий случай («Черепашки мутанты ниндзя», 193 серии в 10 сезонах):
+    имена файлов вида «01..02. Название.mkv» разбирались как «серия 1, серия 1,
+    …» — весь сезон схлопывался в одну серию, и вместо 193 серий показывалось 10
+    кнопок, каждая из которых качала целый сезон.
+    """
+    print("\n== пачка на несколько сезонов: сначала сезон ==")
+    import asyncio
+    from core.models import Task, Torrent, Turn
+
+    pairs = [detect_episode(name) for name in (
+        "01..01. Первая.mkv",
+        "01..02. Вторая.mkv",
+        "02..01. Третья.mkv",
+        "10..05. Последняя.mkv",
+    )]
+    print("  разбор NN..MM:", pairs)
+    check("сезон и серия из «01..02» разбираются", pairs[0] == (1, 1) and pairs[1] == (1, 2), pairs)
+    check("второй сезон не путается с первым", pairs[2] == (2, 1), pairs[2])
+    check("десятый сезон разбирается", pairs[3] == (10, 5), pairs[3])
+    check("«4х07» с кириллической х — тоже сезон и серия", detect_episode("4х07.mkv") == (4, 7))
+
+    glued = parse_files(
+        [
+            {"index": 0, "size": 10, "name": "Сезон..01. A.mkv 01..02. B.mkv 01..03. C.mkv"},
+            {"index": 1, "size": 10, "name": "01..01. A.mkv"},
+            {"index": 2, "size": 10, "name": "02..01. B.mkv"},
+        ]
+    )
+    groups = episode_groups(glued)
+    print("  группы:", [f"{g['season']}×{g['episode']}" for g in groups])
+    check("склеенная строка сезона не считается файлом", glued[0].is_junk, glued[0].name[:40])
+    check("в группы попали только настоящие файлы", len(groups) == 2, len(groups))
+
+    tmp = Path(tempfile.mkdtemp(prefix="seasons-"))
+    settings = dataclasses.replace(
+        get_settings(), data_dir=tmp, db_path=tmp / "s.sqlite3", torrents_dir=tmp / "t"
+    )
+    agent = Agent(settings)
+    entries = parse_files(
+        [
+            {"index": index, "size": 100, "name": name}
+            for index, name in enumerate(
+                ["01..01. A.mkv", "01..02. B.mkv", "02..01. C.mkv", "02..02. D.mkv", "02..03. E.mkv"]
+            )
+        ]
+    )
+    groups = episode_groups(entries)
+    task = Task(
+        id="pack",
+        kind="oneshot",
+        state="awaiting_choice",
+        session_id="s",
+        user_query="Черепашки",
+        params={"title": "Черепашки"},
+        candidate=Torrent(id="777", title="Черепашки (1-2 сезоны: 1-5 серии из 5)").to_dict(),
+    )
+
+    async def scenario() -> None:
+        await agent.store.save_task(task)
+        turn = Turn()
+        await agent._show_episode_picker(  # noqa: SLF001
+            task, Torrent.from_dict(task.candidate), groups, None, turn
+        )
+        first = turn.messages[-1]
+        labels = [action.label for action in first.actions]
+        print("  шаг «сезон»:", labels)
+        check("сначала спрашивается сезон",
+              "Сезон 1" in " ".join(labels) and "Сезон 2" in " ".join(labels), labels)
+        check("серии на этом шаге не предлагаются",
+              not any(action.kind == "toggle_episode" for action in first.actions), labels)
+
+        await agent._pick_season(task, {"season": 2}, turn)  # noqa: SLF001
+        second = turn.messages[-1]
+        labels = [action.label for action in second.actions]
+        print("  шаг «серии сезона 2»:", labels[:6])
+        episodes = [action for action in second.actions if action.kind == "toggle_episode"]
+        check("показаны серии выбранного сезона", len(episodes) == 3, labels)
+        check("у каждой кнопки сезон в payload",
+              all(action.payload.get("season") == 2 for action in episodes),
+              [action.payload.get("season") for action in episodes])
+        check("есть кнопка «Другой сезон»", "Другой сезон" in labels, labels)
+
+    asyncio.run(scenario())
+    agent.store.close()
+
+
 def test_multi_season_pack() -> None:
     """Пачка «1-4 сезоны: 1-40 серии» — серии различаются по сезону.
 
@@ -470,6 +559,7 @@ def main() -> int:
     test_selection_options()
     test_multi_episode_plan()
     test_plan_rebuild()
+    test_pack_seasons_and_big_lists()
     test_multi_season_pack()
     print("\n=== ИТОГ ===")
     if FAILS:

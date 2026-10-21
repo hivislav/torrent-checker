@@ -377,6 +377,8 @@ class Agent:
             turn.add("Пустой запрос. Напишите, что искать — например «Дюна 1080p».")
             return turn
 
+        # Граница хода: сообщения, созданные ниже, нельзя помечать «отвеченными».
+        turn_mark = await self.store.last_row_id()
         user_message_id = await self._remember(
             session_id, Message(role="user", text=text, kind="text", task_id=task_id or "")
         )
@@ -530,7 +532,7 @@ class Agent:
             # Ответ появился — значит, вопрос, который висел, уже отвечен.
             # (toggle_episode не шлёт сообщений: там выбор ещё идёт.)
             try:
-                await self.store.resolve_actions(turn.task.id)
+                await self.store.resolve_actions(turn.task.id, before_id=turn_mark)
             except Exception as exc:  # noqa: BLE001 - пометка не должна ронять ответ
                 log.warning("не удалось пометить вопрос отвеченным: %s", exc)
         await self._remember_many(session_id, turn.messages)
@@ -1050,6 +1052,8 @@ class Agent:
 
     async def handle_action(self, session_id: str, kind: str, payload: dict[str, Any]) -> Turn:
         turn = Turn()
+        # Граница хода: своё же новое сообщение нельзя помечать «отвеченным».
+        turn_mark = await self.store.last_row_id()
         task_id = str(payload.get("task_id") or "")
         task = await self.store.get_task(task_id) if task_id else None
         turn.task = task
@@ -1247,12 +1251,20 @@ class Agent:
             if torrent is None:
                 turn.add("Эта раздача больше не в списке — дождитесь следующей проверки.", kind="error")
             else:
-                # Нажатие «Скачать» в уведомлении — это и есть подтверждение:
-                # ставим в очередь сразу, выбирая только новые серии.
-                await self._auto_download(task, torrent, turn)
+                # Нажатие «Скачать» в уведомлении — это и есть подтверждение.
+                # Качает отдельная разовая задача: мониторинг остаётся
+                # мониторингом, а прогресс виден в «В работе».
+                await self._download_quiet(task, torrent)
+                turn.add(
+                    f"Поставил качать «{torrent.title}» отдельной задачей — она в работе.",
+                    kind="text",
+                    task_id=task.id,
+                )
         elif kind == "start_download" and task:
             await self._start_download(task, turn,
                                        periodic_context=task.kind == "periodic")
+        elif kind == "pick_season" and task:
+            await self._pick_season(task, payload, turn)
         elif kind == "choose_episodes" and task:
             groups = [
                 group for group in (task.options or {}).get("episode_groups") or []
@@ -1411,9 +1423,9 @@ class Agent:
 
         if turn.task is not None and turn.messages:
             # Ответ появился — значит, вопрос, который висел, уже отвечен.
-            # (toggle_episode не шлёт сообщений: там выбор ещё идёт.)
+            # Своё же новое сообщение не трогаем: у него кнопки ещё не нажимали.
             try:
-                await self.store.resolve_actions(turn.task.id)
+                await self.store.resolve_actions(turn.task.id, before_id=turn_mark)
             except Exception as exc:  # noqa: BLE001 - пометка не должна ронять ответ
                 log.warning("не удалось пометить вопрос отвеченным: %s", exc)
         await self._remember_many(session_id, turn.messages)
@@ -1550,12 +1562,23 @@ class Agent:
             ]
         try:
             queue = await self.transmission.list_torrents(limit=200)
+        except TransmissionBusy as exc:
+            # Панель спрашивает очередь каждые несколько секунд: во время
+            # записи большого файла это нормальный ответ, а не ошибка.
+            log.debug("очередь отложена: %s", exc)
+            queue = []
+            self.downloads_meta = {
+                "stale": True,
+                "busy": True,
+                "error": str(exc),
+                "measured_at": _short_clock(),
+            }
         except TransmissionError as exc:
             log.warning("не удалось прочитать очередь Transmission: %s", exc)
             queue = []
             self.downloads_meta = {
                 "stale": True,
-                "busy": isinstance(exc, TransmissionBusy),
+                "busy": False,
                 "error": str(exc),
                 "measured_at": _short_clock(),
             }
@@ -3273,6 +3296,12 @@ class Agent:
             task_season = None
         # Какой сезон показываем: сезон задачи, если он есть в этой пачке.
         shown_season = task_season if task_season in pack_seasons else None
+        # Пачка на несколько сезонов: сначала сезон. Иначе список — это 191
+        # кнопка «Серия N» без шансов найти нужную, а всё, что за пределами
+        # экрана, просто не видно.
+        if shown_season is None and len(pack_seasons) > 1:
+            await self._ask_pack_season(task, torrent, groups, path, turn, pack_seasons)
+            return
         visible = [
             group for group in groups
             if shown_season is None or self._pair_key(group.get("season"), group.get("episode"))[0] == shown_season
@@ -3309,9 +3338,16 @@ class Agent:
             lines.append(f"• ⚠ Внешний диск недоступен: {storage.error}")
         lines.append("• Отметьте серии кнопками (можно несколько) — сумма посчитается сама.")
         lines.append("• Куда: " + str(self.settings.transmission_download_dir))
+        limit = 60
+        hidden = len(visible) - limit
+        if hidden > 0:
+            lines.append(
+                f"• Показаны первые {limit} из {len(visible)} серий — остальные "
+                "можно взять как «Весь сезон»."
+            )
         message = turn.add("\n".join(lines), kind="tickets", task_id=task.id,
                            payload={"task": task.to_dict(), "torrent": torrent.to_dict()})
-        for group in visible[:40]:
+        for group in visible[:limit]:
             season, episode = self._pair_key(group.get("season"), group.get("episode"))
             label = f"Серия {episode} · {human_bytes(int(group.get('size') or 0))}"
             if multi_season and season is not None:
@@ -3352,6 +3388,16 @@ class Agent:
             )
         )
         message.actions.extend(self._torrent_actions(task))
+        if len(pack_seasons) > 1:
+            message.actions.append(
+                Action(
+                    id="other-season",
+                    label="Другой сезон",
+                    kind="pick_season",
+                    payload={"task_id": task.id},
+                    group="Действие",
+                )
+            )
         message.actions.append(
             Action(
                 id="cancel-episodes",
@@ -3364,6 +3410,106 @@ class Agent:
         )
         task.state = "awaiting_choice"
         await self.store.save_task(task)
+
+    async def _ask_pack_season(
+        self,
+        task: Task,
+        torrent: Torrent,
+        groups: list[dict],
+        path: Path | None,
+        turn: Turn,
+        pack_seasons: list[int],
+    ) -> None:
+        """В пачке несколько сезонов — сначала сезон, потом серии.
+
+        Пачка «1-10 сезоны: 1-193 серии» иначе превращается в 191 кнопку
+        «Серия N»: найти нужную невозможно, а всё за пределами экрана и вовсе
+        не видно.
+        """
+        counts: dict[int, int] = {}
+        for group in groups:
+            season = self._pair_key(group.get("season"), group.get("episode"))[0]
+            if season is None:
+                continue
+            counts[int(season)] = counts.get(int(season), 0) + 1
+        lines = [
+            f"В раздаче {_plural(len(groups), 'серия', 'серии', 'серий')} "
+            f"в {_plural(len(pack_seasons), 'сезоне', 'сезонах', 'сезонах')} — какой сезон?",
+            "",
+        ]
+        lines.extend(self._torrent_warnings(torrent))
+        signals = self._signals_line(torrent)
+        if signals:
+            lines.append(f"• Раздача: {signals}")
+        lines.append("• " + ", ".join(f"{season} — {counts.get(season, 0)}" for season in pack_seasons))
+        lines.append("• Затем отметьте серии этого сезона.")
+        message = turn.add(
+            "\n".join(lines),
+            kind="tickets",
+            task_id=task.id,
+            payload={"task": task.to_dict(), "torrent": torrent.to_dict()},
+        )
+        for season in pack_seasons:
+            message.actions.append(
+                Action(
+                    id=f"season-{season}",
+                    label=f"Сезон {season} · {counts.get(season, 0)} сер.",
+                    kind="pick_season",
+                    payload={"task_id": task.id, "season": season},
+                    group="Сезоны",
+                )
+            )
+        message.actions.extend(self._torrent_actions(task))
+        message.actions.append(
+            Action(
+                id="cancel-season",
+                label="Отмена",
+                kind="cancel",
+                payload={"task_id": task.id},
+                style="danger",
+                group="Действие",
+            )
+        )
+        task.options = {
+            **(task.options or {}),
+            "episode_groups": [
+                {
+                    "season": group.get("season"),
+                    "episode": group.get("episode"),
+                    "indexes": group.get("indexes"),
+                    "size": group.get("size"),
+                    "names": group.get("names"),
+                }
+                for group in groups
+            ],
+        }
+        if path is not None:
+            task.options["torrent_path"] = str(path)
+        task.state = "awaiting_choice"
+        await self.store.save_task(task)
+
+    async def _pick_season(self, task: Task, payload: dict[str, Any], turn: Turn) -> None:
+        """Выбран сезон пачки: показываем серии этого сезона (или список сезонов)."""
+        raw = payload.get("season")
+        try:
+            season = int(raw) if raw not in (None, "") else None
+        except (TypeError, ValueError):
+            season = None
+        if season is not None:
+            task.params["season"] = season
+        else:
+            task.params.pop("season", None)
+        task.options = {**(task.options or {}), "selected_episodes": []}
+        await self.store.save_task(task)
+        groups = (task.options or {}).get("episode_groups") or []
+        torrent = Torrent.from_dict(task.candidate or {}) if task.candidate else None
+        if torrent is None or not groups:
+            turn.add("Раздача уже не под рукой — найдите её заново.", kind="error", task_id=task.id)
+            return
+        path_str = str((task.options or {}).get("torrent_path") or "")
+        await self._show_episode_picker(
+            task, torrent, groups, Path(path_str) if path_str else None, turn
+        )
 
     @staticmethod
     def _quality_label(value: str) -> str:

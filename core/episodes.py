@@ -30,8 +30,12 @@ SIDE_EXT = (".srt", ".ass", ".ssa", ".sub", ".idx", ".vtt", ".mka", ".ac3", ".dt
 JUNK_HINTS = ("sample", "трейлер", "trailer", "nfo", ".txt", ".url", ".jpg", ".png", ".exe")
 
 _SEASON_EPISODE_PATTERNS = (
+    # «01..02. Название.mkv» — так оформлены многолетние пачки на трекере:
+    # первое число это сезон, второе — серия. Без этого правила весь сезон
+    # схлопывался в одну «серию 1», и выбор серий показывал 10 кнопок вместо 193.
+    re.compile(r"(?<!\d)(\d{1,2})\.{2}(\d{1,3})(?!\d)"),
     re.compile(r"(?i)\bs(\d{1,2})[\s._-]*e(?:p)?[\s._-]*(\d{1,3})\b"),
-    re.compile(r"(?i)(?<!\d)(\d{1,2})x(\d{1,3})(?!\d)"),
+    re.compile(r"(?i)(?<!\d)(\d{1,2})[xх](\d{1,3})(?!\d)"),
     re.compile(r"(?i)сезон[\s._-]*(\d{1,2}).{0,12}?серия[\s._-]*(\d{1,3})"),
     # «4 сезон 7 серия» — сезон стоит ПЕРЕД словом «сезон»
     re.compile(r"(?i)(\d{1,2})\s*[-_]?\s*сезон\S*.{0,20}?(\d{1,3})\s*[-_]?\s*(?:серия|эпизод|выпуск)"),
@@ -65,7 +69,12 @@ class FileEntry:
     @property
     def is_junk(self) -> bool:
         low = self.name.lower()
-        return any(hint in low for hint in JUNK_HINTS) or self.name.startswith("__MACOSX")
+        if any(hint in low for hint in JUNK_HINTS) or self.name.startswith("__MACOSX"):
+            return True
+        # Страница раздачи для многолетних пачек отдаёт склеенную строку сезона:
+        # в одном «имени файла» перечислены все серии. Это не файл — в списке
+        # серий ему делать нечего.
+        return sum(low.count(ext) for ext in VIDEO_EXT) > 1
 
     @property
     def label(self) -> str:
