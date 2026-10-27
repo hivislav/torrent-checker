@@ -913,6 +913,32 @@ Transmission при штатном удалении перемещает дан�
 завершения — их возвращает `sudo fsck_exfat -fy /dev/rdiskNsM` на отмонтированном
 диске.
 
+Так и оказалось на живом диске: панель показывала «не учтено 13,1 ГБ»,
+`fsck_exfat` ответил «The bitmap needs to be repaired», а после починки
+(и чистого размонтирования) занятое место совпало с файлами: 170,1 → 157,0 ГБ.
+Причина — exfat без журнала: если запись оборвалась, обновление карты занятости
+могла не дойти до диска.
+
+Важно: `fsck_exfat` работает только на **отмонтированном** томе, иначе он
+открывает диск «read-only» и пишет `Couldn't write … Bad file descriptor`, а
+исправление не применяется. Том при этом часто не отпускает Universal Media
+Server (ffmpeg читает файлы с диска):
+
+```
+cd /Users/user/torrent-checker && scripts/run.sh stop
+osascript -e 'quit app "Universal Media Server"'
+pkill -f ffmpeg
+sleep 3
+sudo diskutil unmount /Volumes/EAGET
+sudo fsck_exfat -fy /dev/rdisk4s2
+diskutil mount disk4s2          # монтировать надо по устройству, не по пути
+cd /Users/user/torrent-checker && scripts/run.sh start
+```
+
+Агент переживает и размонтированный диск: на старте он пишет предупреждение и
+поднимает интерфейс, а панель показывает «диск недоступен» — вместо падения
+`PermissionError: /Volumes/EAGET`.
+
 Наши файлы считаются отдельно (`core/storage_target.dir_size`) с ограничением по
 времени: обход 200 ГБ ради строчки в интерфейсе недопустим, поэтому при
 превышении бюджета значение помечается как приблизительное (`≈`).

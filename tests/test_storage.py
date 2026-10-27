@@ -332,6 +332,31 @@ async def test_agent_message() -> None:
 
 
 
+async def test_start_without_disk() -> None:
+    """Несмонтированный диск не валит старт агента.
+
+    Настоящий случай: после `diskutil unmount` (проверка fsck) приложение не
+    поднялось — `mkdir` для каталога torrent-файлов бросил PermissionError на
+    `/Volumes/EAGET`. Интерфейс должен встать и честно сказать «диск недоступен».
+    """
+    print("\n== старт без внешнего диска ==")
+    tmp = Path(tempfile.mkdtemp(prefix="nodisk-"))
+    settings = dataclasses.replace(
+        get_settings(), data_dir=tmp, db_path=tmp / "n.sqlite3",
+        torrents_dir=Path("/Volumes/НЕТ_ТАКОГО_ДИСКА/torrent-files"),
+        transmission_download_dir=Path("/Volumes/НЕТ_ТАКОГО_ДИСКА/torrents"),
+    )
+    agent = Agent(settings)
+    try:
+        await agent.start(with_scheduler=False)
+        check("агент стартовал без диска", True)
+    except Exception as exc:  # noqa: BLE001
+        check("агент стартовал без диска", False, f"{type(exc).__name__}: {exc}")
+    storage, _ = await agent._storage_status()  # noqa: SLF001
+    check("панель говорит, что диск недоступен", storage.get("ok") is False, storage.get("ok"))
+    await agent.stop()
+
+
 async def test_status_cached_offloop() -> None:
     """Состояние диска: считается в потоке, кэшируется, не подвешивает цикл."""
     print("\n== диск в статусе: в потоке и с кэшем ==")
@@ -445,6 +470,7 @@ async def main() -> int:
     await test_agent_refuses_without_torrent_dir()
     await test_agent_message()
     await test_status_cached_offloop()
+    await test_start_without_disk()
     await test_status_keeps_last_known()
 
     print("\n=== ИТОГ ===")

@@ -305,7 +305,14 @@ class Agent:
     async def start(self, *, with_scheduler: bool = True) -> None:
         if self._started:
             return
-        self.settings.torrents_dir.mkdir(parents=True, exist_ok=True)
+        # Внешний диск может быть не смонтирован (выдернули, идёт проверка
+        # fsck, монтирование ещё не вернулось). Это не повод падать на старте:
+        # интерфейс должен подняться и честно показать «диск недоступен»,
+        # а заработать — как только том вернётся.
+        try:
+            self.settings.torrents_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            log.warning("каталог torrent-файлов недоступен на старте: %s", exc)
         self._started = True
         try:
             await self.mcp.start()

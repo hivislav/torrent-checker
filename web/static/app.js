@@ -922,11 +922,11 @@
           if ((disk.hidden_bytes || 0) > 1024 ** 3) {
             const systemDirs = disk.system_dirs || [];
             const why = systemDirs.includes(".Spotlight-V100")
-              ? "служебные каталоги тома: индекс Spotlight (.Spotlight-V100) и .fseventsd — агент не может их измерить, macOS не даёт читать"
-              : "служебные каталоги тома, корзина или данные, которые ещё держит открытыми Transmission";
+              ? "служебные каталоги тома: индекс Spotlight (.Spotlight-V100) и .fseventsd — агент не может их измерить, macOS не даёт читать даже root"
+              : "потерянные кластеры файловой системы (бывает после аварийного завершения записи на exfat) или корзина тома";
             const hint = systemDirs.length
               ? ` Найдено на томе: ${systemDirs.join(", ")}.`
-              : "";
+              : " Если цифра большая, проверьте диск на отмонтированном томе: sudo fsck_exfat -fy /dev/rdiskNsM.";
             rows.push([
               "не учтено",
               `<span class="status-warn" title="Занято ${disk.used_human}, из них наши загрузки и torrent-файлы — ${disk.own_human}. Остальное — ${why}.${hint} Индекс Spotlight для этого диска можно выключить: sudo mdutil -i off ${disk.path}">${disk.hidden_human}</span> — ${systemDirs.length ? "служебное на томе" : "не наши файлы"}`,
