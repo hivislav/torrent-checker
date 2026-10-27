@@ -3,7 +3,7 @@
 Transmission на macOS штатно «удаляет» данные через Finder API, то есть
 перемещает их в `.Trashes` на том же томе. Место при этом не освобождается, пока
 корзину не очистят вручную. Поэтому данные стирает сам агент — обычными
-`os.remove`/`shutil.rmtree`, которые корзину не используют вовсе.
+`os.unlink`/`os.rmdir`, которые корзину не используют вовсе.
 
 Главный риск здесь — удалить не то. Пути приходят из Transmission RPC, а он
 отдаёт их как есть, поэтому перед удалением каждый путь проверяется:
@@ -18,7 +18,7 @@ Transmission на macOS штатно «удаляет» данные через 
 from __future__ import annotations
 
 import os
-import shutil
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
@@ -57,7 +57,41 @@ def _norm(path: str | Path) -> str:
         real = os.path.realpath(str(path))
     except OSError:
         real = str(path)
-    return real.rstrip(os.sep) or os.sep
+    # NFC: exfat отдаёт имена в разложенном виде («ё» = «е» + диакритика), а в
+    # памяти агента они составные. Без нормализации один и тот же путь
+    # сравнивается как два разных, и удаление отказывает «не то место».
+    return unicodedata.normalize("NFC", real.rstrip(os.sep) or os.sep)
+
+
+def resolve_existing(path: Path) -> Path | None:
+    """Находит путь на диске с учётом нормализации Unicode.
+
+    Иначе `os.path.lexists` говорит «нет такого файла», хотя папка лежит: так
+    7 ГБ «Звёзд в джунглях» остались на диске, а запись о них агент уже снял.
+    """
+    path = Path(path)
+    parent = path.parent
+    if parent == path:
+        return path if os.path.lexists(path) else None
+    if not os.path.isdir(parent):
+        fixed = resolve_existing(parent)
+        if fixed is None:
+            return None
+        parent = fixed
+    try:
+        names = os.listdir(parent)
+    except OSError:
+        return None
+    # Имя берём ровно такое, какое лежит на диске. `lexists` здесь обманывает:
+    # exfat отвечает «файл есть» на составное имя, а `rmtree`/`unlink` с этим
+    # же именем падает «No such file or directory».
+    if path.name in names:
+        return parent / path.name
+    wanted = unicodedata.normalize("NFC", path.name)
+    for child in names:
+        if unicodedata.normalize("NFC", child) == wanted:
+            return parent / child
+    return None
 
 
 def _allocated_size(path: str) -> int:
@@ -103,21 +137,67 @@ def is_within(path: Path, roots: Iterable[Path]) -> bool:
     return False
 
 
+def _name_variants(name: str) -> list[str]:
+    """Все написания имени, которые стоит попробовать при удалении.
+
+    exfat хранит имя ровно в том виде, в каком его создали (составное «ё» или
+    разложенное «е» + диакритика), а `listdir` всегда показывает разложенное.
+    Поэтому `unlink`/`rmdir` с именем «как в списке» может упасть с ENOENT,
+    хотя файл лежит прямо перед нами: так 7 ГБ «Звёзд в джунглях» остались на
+    диске, а запись о раздаче агент уже снял.
+    """
+    variants: list[str] = []
+    for value in (name, unicodedata.normalize("NFC", name), unicodedata.normalize("NFD", name)):
+        if value and value not in variants:
+            variants.append(value)
+    return variants
+
+
+def _unlink(path: Path) -> None:
+    for name in _name_variants(path.name):
+        try:
+            os.unlink(Path(path.parent) / name)
+            return
+        except FileNotFoundError:
+            continue
+    raise FileNotFoundError(f"нет такого файла: {path}")
+
+
+def _rmdir(path: Path) -> None:
+    for name in _name_variants(path.name):
+        try:
+            os.rmdir(Path(path.parent) / name)
+            return
+        except FileNotFoundError:
+            continue
+    raise FileNotFoundError(f"нет такой папки: {path}")
+
+
+def remove_tree(path: Path) -> None:
+    """Рекурсивно удаляет папку (или файл), подбирая написание каждого имени."""
+    path = Path(path)
+    if path.is_symlink() or not path.is_dir():
+        _unlink(path)
+        return
+    for name in os.listdir(path):
+        remove_tree(path / name)
+    _rmdir(path)
+
+
 def delete_path(path: Path, roots: Iterable[Path], result: DeletionResult) -> None:
     """Удаляет файл или папку без корзины, если путь в разрешённом корне."""
     path = Path(path)
-    if not os.path.lexists(path):
+    found = resolve_existing(path)
+    if found is None:
         result.missing.append(str(path))
         return
+    path = found
     if not is_within(path, roots):
         result.refused.append(str(path))
         return
     size = path_size(path)
     try:
-        if path.is_symlink() or path.is_file():
-            os.remove(path)
-        else:
-            shutil.rmtree(path)
+        remove_tree(path)
     except OSError as exc:
         result.errors.append(f"не удалось удалить {path}: {exc}")
         return

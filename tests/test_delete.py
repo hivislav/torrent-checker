@@ -151,9 +151,60 @@ async def test_agent_delete() -> None:
     agent.store.close()
 
 
+def test_unicode_names() -> None:
+    """Удаление находит имена в любом написании Unicode.
+
+    exfat хранит имя так, как его создали (составное «ё» или разложенное), а
+    список всегда отдаёт разложенное. Настоящий случай: папка «Звёзды в
+    джунглях» (7 ГБ) не удалилась — «No such file or directory», — а запись о
+    раздаче агент уже снял, и место осталось занятым.
+    """
+    print("\n== удаление не спотыкается об Unicode ==")
+    import os
+    import tempfile
+    import unicodedata
+
+    from core.files import delete_paths, resolve_existing
+
+    root = Path(tempfile.mkdtemp(prefix="unicode-del-"))
+    for label, dir_form, file_form in (
+        ("nfc-nfc", "NFC", "NFC"),
+        ("nfc-nfd", "NFC", "NFD"),
+        ("nfd-nfc", "NFD", "NFC"),
+        ("nfd-nfd", "NFD", "NFD"),
+    ):
+        target = root / label
+        target.mkdir()
+        folder = unicodedata.normalize(dir_form, "Звёзды Тест")
+        (target / folder).mkdir()
+        for name in ("файл.bin", "серия.mkv"):
+            (target / folder / unicodedata.normalize(file_form, name)).write_bytes(b"\0" * 1024)
+        # Агент помнит путь в составном виде — как пришёл из своей базы.
+        wanted = target / unicodedata.normalize("NFC", "Звёзды Тест")
+        result = delete_paths([wanted], [target])
+        check(f"{label}: папка удалена", not result.errors and not os.listdir(target),
+              (result.errors, os.listdir(target)))
+        check(f"{label}: место посчитано", result.freed_bytes >= 2048, result.freed_bytes)
+
+    check("путь ищется по нормализованному имени",
+          resolve_existing(root / "нет такого") is None)
+
+    # штатная проверка «только свои папки» продолжает работать
+    outside = Path(tempfile.mkdtemp(prefix="outside-"))
+    (outside / "чужое").mkdir()
+    refused = delete_paths([outside / "чужое"], [root])
+    check("вне разрешённых папок не удаляем", bool(refused.refused), refused.refused)
+    check("чужое осталось", (outside / "чужое").exists())
+    import shutil
+
+    shutil.rmtree(outside, ignore_errors=True)
+    shutil.rmtree(root, ignore_errors=True)
+
+
 async def main() -> int:
     test_paths()
     await test_agent_delete()
+    test_unicode_names()
 
     print("\n=== ИТОГ ===")
     if FAILS:
