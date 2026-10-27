@@ -245,10 +245,13 @@ class Transmission:
                 last = exc
                 pause = self._mark_busy(exc)
                 self._reset_client()
-                # В журнал — только начало заминки. Дальше панель опрашивает
-                # демон каждые несколько секунд, и каждый такой таймаут
-                # превращался в новую запись: журнал тонул в одинаковых строках.
-                if self._timeouts == 1:
+                # В журнал — только начало заминки и не чаще раза в минуту.
+                # Дальше панель опрашивает демон каждые несколько секунд, и
+                # каждый таймаут превращался в новую запись: журнал тонул в
+                # одинаковых строках.
+                now = time.monotonic()
+                if self._timeouts == 1 and now - getattr(self, "_busy_logged_at", 0.0) > 60:
+                    self._busy_logged_at = now
                     journal.add(
                         "transmission",
                         "RPC не ответил — жду, пока демон освободится",
@@ -693,6 +696,9 @@ class Transmission:
 
         try:
             return await self._run(run)
+        except TransmissionBusy:
+            # «Занят диском» — не поломка очереди: пусть вызывающий отличит.
+            raise
         except Exception as exc:  # noqa: BLE001
             raise TransmissionError(self._explain(exc)) from exc
 

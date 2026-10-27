@@ -409,6 +409,28 @@ async def test_status_keeps_last_known() -> None:
           "занят" in str(storage.get("error")), storage.get("error"))
     check("каталог .torrent тоже из прошлого ответа",
           torrents.get("ok") is True, torrents)
+
+    # Служебные каталоги тома: их не измерить, но панель должна знать, что они есть,
+    # иначе занятое место выглядит как «чужие файлы» на диске, где есть только мы.
+    import tempfile as _tempfile
+    volume = Path(_tempfile.mkdtemp(prefix="volume-"))
+    (volume / ".Spotlight-V100").mkdir()
+    (volume / ".fseventsd").mkdir()
+    downloads = volume / "torrents"
+    downloads.mkdir()
+    real_settings = dataclasses.replace(
+        get_settings(), data_dir=volume / "data", db_path=volume / "data" / "s.sqlite3",
+        torrents_dir=volume / "torrent-files", transmission_download_dir=downloads,
+    )
+    (volume / "data").mkdir()
+    real_settings.torrents_dir.mkdir()
+    real_agent = Agent(real_settings)
+    storage_live, _ = await real_agent._storage_status()  # noqa: SLF001
+    print("  служебные каталоги тома:", storage_live.get("system_dirs"))
+    check("видны служебные каталоги тома",
+          ".Spotlight-V100" in (storage_live.get("system_dirs") or []),
+          storage_live.get("system_dirs"))
+    real_agent.store.close()
     agent.store.close()
 
 

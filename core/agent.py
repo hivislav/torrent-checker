@@ -1754,6 +1754,16 @@ class Agent:
             storage["downloads_size_human"] = human_size(own_downloads)
             storage["torrents_size_human"] = human_size(own_torrents)
             storage["checked_at"] = _short_clock()
+            # Служебные каталоги тома: их не измерить (macOS не даёт читать
+            # .Spotlight-V100), но именно они попадают в «не учтено». Пусть
+            # панель скажет об этом прямо, а не намекает на чужие файлы.
+            root = Path(storage.get("path") or self.settings.transmission_download_dir)
+            volume = root.parent
+            system_dirs = [
+                name for name in (".Spotlight-V100", ".fseventsd", ".Trashes")
+                if (volume / name).exists()
+            ]
+            storage["system_dirs"] = system_dirs
             return storage, target_info(self.settings.torrents_dir).to_dict()
 
         try:
@@ -6025,10 +6035,21 @@ class Agent:
         """Потомок становится обычным скачиванием: хеш, прогресс, план."""
         child.state = "downloading"
         child.candidate = torrent.to_dict()
-        child.last_result = "поставлено в очередь"
         child.last_error = ""
         child.params["transmission_hash"] = str(result.get("transmission_hash") or "")
         child.params["torrent_id"] = torrent.id
+        # Сразу спрашиваем прогресс: иначе карточка несколько секунд выглядит
+        # пустой, и кажется, что скачивание не запустилось.
+        child.last_result = "поставлено в очередь — жду первых данных"
+        if child.params["transmission_hash"]:
+            try:
+                state = await self.transmission.progress([child.params["transmission_hash"]])
+                first = (state or {}).get(child.params["transmission_hash"])
+            except Exception:  # noqa: BLE001 - подпись не должна ронять скачивание
+                first = None
+            if first:
+                child.params["progress"] = first
+                child.last_result = self._progress_text(first)
         child.options = {
             **(child.options or {}),
             "plan": result.get("plan") or {},
