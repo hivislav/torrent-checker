@@ -282,7 +282,9 @@
           line.append(caret, text);
           line.addEventListener("click", () => {
             if (line.disabled) return;
-            showTorrentDetails(action.payload.torrent_id, line);
+            showTorrentDetails(
+              action.payload.torrent_id, line, action.payload.task_id || ""
+            );
           });
           row.appendChild(line);
           continue;
@@ -477,9 +479,12 @@
       await openConversation(ownerTask);
     }
     state.busy = true;
-    const owner = button.closest(".msg");
+    // Кнопки может не быть: действие приходит из окна «Подробнее», где нет
+    // сообщения чата. Раньше это роняло обработчик до запроса — кнопка
+    // «Взять эту раздачу» выглядела мёртвой.
+    const owner = button && button.closest ? button.closest(".msg") : null;
     if (owner) lockMessage(owner);
-    button.disabled = true;
+    if (button) button.disabled = true;
     renderPending();
     try {
       const payload = await api("/api/action", {
@@ -1313,7 +1318,7 @@
     return link;
   }
 
-  function detailsBox(data, torrentId) {
+  function detailsBox(data, torrentId, taskId) {
     const box = document.createElement("div");
     const head = document.createElement("p");
     head.className = "info__title";
@@ -1345,10 +1350,23 @@
       text.textContent = data.description;
       box.appendChild(text);
     }
-    if (data.url) {
+    if (data.url || taskId) {
       const wrap = document.createElement("div");
       wrap.className = "info__actions";
-      wrap.appendChild(infoLink(data.url, "Открыть на трекере · комментарии"));
+      // Раздачу из списка вариантов можно взять прямо здесь, не набирая
+      // заново название и не выбирая качество.
+      if (taskId) {
+        const take = document.createElement("button");
+        take.type = "button";
+        take.className = "btn btn--primary btn--tiny";
+        take.textContent = "Взять эту раздачу";
+        take.addEventListener("click", () => {
+          closeInfo();
+          runAction({ kind: "pick_torrent", payload: { task_id: taskId, torrent_id: torrentId } });
+        });
+        wrap.appendChild(take);
+      }
+      if (data.url) wrap.appendChild(infoLink(data.url, "Открыть на трекере · комментарии"));
       box.appendChild(wrap);
     }
     return box;
@@ -1370,7 +1388,7 @@
   // Окно открывается СРАЗУ, до запроса к трекеру: страница раздачи идёт через
   // шлюз Cloudflare и на холодном старте может отвечать секундами. Молчаливая
   // кнопка «открываю…» без окна выглядит как «ничего не произошло».
-  async function showTorrentDetails(torrentId, button) {
+  async function showTorrentDetails(torrentId, button, taskId) {
     if (!torrentId) return;
     const label = button ? button.textContent : "";
     if (button) {
@@ -1380,7 +1398,7 @@
     openInfo("Подробности раздачи", "Читаю страницу раздачи на трекере…");
     try {
       const data = await api(`/api/torrent/${encodeURIComponent(torrentId)}/details`);
-      fillInfo(detailsBox(data, torrentId));
+      fillInfo(detailsBox(data, torrentId, taskId));
     } catch (error) {
       fillInfo(`Не получилось открыть раздачу: ${error.message}`);
     } finally {

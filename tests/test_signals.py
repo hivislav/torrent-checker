@@ -180,6 +180,36 @@ def test_actions() -> None:
     agent.store.close()
 
 
+def test_pool_rows() -> None:
+    """Полный список по названию: от лучшей к худшей, с ограничением.
+
+    Настоящий случай: запрос «черепашки ниндзя» в задаче с годом 1987 давал 3
+    раздачи, хотя по названию их больше сотни. Теперь под вопросом о качестве
+    виден весь список, отсортированный по соответствию условиям.
+    """
+    print("\n== список всех вариантов по названию ==")
+    agent = make_agent()
+    task = make_task(MOVIE, params={"title": "Дюна", "year": 2024})
+    matched = dataclasses.replace(MOVIE, id="1", year=2024, seeds=40)
+    other = dataclasses.replace(MOVIE, id="2", year=1990, seeds=1)
+    pool = [other, matched] + [
+        dataclasses.replace(MOVIE, id=str(100 + i), title=f"Дюна {i}", seeds=i)
+        for i in range(20)
+    ]
+    rows = agent._pool_rows(task, pool)  # noqa: SLF001
+    print("  строк:", len(rows), "| первая:", rows[0].label[:60] if rows else None)
+    check("список ограничен 15 строками", len(rows) == 15, len(rows))
+    check("первая строка — самая подходящая (по условиям)",
+          rows[0].payload.get("torrent_id") == "1", rows[0].payload)
+    check("строки пронумерованы по порядку",
+          [row.label.split(".")[0] for row in rows[:3]] == ["1", "2", "3"],
+          [row.label[:12] for row in rows[:3]])
+    check("строка знает задачу — из карточки можно взять раздачу",
+          all(row.payload.get("task_id") == task.id for row in rows),
+          rows[0].payload)
+    agent.store.close()
+
+
 def test_link_flow() -> None:
     print("\n== задача по ссылке ==")
     agent = make_agent()
@@ -334,16 +364,24 @@ def test_details_everywhere() -> None:
         agent._ask_dimension(task, turn, "quality", ["1080p", "720p"], len(pool), found=pool)  # noqa: SLF001
     )
     found_actions = details_actions(turn.messages[0])
-    # Кликабельная строка на КАЖДЫЙ вариант, а не одна «лучшая»: по строке
-    # видно, что даёт это качество, и можно открыть его раздачу.
+    # Строки двух видов: по вариантам качества и полный список по названию.
+    def numbered(action) -> bool:
+        head, sep, _rest = action.label.partition(". ")
+        return bool(sep) and head.isdigit()
+
+    option_rows = [a for a in found_actions if not numbered(a)]
+    pool_rows = [a for a in found_actions if numbered(a)]
     check("на шаге выбора качества — строка на каждый вариант",
-          len(found_actions) == 2, [a.label for a in found_actions])
-    labels = [action.label for action in found_actions]
+          len(option_rows) == 2, [a.label for a in found_actions])
+    labels = [action.label for action in option_rows]
     check("в подписях строк — качество и сигналы",
           all("p" in label and "сид" in label for label in labels), labels)
     check("строка ведёт на раздачу этого варианта",
-          {action.payload.get("torrent_id") for action in found_actions} == {"12", "11"},
-          [action.payload.get("torrent_id") for action in found_actions])
+          {action.payload.get("torrent_id") for action in option_rows} == {"12", "11"},
+          [action.payload.get("torrent_id") for action in option_rows])
+    check("и ниже — полный список по названию, от лучшей",
+          bool(pool_rows) and pool_rows[0].label.startswith("1."),
+          [a.label[:40] for a in pool_rows[:3]])
     # Ссылка на трекер переехала внутрь окна «Подробнее»: в чате её больше нет.
     check("в чате нет отдельной ссылки на трекер",
           not any(action.kind == "link" for action in turn.messages[0].actions),
@@ -354,8 +392,12 @@ def test_details_everywhere() -> None:
     turn = Turn()
     asyncio.run(agent._offer_relaxed(relaxed, pool, turn))  # noqa: SLF001
     relaxed_rows = details_actions(turn.messages[0])
+    relaxed_options = [a for a in relaxed_rows
+                       if not (a.label.partition(". ")[1] and a.label.partition(". ")[0].isdigit())]
     check("в «ничего не подошло» — строка на каждый доступный вариант",
-          len(relaxed_rows) == 2, [a.label for a in relaxed_rows])
+          len(relaxed_options) == 2, [a.label for a in relaxed_rows])
+    check("и полный список по названию тоже есть",
+          len(relaxed_rows) > len(relaxed_options), [a.label[:30] for a in relaxed_rows])
 
     # Шаг «какой именно фильм» — подробности о самом вероятном варианте.
     title_task = make_task(pool[1], params={"title": "Дюна"})
@@ -390,6 +432,7 @@ def main() -> int:
     test_card()
     test_options()
     test_actions()
+    test_pool_rows()
     test_details_everywhere()
     test_link_flow()
     test_checks_journal()

@@ -908,7 +908,7 @@ class Agent:
             await self.store.save_task(task)
             turn.add(f"Не смог обратиться к трекеру: {exc}", kind="error", task_id=task.id)
             return
-        task.options = {"pool": [t.to_dict() for t in torrents[:80]], "queries": [task.params.get("title")]}
+        task.options = {"pool": [t.to_dict() for t in torrents[:200]], "queries": [task.params.get("title")]}
         await self.store.save_task(task)
         summary = ", ".join(
             f"{PARAM_TITLES.get(key, key)}: {value}" for key, value in shown.items()
@@ -1013,7 +1013,7 @@ class Agent:
             except MCPError as exc:
                 turn.add(f"Не смог обратиться к трекеру: {exc}", kind="error", task_id=task.id)
                 return
-            task.options = {**(task.options or {}), "pool": [t.to_dict() for t in torrents[:80]]}
+            task.options = {**(task.options or {}), "pool": [t.to_dict() for t in torrents[:200]]}
             await self._present_periodic(task, torrents, turn)
             return
 
@@ -2360,7 +2360,7 @@ class Agent:
             return
 
         task.options = {
-            "pool": [t.to_dict() for t in torrents[:80]],
+            "pool": [t.to_dict() for t in torrents[:200]],
             "queries": [task.params.get("title")],
             "suggestions": suggestions,
         }
@@ -2807,6 +2807,9 @@ class Agent:
             message.actions.extend(
                 self._torrent_actions(task, torrent=self._best_torrent(by_title, params))
             )
+        # Полный список по названию: условия не сошлись, но выбор должен быть
+        # виден целиком, а не «по фильтрам ничего нет».
+        message.actions.extend(self._pool_rows(task, by_title))
         message.actions.append(
             Action(
                 id="cancel-options",
@@ -2881,6 +2884,22 @@ class Agent:
             lines.extend(summary)
         else:
             lines.append(f"Доступно с учётом остальных условий: {shown}.")
+        # Всё, что вообще есть по названию: фильтры могли сузить выдачу до двух
+        # раздач, а по названию их десятки — человек должен видеть весь список.
+        by_title_pool = filter_candidates(
+            [Torrent.from_dict(item) for item in (task.options or {}).get("pool", [])],
+            {"title": str(task.params.get("title") or "")},
+        )
+        pool_rows = self._pool_rows(task, by_title_pool)
+        if len(by_title_pool) > len(found) and pool_rows:
+            shown = min(len(by_title_pool), len(pool_rows))
+            lines.append("")
+            lines.append(
+                f"Всего по названию "
+                f"{_plural(len(by_title_pool), 'раздача', 'раздачи', 'раздач')} — ниже "
+                + (f"все {shown}, " if shown >= len(by_title_pool) else f"первые {shown}, ")
+                + "от лучшей к худшей (нажмите, чтобы посмотреть):"
+            )
         lines.append(DETAILS_HINT)
         text = "\n".join(lines)
         group = "Качество" if dimension == "quality" else "Озвучка"
@@ -2922,6 +2941,8 @@ class Agent:
             message.actions.extend(
                 self._torrent_actions(task, torrent=self._best_torrent(found, task.params))
             )
+        if pool_rows:
+            message.actions.extend(pool_rows)
         message.actions.append(
             Action(
                 id="cancel-choose",
@@ -3314,7 +3335,7 @@ class Agent:
             torrents = exact
         task.options = {
             **(task.options or {}),
-            "pool": [t.to_dict() for t in torrents[:80]],
+            "pool": [t.to_dict() for t in torrents[:200]],
             "suggestions": [],
             "queries": [title],
         }
@@ -4394,6 +4415,46 @@ class Agent:
             out.append((label, rank(subset, params)[0] if subset else None, len(subset)))
         return out
 
+    def _pool_rows(
+        self, task: Task, pool: list[Torrent], limit: int = 15
+    ) -> list[Action]:
+        """Кликабельные строки на все раздачи по названию — от лучшей к худшей.
+
+        Человек ждёт «что вообще есть по этому названию», а видел только то, что
+        прошло фильтры: запрос «черепашки ниндзя» в задаче с годом 1987 давал три
+        раздачи из сотни. Порядок — по соответствию условиям и живучести.
+        """
+        if not pool:
+            return []
+        ordered = rank(pool, task.params or {})
+        rows: list[Action] = []
+        for index, torrent in enumerate(ordered[:limit], start=1):
+            # Подпись: качество/серия без веса (вес есть в сигналах) — иначе
+            # «8,47 ГБ» повторяется дважды.
+            hint_bits: list[str] = []
+            episodes = sorted({int(item) for item in (torrent.episodes or [])})
+            if len(episodes) > 1:
+                hint_bits.append(
+                    f"сезон {torrent.season}, серии {episodes[0]}–{episodes[-1]}"
+                    if torrent.season else f"серии {episodes[0]}–{episodes[-1]}"
+                )
+            elif episodes:
+                hint_bits.append(f"серия {episodes[0]}")
+            if torrent.year:
+                hint_bits.append(str(torrent.year))
+            if torrent.quality:
+                hint_bits.append(torrent.quality)
+            signals = self._signals_line(torrent)
+            if signals:
+                hint_bits.append(signals)
+            hint = " · ".join(hint_bits)
+            rows.append(
+                self._variant_row(
+                    torrent.id, f"{index}. {torrent.title}", hint=hint, task_id=task.id
+                )
+            )
+        return rows
+
     def _option_summaries(
         self,
         found: list[Torrent],
@@ -4730,7 +4791,9 @@ class Agent:
             return []
         # Одна строка вместо двух кнопок: «Подробнее» открывает окно, а ссылка на
         # трекер живёт уже внутри него — но только если человек захочет.
-        return [self._variant_row(identifier, "Подробнее о раздаче", task_id=task.id)]
+        # Без task_id: это карточка уже выбранной раздачи, «взять» из неё незачем
+        # (а лишний клик поставил бы её в очередь повторно).
+        return [self._variant_row(identifier, "Подробнее о раздаче")]
 
     @staticmethod
     def _variant_row(
