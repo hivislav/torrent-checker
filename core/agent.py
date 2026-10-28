@@ -4358,6 +4358,10 @@ class Agent:
             if torrent_id not in seen:
                 seen.append(torrent_id)
         task.params["seen_ids"] = seen[-400:]
+        # Отметка «с базовой линией уже разбирались». Без неё задача, у которой
+        # на момент создания ничего не нашлось (транслит вроде «Сэйлор Мун»),
+        # при первой же находке объявляла бы новинкой всё, что лежит на трекере.
+        task.params["baseline_at"] = now_iso()
         by_season = episodes_by_season(torrents)
         if by_season:
             # Ключи JSON всегда строки — приводим к ним явно.
@@ -6490,6 +6494,23 @@ class Agent:
                 max_uploaded_ts=max_ts,
                 next_episode=next_episode,
             )
+            if (
+                fresh
+                and params.get("baseline_at")
+                and not params.get("seen_ids")
+                and not params.get("baseline_ts")
+            ):
+                # Базовой линии нет (задача создана, когда по названию ничего не
+                # находилось, — например транслит «Сэйлор Мун»). То, что нашлось
+                # сейчас, — не новость, а то, что уже лежит на трекере:
+                # запоминаем и сообщим только про следующее.
+                self._record_baseline(task, matched)
+                journal.add(
+                    "agent",
+                    f"первая находка по задаче «{task.title}»: запомнил, что уже есть",
+                    {"найдено": len(matched), "как новое не считаю": len(fresh)},
+                )
+                fresh = []
             task.found_total = len(matched)
             task.next_check_at = None
             self._schedule_next(task)

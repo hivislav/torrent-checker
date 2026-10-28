@@ -1153,6 +1153,54 @@ async def test_default_interval() -> None:
     agent.store.close()
 
 
+async def test_first_finding_is_not_news() -> None:
+    """У задачи, созданной без находок, первая находка — не новинка.
+
+    Настоящий случай: «Сэйлор Мун» создана, когда по названию ничего не
+    нашлось (транслит), базовая линия пустая. После исправления поиска по
+    алиасам проверка нашла 7 старых раздач — и они не должны прийти как
+    «нашёл новое».
+    """
+    print("\n== первая находка после исправления поиска ==")
+    import sqlite3  # noqa: F401  (для наглядности: сценарий про базу)
+
+    agent, mcp, transmission = build_agent()
+    mcp.custom_rows = [tracker_row(2)]
+    from core.models import Task
+
+    task = Task(
+        id="first-finding", kind="periodic", state="monitoring", session_id="checks",
+        user_query="Сэйлор Мун", interval_minutes=720, auto_download=True,
+        params={
+            "title": "Звёзды в джунглях",
+            "type": "series",
+            "seen_ids": [],
+            # базовая линия снималась при создании, но нашлось тогда ноль
+            "baseline_at": "2026-10-28T07:00:00+00:00",
+        },
+    )
+    await agent.store.save_task(task)
+    await agent.check_task(task)
+    rows = await agent.store.history_for_task(task.id)
+    notices = [row for row in rows if row["role"] == "agent"]
+    print("  сообщений:", len(notices), "| постановок в очередь:", len(transmission.added))
+    check("новинкой не объявлено", not transmission.added, transmission.added)
+    check("и уведомления о новом нет", not notices, [r["text"][:60] for r in notices])
+    stored = await agent.store.get_task(task.id)
+    print("  seen_ids:", len((stored.params or {}).get("seen_ids") or []))
+    check("раздача запомнена как уже виденная",
+          str(tracker_row(2)["id"]) in ((stored.params or {}).get("seen_ids") or []),
+          (stored.params or {}).get("seen_ids"))
+
+    # Следующая находка — уже настоящая новость: и на странице, и в .torrent
+    # серий стало больше.
+    mcp.custom_rows = [tracker_row(3, upload_date="28.10.2026 в 12:00")]
+    mcp.episodes = 3
+    await agent.check_task(await agent.store.get_task(task.id))
+    check("следующая серия считается новинкой", bool(transmission.added), transmission.added)
+    agent.store.close()
+
+
 async def test_check_searches_aliases() -> None:
     """Проверка периодической задачи ищет так же, как разовый поиск.
 
@@ -1256,6 +1304,7 @@ async def main() -> int:
     await test_refine_settings()
     await test_cancel_only_in_panel()
     await test_default_interval()
+    await test_first_finding_is_not_news()
     await test_check_searches_aliases()
     test_name_matching()
 
