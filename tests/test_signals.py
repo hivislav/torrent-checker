@@ -263,8 +263,8 @@ def test_pool_choice_without_quality() -> None:
     check("в подписях видно качество и сиды",
           any("1080p" in action.label and "сид" in action.label for action in rows),
           [action.label for action in rows][:3])
-    check("сказано про разный состав сезонов",
-          "разный состав сезонов" in message.text, message.text[:300])
+    check("сказано, что состав сезонов у раздач разный",
+          "различаются составом сезонов" in message.text, message.text[:300])
     agent.store.close()
 
 
@@ -315,6 +315,68 @@ def test_title_change_drops_stale_filters() -> None:
     agent._drop_dims_not_in_query(asked)  # noqa: SLF001
     check("названное качество осталось", asked.params.get("quality") == "1080p", asked.params)
     check("названный год остался", asked.params.get("year") == 2024, asked.params)
+    agent.store.close()
+
+
+def test_expand_group_lists_releases() -> None:
+    """Строка «название — 4 раздачи» раскрывает сами раздачи, а не первую из них.
+
+    Настоящий случай: «Сэйлор Мун» → «Какой именно нужен?», и рядом с двумя
+    названиями висело «Подробнее о вариантах», открывавшее карточку случайной
+    раздачи группы. Теперь клик по названию раскрывает его раздачи: у каждой
+    своя карточка («Взять эту раздачу» → сезон и серии).
+    """
+    print("\n== название раскрывается в список своих раздач ==")
+    agent = make_agent()
+    rows = [
+        ("1", "Красавица-воин Сейлор Мун (1 сезон: 1-46 серии из 46) / 1992 / ДБ / DVDRip (480p)", "12 ГБ", 6),
+        ("2", "Красавица-воин Сейлор Мун (2 сезон: 1-43 серии из 43) / 1993 / ДБ / DVDRip (480p)", "11 ГБ", 4),
+        ("3", "Красавица-воин Сейлор Мун: Кристалл ONA (1 сезон: 1-26 серии из 26) / 2014 / ДБ / WEB-DL (1080p)", "9 ГБ", 7),
+    ]
+    pool = [
+        parse_torrent({"id": i, "title": t, "size": size, "seeds": seeds})
+        for i, t, size, seeds in rows
+    ]
+    task = make_task(pool[0], params={"title": "Сэйлор Мун", "type": "series"})
+    task.options = {"pool": [t.to_dict() for t in pool]}
+    asyncio.run(agent.store.save_task(task))
+
+    turn = Turn()
+    asyncio.run(agent._ask_title(  # noqa: SLF001
+        task,
+        [
+            {"title": "Красавица-воин Сейлор Мун", "torrent_id": "1", "count": 2, "years": "1992–1993"},
+            {"title": "Красавица-воин Сейлор Мун: Кристалл ONA", "torrent_id": "3", "count": 1, "years": "2014"},
+        ],
+        3,
+        turn,
+        weak=False,
+    ))
+    row = [a for a in turn.messages[-1].actions if a.kind == "expand_group"][0]
+    check("строка-название раскрывается, а не открывает карточку",
+          row.kind == "expand_group" and row.payload.get("row") is True, row.payload)
+
+    expanded = asyncio.run(
+        agent.handle_action("s", "expand_group", {"task_id": task.id, "title": row.payload["title"]})
+    )
+    message = expanded.messages[-1]
+    print("  текст:", message.text.replace("\n", " | ")[:160])
+    check("видно, какое название раскрыто",
+          "Красавица-воин Сейлор Мун»" in message.text and "2 раздачи" in message.text,
+          message.text[:200])
+    cards = [a for a in message.actions if a.kind == "details"]
+    check("в списке только раздачи этой группы", len(cards) == 2,
+          [a.label for a in message.actions])
+    check("и это раздачи сериала 1992 года, без «Кристалла»",
+          all("Кристалл" not in a.label for a in cards), [a.label for a in cards])
+    check("у каждой раздачи своя строка-карточка",
+          len({a.payload.get("torrent_id") for a in cards}) == 2,
+          [a.payload.get("torrent_id") for a in cards])
+    check("задача по-прежнему в выборе", (asyncio.run(agent.get_task(task.id))).state
+          in ("awaiting_choice", "awaiting_confirm"))
+    check("остальные раздачи в задаче не потерялись",
+          len(asyncio.run(agent.get_task(task.id)).options.get("pool") or []) == 3,
+          (asyncio.run(agent.get_task(task.id)).options or {}).get("pool"))
     agent.store.close()
 
 
@@ -599,11 +661,22 @@ def test_details_everywhere() -> None:
     ]
     asyncio.run(agent._ask_title(title_task, suggestions, 6, turn, weak=False))  # noqa: SLF001
     title_actions = details_actions(turn.messages[0])
-    check("на шаге выбора названия — строка на каждый вариант",
-          len(title_actions) == 2, [a.label for a in title_actions])
-    check("строки ведут на разные раздачи",
-          {action.payload.get("torrent_id") for action in title_actions} == {"12", "13"},
-          [action.payload.get("torrent_id") for action in title_actions])
+    # Уточнение названия — не выбор раздачи: за «Дюной» их четыре, и «Подробнее»
+    # открыло бы карточку первой попавшейся. Правило владельца: строка на этом
+    # шаге раскрывает раздачи названия, а карточка — уже у конкретной раздачи.
+    check("на шаге выбора названия нет карточки «первой попавшейся»",
+          not title_actions, [a.label for a in title_actions])
+    expand_rows = [a for a in turn.messages[0].actions if a.kind == "expand_group"]
+    check("вместо неё — раскрывающиеся строки по названиям", len(expand_rows) == 2,
+          [a.label for a in turn.messages[0].actions])
+    check("в подписи строки — счётчик раздач и годы",
+          all("раздач" in row.label and "20" in row.label for row in expand_rows),
+          [row.label for row in expand_rows])
+    check("подсказка объясняет, что клик раскроет раздачи",
+          "раскрою его раздачи" in turn.messages[0].text, turn.messages[0].text[:400])
+    check("кнопки выбора названия на месте",
+          sum(1 for a in turn.messages[0].actions if a.label.startswith("Это «")) == 2,
+          [a.label for a in turn.messages[0].actions])
 
     # Экранки: подробности о найденной экранке.
     screener = dataclasses.replace(MOVIE, id="99", screener=True, seeds=30)
@@ -628,6 +701,7 @@ def main() -> int:
     test_pool_choice_before_episodes()
     test_pool_choice_without_quality()
     test_title_change_drops_stale_filters()
+    test_expand_group_lists_releases()
     test_details_everywhere()
     test_link_flow()
     test_checks_journal()

@@ -1073,6 +1073,7 @@ class Agent:
             "periodic_pick", "periodic_back", "relax_filters",
             "download_selected", "download_all", "choose_episode", "confirm_download",
             "download_new", "periodic_auto", "periodic_notify", "make_periodic",
+            "expand_group",
         )
         if task is not None and task.state == "cancelled" and (
             kind == "choose" or kind in CONT_SUFFIXES
@@ -1120,6 +1121,8 @@ class Agent:
         elif kind == "confirm_download" and task:
             torrent = Torrent.from_dict(task.candidate or {})
             await self._download_with_report(task, torrent, turn)
+        elif kind == "expand_group" and task:
+            await self._expand_group(task, str(payload.get("title") or ""), turn)
         elif kind == "pick_torrent" and task:
             torrent_id = str(payload.get("torrent_id") or "")
             pool = [Torrent.from_dict(item) for item in (task.options or {}).get("pool", [])]
@@ -2511,26 +2514,39 @@ class Agent:
         await self._present_candidate(task, best_list, turn)
 
     async def _present_pool_choice(
-        self, task: Task, pool: list[Torrent], turn: Turn
+        self, task: Task, pool: list[Torrent], turn: Turn, *, caption: str = ""
     ) -> None:
         """Подходит несколько раздач: человек выбирает раздачу, а не серию вслепую.
 
         Каждая строка открывает карточку раздачи, скачивание — только кнопкой
         «Взять эту раздачу» внутри неё. Так выбор виден целиком: у «Сейлор Мун»
         четыре раздачи с разным составом сезонов, и первая из них — не ответ.
+
+        `caption` — что именно раскрыли: «Красавица-воин Сейлор Мун» вместо
+        всего запроса. Из запроса про «Сэйлор Мун» не видно, о какой из групп
+        речь, а человек только что выбрал одну.
         """
-        lines = [
-            f"По запросу «{task.title}» подходит "
-            f"{_plural(len(pool), 'раздача', 'раздачи', 'раздач')} — какую берём?",
-            "",
-        ]
+        head = (
+            f"{caption} — {_plural(len(pool), 'раздача', 'раздачи', 'раздач')}, какую берём?"
+            if caption
+            else f"По запросу «{task.title}» подходит "
+            f"{_plural(len(pool), 'раздача', 'раздачи', 'раздач')} — какую берём?"
+        )
+        lines = [head, ""]
         # Раздачи одного сериала различаются составом сезонов больше, чем чем-либо
-        # ещё: «1 сезон: 1-46 серии», «1-5 сезоны: 1-200 серий». Без этого
-        # список выглядит как повторы одного и того же.
-        seasons = sorted({int(s) for item in pool for s in (item.seasons or []) if s is not None})
-        if len(seasons) > 1:
-            span = f"{seasons[0]}–{seasons[-1]}" if len(seasons) > 2 else ", ".join(map(str, seasons))
-            lines.append(f"Сезоны в выдаче: {span} — у раздач разный состав сезонов и серий.")
+        # ещё: «1 сезон: 1-46 серии», «1-5 сезоны: 1-200 серий». Без этой строки
+        # список выглядит как повторы одного и того же. Показываем состав каждой
+        # раздачи, а не общий диапазон: «1, 1–5» честнее, чем «1–5».
+        spans: list[str] = []
+        for item in pool:
+            numbers = sorted({int(s) for s in (item.seasons or []) if s is not None})
+            if not numbers:
+                continue
+            text = str(numbers[0]) if len(numbers) == 1 else f"{numbers[0]}–{numbers[-1]}"
+            if text not in spans:
+                spans.append(text)
+        if len(spans) > 1:
+            lines.append(f"Раздачи различаются составом сезонов: {', '.join(spans[:6])}.")
             lines.append("")
         lines.append(DETAILS_HINT)
         shown = min(len(pool), 15)
@@ -2554,9 +2570,65 @@ class Agent:
                 style="danger",
             )
         )
-        task.options = {**(task.options or {}), "pool": [t.to_dict() for t in pool]}
+        # Пул не сужаем до раскрытой группы: в задаче остаётся вся выдача, и
+        # «Отмена»/повторный выбор не теряют остальные названия.
+        merged = {
+            str(item.get("id")): Torrent.from_dict(item)
+            for item in (task.options or {}).get("pool", [])
+        }
+        merged.update({t.id: t for t in pool})
+        task.options = {**(task.options or {}), "pool": [t.to_dict() for t in merged.values()]}
         task.state = "awaiting_choice"
         await self.store.save_task(task)
+
+    async def _expand_group(self, task: Task, title: str, turn: Turn) -> None:
+        """Раскрывает «одно название — несколько раздач» в список этих раздач.
+
+        На шаге уточнения названия строка — это название, а не раздача: за
+        «Красавица-воин Сейлор Мун — 4 раздачи» стоят четыре разных релиза с
+        разным составом сезонов. «Подробнее» такой строкой открывало карточку
+        первой попавшейся — то есть ничего не говорило о выборе. Поэтому клик
+        раскрывает сами раздачи, а карточка (и «Взять эту раздачу» → серии)
+        открывается уже у конкретной.
+        """
+        wanted = normalize(title)
+
+        def group_of(items: list[Torrent]) -> list[Torrent]:
+            return [
+                item
+                for item in items
+                if normalize(
+                    (item.series_title or "").strip() or (item.title or "").strip()
+                ) == wanted
+            ]
+
+        pool = [Torrent.from_dict(item) for item in (task.options or {}).get("pool", [])]
+        # Счётчик в строке-названии считался по выдаче под условия задачи и без
+        # уже скачанных раздач — раскрываем ровно столько же, иначе «4 раздачи»
+        # раскрываются в пять (в пуле бывают раздачи, найденные по другому
+        # варианту названия).
+        downloaded = await self.store.downloaded_ids()
+        candidates = filter_candidates(pool, task.params or {}) or pool
+        group = [item for item in group_of(candidates) if item.id not in downloaded]
+        if not group:
+            # Название из подсказки могло прийти не из этой выдачи — тогда
+            # показываем всё, что стоит за названием, включая скачанное.
+            group = group_of(pool) or [item for item in pool if title_match(title, item)]
+        if not group:
+            turn.add(
+                f"Раздачи «{title}» пропали из выдачи — напишите запрос заново.",
+                kind="error",
+                task_id=task.id,
+            )
+            return
+        journal.add("agent", "раскрыто название", {"название": title, "раздач": len(group)})
+        if len(group) == 1:
+            # Одна раздача — раскрывать нечего, сразу состав и серии.
+            task.params["title"] = title
+            await self.store.save_task(task)
+            await self._present_candidate(task, group, turn)
+            return
+        await self._present_pool_choice(task, group, turn, caption=f"«{title}»")
 
     async def _ask_title(
         self,
@@ -2593,7 +2665,13 @@ class Agent:
             lines.append(line)
         lines.append("")
         lines.append("Кнопка выберет раздачу — и я поищу заново уже по ней.")
-        lines.append(DETAILS_HINT)
+        # Под карточкой здесь понимается раскрытие названия, а не карточка
+        # раздачи: за названием стоят несколько раздач, и «Подробнее» показало
+        # бы случайную из них.
+        lines.append(
+            "Нажмите на название внизу — раскрою его раздачи: у каждой своя "
+            "карточка и свой выбор серий."
+        )
         message = turn.add(
             "\n".join(lines),
             kind="tickets",
@@ -2610,23 +2688,25 @@ class Agent:
                     group="Похожие названия",
                 )
             )
-        # Кликабельная строка на каждый вариант: иначе непонятно, чем «Дюна»
-        # отличается от «Планеты Дюна», и открыть можно было только первый.
+        # Раскрывающаяся строка на каждое название: нажал — увидел раздачи этой
+        # группы, а не карточку первой попавшейся. Счётчики и годы — в подписи,
+        # потому что они и есть разница между названиями.
         for item in suggestions[:10]:
-            torrent_id = str(item.get("torrent_id") or "")
-            if not torrent_id:
-                continue
-            hint_bits: list[str] = []
+            bits: list[str] = []
             if item.get("count"):
-                hint_bits.append(_plural(int(item["count"]), "раздача", "раздачи", "раздач"))
+                bits.append(_plural(int(item["count"]), "раздача", "раздачи", "раздач"))
             if item.get("years"):
-                hint_bits.append(str(item["years"]))
+                bits.append(str(item["years"]))
+            label = str(item.get("title") or "")
+            if bits:
+                label = f"{label} — {' · '.join(bits)}"
             message.actions.append(
-                self._variant_row(
-                    torrent_id,
-                    str(item.get("title") or ""),
-                    hint=" · ".join(hint_bits),
-                    task_id=task.id,
+                Action(
+                    id=f"expand-{normalize(str(item.get('title') or ''))[:40]}",
+                    label=label[:220],
+                    kind="expand_group",
+                    payload={"task_id": task.id, "title": item["title"], "row": True},
+                    group="Подробнее о вариантах",
                 )
             )
         message.actions.append(
@@ -2700,6 +2780,10 @@ class Agent:
             lines.append(f"{index}. {item['title']}")
         lines.append("")
         lines.append("Выберите название кнопкой — поищу заново по нему.")
+        lines.append(
+            "Нажмите на название внизу — раскрою его раздачи: у каждой своя "
+            "карточка и свой выбор серий."
+        )
         message = turn.add("\n".join(lines), kind="tickets", task_id=task.id,
                            payload={"task": task.to_dict(), "suggestions": suggestions})
         for item in suggestions[:10]:
@@ -2713,12 +2797,18 @@ class Agent:
                     style="primary" if item is suggestions[0] else "normal",
                 )
             )
+        # Раскрывающаяся строка на название, а не карточка первой раздачи:
+        # за названием из подсказки может стоять несколько раздач.
         for item in suggestions[:10]:
-            torrent_id = str(item.get("torrent_id") or "")
-            if torrent_id:
-                message.actions.append(
-                    self._variant_row(torrent_id, str(item.get("title") or ""), task_id=task.id)
+            message.actions.append(
+                Action(
+                    id=f"expand-{normalize(str(item.get('title') or ''))[:40]}",
+                    label=str(item.get("title") or "")[:220],
+                    kind="expand_group",
+                    payload={"task_id": task.id, "title": item["title"], "row": True},
+                    group="Подробнее о вариантах",
                 )
+            )
         message.actions.append(
             Action(
                 id="keep-typo",

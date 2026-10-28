@@ -300,6 +300,36 @@
           continue;
         }
 
+        // Раскрытие названия: за ним стоят несколько раздач, поэтому клик не
+        // открывает карточку, а показывает сами раздачи (тоже строками).
+        if (action.kind === "expand_group" && action.payload && action.payload.row) {
+          const line = document.createElement("div");
+          line.className = "variant";
+          line.setAttribute("role", "button");
+          line.tabIndex = 0;
+          line.title = "Показать раздачи этого названия";
+          const caret = document.createElement("span");
+          caret.className = "variant__caret";
+          caret.textContent = "›";
+          const text = document.createElement("span");
+          text.className = "variant__text";
+          text.textContent = action.label;
+          line.append(caret, text);
+          const open = () => {
+            if (state.busy) return;
+            runAction(action, line);
+          };
+          line.addEventListener("click", open);
+          line.addEventListener("keydown", (event) => {
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              open();
+            }
+          });
+          row.appendChild(line);
+          continue;
+        }
+
         // Кнопка-ссылка: уходит на трекер в новой вкладке, на сервер не ходит.
         // Рисуем именно <a>: на телефоне это открывается в браузере, а не в PWA.
         if (action.kind === "link" && action.url) {
