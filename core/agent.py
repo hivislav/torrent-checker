@@ -70,6 +70,8 @@ from core.models import (
 from core.notify import DesktopNotifier, EventBus
 from core.push import WebPush
 from core.episodes import (
+    SIDE_EXT,
+    VIDEO_EXT,
     episode_groups,
     is_episode_pack,
     parse_files,
@@ -156,6 +158,10 @@ kinozal.me, скачивает торрент-файлы и ставит их в
 найти, скачать или отслеживать — подскажи нажать кнопку «Разово» или
 «Периодически» под полем ввода и написать запрос."""
 
+
+# Склеенная строка пункта релиза из листинга трекера: «03.Фильм.1993…имя.avi».
+# Такой же файл приходит отдельной строкой с чистым именем — склеенную не берём.
+_GLUED_RELEASE = re.compile(r"^\d{1,2}\s*[._]\s*.*(?:19|20)\d{2}")
 
 # Одна и та же подсказка на шагах выбора: про кнопку «Подробнее» легко не
 # догадаться, а читать про фильм нужно до выбора качества, а не после.
@@ -1073,7 +1079,7 @@ class Agent:
             "periodic_pick", "periodic_back", "relax_filters",
             "download_selected", "download_all", "choose_episode", "confirm_download",
             "download_new", "periodic_auto", "periodic_notify", "make_periodic",
-            "expand_group",
+            "expand_group", "pick_file",
         )
         if task is not None and task.state == "cancelled" and (
             kind == "choose" or kind in CONT_SUFFIXES
@@ -1121,6 +1127,17 @@ class Agent:
         elif kind == "confirm_download" and task:
             torrent = Torrent.from_dict(task.candidate or {})
             await self._download_with_report(task, torrent, turn)
+        elif kind == "pick_file" and task:
+            raw = payload.get("indexes")
+            if raw in (None, ""):
+                raw = [payload.get("index")]
+            if isinstance(raw, (int, str)):
+                raw = [raw]
+            try:
+                indexes = [int(item) for item in raw if item not in (None, "")]
+            except (TypeError, ValueError):
+                indexes = []
+            await self._confirm_files(task, indexes, turn)
         elif kind == "expand_group" and task:
             await self._expand_group(task, str(payload.get("title") or ""), turn)
         elif kind == "pick_torrent" and task:
@@ -3241,7 +3258,7 @@ class Agent:
         files = listing.get("files") or []
         if not files:
             return None
-        return [
+        entries = [
             {
                 "index": index,
                 "name": str(item.get("name") or ""),
@@ -3249,6 +3266,27 @@ class Agent:
             }
             for index, item in enumerate(files)
         ]
+        # Трекер вместо состава иногда отдаёт одну строку-отказ: «Мы не можем
+        # показать Вам весь список, он содержит более 300 файлов…». Это не файл
+        # и не состав раздачи: с ним карточка показывала «вес 0 Б» и не давала
+        # выбрать серии. В таком случае берём .torrent — там список полный.
+        if not any(self._looks_like_file(entry) for entry in entries):
+            journal.add(
+                "agent",
+                "трекер не отдал состав раздачи — беру .torrent",
+                {"раздача": torrent.id, "что пришло": entries[0]["name"][:120]},
+                level="warn",
+            )
+            return None
+        return entries
+
+    @staticmethod
+    def _looks_like_file(entry: dict[str, Any]) -> bool:
+        """Похоже ли на настоящий файл: имя с расширением или ненулевой вес."""
+        name = str(entry.get("name") or "").strip().lower()
+        if int(entry.get("size") or 0) > 0:
+            return True
+        return name.endswith(VIDEO_EXT + SIDE_EXT)
 
     async def _present_candidate(
         self, task: Task, best_list: list[Torrent], turn: Turn
@@ -3659,6 +3697,9 @@ class Agent:
             if shown_season is None or self._pair_key(group.get("season"), group.get("episode"))[0] == shown_season
         ] or groups
         multi_season = len({self._pair_key(group.get("season"), group.get("episode"))[0] for group in visible}) > 1
+        # Фильмы и спецвыпуски: в список серий они не попадают, но взять их
+        # отдельно нужно уметь.
+        extras = self._extra_video_files(task)
 
         head = f"В раздаче {_plural(len(visible), 'серия', 'серии', 'серий')}"
         if shown_season is not None:
@@ -3690,6 +3731,11 @@ class Agent:
             lines.append(f"• ⚠ Внешний диск недоступен: {storage.error}")
         lines.append("• Отметьте серии кнопками (можно несколько) — сумма посчитается сама.")
         lines.append("• Куда: " + str(self.settings.transmission_download_dir))
+        if extras:
+            lines.append(
+                f"• Кроме серий есть {_plural(len(extras), 'файл', 'файла', 'файлов')} "
+                "(фильмы, спецвыпуски) — кнопками ниже."
+            )
         message = turn.add("\n".join(lines), kind="tickets", task_id=task.id,
                            payload={"task": task.to_dict(), "torrent": torrent.to_dict()})
         # Список серий не обрезаем: раньше показывались первые 60, и раздача
@@ -3734,6 +3780,26 @@ class Agent:
                 group="Действие",
             )
         )
+        for entry in extras[:12]:
+            message.actions.append(
+                Action(
+                    id=f"file-{entry.index}",
+                    label=f"{self._short_file_label(entry)} · {human_bytes(int(entry.size))}"[:70],
+                    kind="pick_file",
+                    payload={"task_id": task.id, "index": entry.index},
+                    group="Фильмы и спецвыпуски",
+                )
+            )
+        if len(extras) > 1:
+            message.actions.append(
+                Action(
+                    id="files-all-extra",
+                    label="Все фильмы и спецвыпуски",
+                    kind="pick_file",
+                    payload={"task_id": task.id, "indexes": [entry.index for entry in extras]},
+                    group="Фильмы и спецвыпуски",
+                )
+            )
         message.actions.extend(self._torrent_actions(task))
         if len(pack_seasons) > 1:
             message.actions.append(
@@ -3758,8 +3824,113 @@ class Agent:
         task.state = "awaiting_choice"
         await self.store.save_task(task)
 
-    async def _confirm_whole_torrent(self, task: Task, turn: Turn) -> None:
-        """Карточка «вся раздача целиком» — со всеми файлами, включая фильмы."""
+    def _extra_video_files(self, task: Task) -> list[Any]:
+        """Видеофайлы раздачи, которых нет в списке серий: фильмы, спецвыпуски.
+
+        В пачке «5 сезонов + 3 фильма» фильмы не входят ни в один сезон, и без
+        отдельного выбора до них было не добраться — только «вся раздача».
+        Признак простой: у такого файла нет номера серии, а в список серий
+        попадают только файлы с номером.
+        """
+        extras: list[Any] = []
+        for entry in self._entries_from_task(task):
+            if getattr(entry, "is_junk", False) or not getattr(entry, "is_video", False):
+                continue
+            if getattr(entry, "episode", None) is not None:
+                continue
+            if _GLUED_RELEASE.match(str(getattr(entry, "name", "") or "")):
+                # Склеенная строка пункта релиза («03.Фильм.1993…имя файла.avi»):
+                # тот же фильм есть отдельной строкой с чистым именем.
+                continue
+            extras.append(entry)
+        return extras
+
+    def _plan_from_names(
+        self, entries: list[Any], plan: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Пересобирает план по именам файлов, когда индексы разошлись.
+
+        Список со страницы трекера и настоящий .torrent нумеруют файлы
+        по-разному. Для серий есть `_plan_from_episodes`, а для фильмов и
+        спецвыпусков номеров нет — сверяем по имени: страница склеивает имя
+        папки с именем файла, поэтому имя файла из .torrent в ней содержится.
+        """
+        names = [str(name) for name in plan.get("names") or []]
+        if not names:
+            return None
+        wanted: list[int] = []
+        picked: list[Any] = []
+        for name in names:
+            target = normalize(name)
+            for entry in entries:
+                candidate = normalize(getattr(entry, "name", ""))
+                if candidate and candidate in target:
+                    wanted.append(int(entry.index))
+                    picked.append(entry)
+                    break
+        if not wanted:
+            return None
+        return {
+            **plan,
+            "wanted": sorted(set(wanted)),
+            "size": sum(int(entry.size) for entry in picked),
+            "names": [entry.name for entry in picked],
+            "total_files": len(entries),
+            "total_size": sum(int(entry.size) for entry in entries),
+        }
+
+    @staticmethod
+    def _short_file_label(entry: Any) -> str:
+        """Короткая подпись файла: имя релиза в строках трекера склеено с папкой."""
+        name = str(getattr(entry, "label", "") or getattr(entry, "name", "")).strip()
+        for ext in VIDEO_EXT:
+            if name.lower().endswith(ext):
+                name = name[: -len(ext)]
+                break
+        name = name.replace(".", " ").replace("_", " ").strip()
+        return name[:64] or "файл"
+
+    async def _confirm_files(self, task: Task, indexes: list[int], turn: Turn) -> None:
+        """Выбраны отдельные файлы раздачи — фильмы или спецвыпуски пачки."""
+        entries = self._entries_from_task(task)
+        wanted = [entry for entry in entries if entry.index in set(indexes)]
+        if not wanted:
+            turn.add(
+                "Эти файлы не нашлись в раздаче — начните задачу заново.",
+                kind="error",
+                task_id=task.id,
+            )
+            return
+        plan = {
+            "kind": "single" if len(wanted) == 1 else "all",
+            "wanted": [entry.index for entry in wanted],
+            "size": sum(int(entry.size) for entry in wanted),
+            "total_size": sum(int(entry.size) for entry in entries),
+            "total_files": len(entries),
+            "names": [entry.label for entry in wanted][:10],
+            "episode": None,
+            "season": None,
+            "selected_episodes": [],
+        }
+        task.options = {**(task.options or {}), "plan": plan}
+        task.state = "awaiting_confirm"
+        await self.store.save_task(task)
+        message = turn.add(
+            self._confirm_card_text(task, Torrent.from_dict(task.candidate or {}), plan),
+            kind="task",
+            task_id=task.id,
+            payload={"task": task.to_dict(), "plan": plan},
+        )
+        message.actions = self._start_actions(task, plan)
+
+    async def _confirm_whole_torrent(
+        self, task: Task, turn: Turn, *, reason: str = ""
+    ) -> None:
+        """Карточка «вся раздача целиком» — со всеми файлами, включая фильмы.
+
+        `reason` — почему показана именно эта карточка (например, трекер не
+        отдал состав). Тогда вес неизвестен, и об этом сказано прямо.
+        """
         entries = self._entries_from_task(task)
         total = sum(int(entry.size) for entry in entries)
         plan = {
@@ -3773,6 +3944,9 @@ class Agent:
             "season": None,
             "selected_episodes": [],
         }
+        if reason:
+            plan["size_unknown"] = True
+            plan["reason"] = reason
         task.options = {**(task.options or {}), "plan": plan}
         await self.store.save_task(task)
         message = turn.add(
@@ -3816,14 +3990,14 @@ class Agent:
         lines.append("• " + ", ".join(f"{season} — {counts.get(season, 0)}" for season in pack_seasons))
         lines.append("• Затем отметьте серии этого сезона.")
         # В пачке кроме серий бывают фильмы и спецвыпуски: они не входят ни в
-        # один сезон, и без отдельной кнопки до них не добраться.
+        # один сезон, и без отдельного выбора до них не добраться.
         plan = (task.options or {}).get("plan") or {}
         total = int(plan.get("total_size") or 0)
-        episode_files = sum(len(group.get("indexes") or []) for group in groups)
-        if total and plan.get("total_files") and int(plan["total_files"]) > episode_files:
+        extras = self._extra_video_files(task)
+        if extras:
             lines.append(
-                f"• Кроме серий в раздаче есть другие файлы (фильмы, спецвыпуски) — "
-                f"вся раздача целиком: {human_bytes(total)}."
+                f"• Кроме серий есть {_plural(len(extras), 'файл', 'файла', 'файлов')} "
+                "(фильмы, спецвыпуски) — их можно взять отдельно, кнопками ниже."
             )
         message = turn.add(
             "\n".join(lines),
@@ -3841,6 +4015,30 @@ class Agent:
                     group="Сезоны",
                 )
             )
+        if extras:
+            for entry in extras[:12]:
+                message.actions.append(
+                    Action(
+                        id=f"file-{entry.index}",
+                        label=f"{self._short_file_label(entry)} · {human_bytes(int(entry.size))}"[:70],
+                        kind="pick_file",
+                        payload={"task_id": task.id, "index": entry.index},
+                        group="Фильмы и спецвыпуски",
+                    )
+                )
+            if len(extras) > 1:
+                message.actions.append(
+                    Action(
+                        id="files-all-extra",
+                        label="Все фильмы и спецвыпуски",
+                        kind="pick_file",
+                        payload={
+                            "task_id": task.id,
+                            "indexes": [entry.index for entry in extras],
+                        },
+                        group="Фильмы и спецвыпуски",
+                    )
+                )
         message.actions.extend(self._torrent_actions(task))
         plan_total = int(((task.options or {}).get("plan") or {}).get("total_size") or 0)
         whole_label = "Вся раздача"
@@ -4471,6 +4669,19 @@ class Agent:
                 )
                 return
             entries = parse_files(file_list(path))
+        if not entries:
+            # Состава нет ни со страницы, ни из .torrent: выбрать серии не из
+            # чего. Честно говорим об этом и не показываем «вес 0 Б».
+            journal.add(
+                "agent",
+                "состав раздачи неизвестен — серии выбрать не из чего",
+                {"раздача": torrent.id, "название": torrent.title[:120]},
+                level="warn",
+            )
+            await self._confirm_whole_torrent(
+                task, turn, reason="трекер не отдал список файлов"
+            )
+            return
         plan = self._plan_files(task, entries, torrent)
         task.options = {
             **(task.options or {}),
@@ -4630,6 +4841,12 @@ class Agent:
             f"Ниже все {_plural(len(episodes), 'серия', 'серии', 'серий')} с весом — "
             "нажмите нужную или возьмите весь сезон."
         )
+        extras = self._extra_video_files(task)
+        if extras:
+            lines.append(
+                f"Кроме серий есть {_plural(len(extras), 'файл', 'фильм', 'файлов')} "
+                "(фильмы, спецвыпуски) — их можно взять отдельно, кнопками ниже."
+            )
         return "\n".join(lines)
 
     def _episode_actions(self, task: Task, plan: dict[str, Any]) -> list[Action]:
@@ -4650,6 +4867,29 @@ class Agent:
                     label=label[:60],
                     kind="choose_episode",
                     payload={"task_id": task.id, "episode": episode, "season": season},
+                )
+            )
+        # Фильмы и спецвыпуски пачки: в списке серий их нет, но взять отдельно
+        # нужно уметь — иначе остаётся только «вся раздача».
+        extras = self._extra_video_files(task)
+        for entry in extras[:12]:
+            actions.append(
+                Action(
+                    id=f"file-{entry.index}",
+                    label=f"{self._short_file_label(entry)} · {human_bytes(int(entry.size))}"[:70],
+                    kind="pick_file",
+                    payload={"task_id": task.id, "index": entry.index},
+                    group="Фильмы и спецвыпуски",
+                )
+            )
+        if len(extras) > 1:
+            actions.append(
+                Action(
+                    id="files-all-extra",
+                    label="Все фильмы и спецвыпуски",
+                    kind="pick_file",
+                    payload={"task_id": task.id, "indexes": [entry.index for entry in extras]},
+                    group="Фильмы и спецвыпуски",
                 )
             )
         actions.append(
@@ -4869,11 +5109,32 @@ class Agent:
         self._details_cache[torrent_id] = (now, result)
         return result
 
+    @staticmethod
+    def _size_text_bytes(value: Any) -> int:
+        """«62.83 ГБ» → байты. Нужно, когда состав раздачи неизвестен."""
+        match = re.match(
+            r"\s*([\d.,]+)\s*([КМГТкмгт])?[Бб]?", str(value or "").strip()
+        )
+        if not match:
+            return 0
+        try:
+            number = float(match.group(1).replace(",", "."))
+        except ValueError:
+            return 0
+        unit = (match.group(2) or "Г").upper()
+        factor = {"К": 1024, "М": 1024**2, "Г": 1024**3, "Т": 1024**4}.get(unit, 1024**3)
+        return int(number * factor)
+
     def _confirm_card_text(self, task: Task, torrent: Torrent, plan: dict[str, Any]) -> str:
         """Полная информация перед скачиванием: что, сколько и куда."""
         storage = self.transmission.storage_info()
         info = storage.to_dict()
         needed = int(plan.get("size") or plan.get("total_size") or 0)
+        size_unknown = bool(plan.get("size_unknown"))
+        if size_unknown:
+            # Состава нет — берём вес раздачи с трекера, иначе проверка места
+            # проходит по нулю и говорит «места хватает» на 60 ГБ.
+            needed = self._size_text_bytes(torrent.size)
         reserve = self.transmission.min_free_bytes()
         fits = storage.ok and storage.free >= needed + reserve
 
@@ -4929,22 +5190,36 @@ class Agent:
                 lines.append(f"    – {name}")
             if len(names) > 5:
                 lines.append(f"    … и ещё {len(names) - 5}")
+        elif size_unknown:
+            lines.append("• Что качаем: всю раздачу — состав трекер не показал")
         else:
             lines.append("• Что качаем: вся раздача")
 
         lines.append("")
-        lines.append(f"• Вес выбранного: {human_bytes(needed)}")
-        if plan.get("total_size") and needed != plan.get("total_size"):
-            lines.append(f"• Вес всей раздачи: {human_bytes(plan.get('total_size'))}")
+        if size_unknown:
+            # Врать «вес 0 Б» нельзя: серии выбрать не из чего, и человек
+            # должен это понимать до подтверждения.
+            lines.append(
+                f"• Вес: неизвестен — {plan.get('reason') or 'трекер не отдал список файлов'}. "
+                "Серии выбрать нельзя, скачается вся раздача."
+            )
+        else:
+            lines.append(f"• Вес выбранного: {human_bytes(needed)}")
+            if plan.get("total_size") and needed != plan.get("total_size"):
+                lines.append(f"• Вес всей раздачи: {human_bytes(plan.get('total_size'))}")
         if storage.ok:
             lines.append(
                 f"• Диск «{info['volume']}»: свободно {info['free_human']} из "
                 f"{info['total_human']} (резерв {human_bytes(reserve)})"
             )
-            lines.append(
-                "• Места хватает" if fits
-                else f"• ⚠ Места не хватает: нужно {human_bytes(needed + reserve)}"
-            )
+            if fits:
+                lines.append(
+                    "• Места хватает (вес — по данным трекера)"
+                    if size_unknown
+                    else "• Места хватает"
+                )
+            else:
+                lines.append(f"• ⚠ Места не хватает: нужно {human_bytes(needed + reserve)}")
         else:
             lines.append(f"• ⚠ Внешний диск недоступен: {storage.error}")
         lines.append(f"• Куда: {self.settings.transmission_download_dir}")
@@ -5262,6 +5537,9 @@ class Agent:
                     level="warn",
                 )
                 rebuilt = self._plan_from_episodes(entries, plan)
+                if rebuilt is None:
+                    # Не серии (фильм, спецвыпуск) — сверяем по именам файлов.
+                    rebuilt = self._plan_from_names(entries, plan)
                 if rebuilt is not None:
                     plan = rebuilt
                     task.options = {**(task.options or {}), "plan": plan}

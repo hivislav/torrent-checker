@@ -784,6 +784,207 @@ def test_all_episodes_listed() -> None:
     agent.store.close()
 
 
+def _bencode(value) -> bytes:
+    if isinstance(value, int):
+        return b"i" + str(value).encode() + b"e"
+    if isinstance(value, str):
+        value = value.encode()
+    if isinstance(value, bytes):
+        return str(len(value)).encode() + b":" + value
+    if isinstance(value, list):
+        return b"l" + b"".join(_bencode(item) for item in value) + b"e"
+    if isinstance(value, dict):
+        return b"d" + b"".join(_bencode(k) + _bencode(v) for k, v in sorted(value.items())) + b"e"
+    raise TypeError(type(value))
+
+
+def _write_torrent(path: Path, files: list[list[str]], size: int = 1 << 30) -> None:
+    payload = {
+        "announce": "http://127.0.0.1:1/announce",
+        "info": {
+            "name": "pack",
+            "piece length": 16384,
+            "pieces": b"\x00" * 20,
+            "files": [{"length": size, "path": items} for items in files],
+        },
+    }
+    path.write_bytes(_bencode(payload))
+
+
+REFUSAL = (
+    "Мы не можем показать Вам весь список, он содержит более 300 файлов (400), "
+    "для проверки Вы можете скачать торрент с трекера."
+)
+
+
+def test_refusal_listing_falls_back_to_torrent() -> None:
+    """«Более 300 файлов» — не состав раздачи: берём .torrent и разбираем сезон.
+
+    Настоящий случай: «сэйлор мун 4 сезон» → верная раздача, но карточка
+    показала «Что качаем: Мы не можем показать Вам весь список…» и «Вес
+    выбранного: 0 Б», и серии выбрать было нельзя. Трекер отдал вместо списка
+    одну строку-отказ, а агент принял её за файл.
+    """
+    print("\n== отказ трекера на список файлов ==")
+    import asyncio
+
+    tmp = Path(tempfile.mkdtemp(prefix="refusal-"))
+    settings = dataclasses.replace(
+        get_settings(), data_dir=tmp, db_path=tmp / "s.sqlite3",
+        torrents_dir=tmp / "torrent-files",
+    )
+    agent = Agent(settings)
+    files = [
+        ["Sejlor.Mun.Super.S.(4.sezon.39.serij)", "Sejlor.Mun.Super.S.05.serija.iz.39.avi"],
+        ["Sejlor.Mun.Super.S.(4.sezon.39.serij)", "Sejlor.Mun.Super.S.06.serija.iz.39.avi"],
+        ["03.Sejlor.Mun.R.Film.1993.H264.DVDRip", "Sejlor.Mun.R.Obewanie.rosy.1993.H264.DVDRip.avi"],
+    ]
+
+    class FakeMCP:
+        async def file_list(self, torrent_id: str) -> dict:
+            return {"success": True, "files": [{"name": REFUSAL, "size": 0}]}
+
+        async def download(self, torrent_id: str, path: Path) -> dict:
+            _write_torrent(path, files)
+            return {"success": True, "message": "torrent сохранён"}
+
+    agent.mcp = FakeMCP()  # type: ignore[assignment]
+    torrent = Torrent(
+        id="1231847", title="Красавица-воин Сейлор Мун (1-5 сезонов из 5) / 1992-1997 / ПМ, СТ / DVDRip",
+        size="62.83 ГБ", seeds=2, series_title="Красавица-воин Сейлор Мун",
+    )
+    task = Task(
+        id="refusal", kind="oneshot", state="searching", session_id="s",
+        user_query="сэйлор мун 4 сезон",
+        params={"title": "Сэйлор Мун", "type": "series", "season": 4},
+        candidate=torrent.to_dict(),
+    )
+
+    async def scenario():
+        await agent.store.save_task(task)
+        turn = Turn()
+        await agent._download_with_report(task, torrent, turn)  # noqa: SLF001
+        return turn
+
+    turn = asyncio.run(scenario())
+    message = turn.messages[-1]
+    print("  ответ:", message.text.replace("\n", " | ")[:170])
+    check("состав взят из .torrent, а не из отказа",
+          "не можем показать" not in message.text, message.text[:200])
+    labels = [a.label for a in message.actions]
+    check("предложены серии сезона", any(a.kind == "choose_episode" for a in message.actions),
+          labels)
+    check("нулевого веса в карточке нет", "0 Б" not in message.text, message.text[:300])
+    film = [a for a in message.actions if a.kind == "pick_file"]
+    check("фильм можно взять отдельно", len(film) == 1, labels)
+
+    asyncio.run(agent.handle_action("s", "pick_file", film[0].payload))
+    plan = (asyncio.run(agent.store.get_task(task.id)).options or {}).get("plan") or {}
+    print("  план по фильму:", {"wanted": plan.get("wanted"), "names": plan.get("names")})
+    check("в плане только файл фильма", plan.get("wanted") == [2], plan.get("wanted"))
+    check("вес — вес фильма", plan.get("size") == 1 << 30, plan.get("size"))
+    agent.store.close()
+
+
+def test_unknown_composition_is_honest() -> None:
+    """Состава нет и .torrent не выдали — честный отказ, а не «вес 0 Б»."""
+    print("\n== состав недоступен: честная карточка ==")
+    import asyncio
+
+    tmp = Path(tempfile.mkdtemp(prefix="unknown-"))
+    settings = dataclasses.replace(
+        get_settings(), data_dir=tmp, db_path=tmp / "s.sqlite3",
+        torrents_dir=tmp / "torrent-files",
+    )
+    agent = Agent(settings)
+
+    class FakeMCP:
+        async def file_list(self, torrent_id: str) -> dict:
+            return {"success": True, "files": [{"name": REFUSAL, "size": 0}]}
+
+        async def download(self, torrent_id: str, path: Path) -> dict:
+            return {"success": False, "message": "Вам недоступен торрент-файл"}
+
+    agent.mcp = FakeMCP()  # type: ignore[assignment]
+    torrent = Torrent(
+        id="1231847", title="Красавица-воин Сейлор Мун (1-5 сезонов из 5) / 1992-1997 / DVDRip",
+        size="62.83 ГБ", seeds=2, series_title="Красавица-воин Сейлор Мун",
+    )
+    task = Task(
+        id="unknown", kind="oneshot", state="searching", session_id="s",
+        user_query="сэйлор мун 4 сезон",
+        params={"title": "Сэйлор Мун", "type": "series", "season": 4},
+        candidate=torrent.to_dict(),
+    )
+
+    async def scenario():
+        await agent.store.save_task(task)
+        turn = Turn()
+        await agent._download_with_report(task, torrent, turn)  # noqa: SLF001
+        return turn
+
+    turn = asyncio.run(scenario())
+    text = turn.messages[-1].text
+    print("  карточка:", text.replace("\n", " | ")[:200])
+    # Состава нет и .torrent не выдали — скачивать нечего, и это сказано прямо.
+    # Раньше вместо этого показывалась карточка подтверждения с «весом 0 Б».
+    check("сказано, что качать пока нечего", "не выдал torrent-файл" in text, text[:300])
+    check("нулевого веса нет", "0 Б" not in text, text[:300])
+    check("состав-отказ не выдан за файл", "не можем показать" not in text, text[:300])
+    agent.store.close()
+
+
+def test_extra_files_and_name_rebuild() -> None:
+    """Фильмы берутся по имени файла, а не по номеру из списка со страницы.
+
+    Список со страницы трекера и настоящий .torrent нумеруют файлы по-разному,
+    и для фильма (у него нет номера серии) план по индексам мог выбрать чужой
+    файл. Теперь план пересобирается по именам.
+    """
+    print("\n== отдельные файлы: сверка по имени ==")
+    import asyncio
+
+    tmp = Path(tempfile.mkdtemp(prefix="extras-"))
+    settings = dataclasses.replace(
+        get_settings(), data_dir=tmp, db_path=tmp / "s.sqlite3",
+        torrents_dir=tmp / "torrent-files",
+    )
+    agent = Agent(settings)
+    # Строка со страницы: имя папки склеено с именем файла, индекс 5.
+    page_files = [
+        {"index": 0, "name": "Sejlor.Mun.Super.S.01.serija.iz.39.avi", "size": 300, "season": 4, "episode": 1},
+        {"index": 5, "name": "03.Sejlor.Mun.R.Film.1993.H264.DVDRip-dfuySejlor.Mun.R.Obewanie.rosy.1993.DVDRip-dfuy.avi",
+         "size": 800, "season": None, "episode": None},
+        {"index": 6, "name": "Sejlor.Mun.R.Obewanie.rosy.1993.DVDRip-dfuy.avi", "size": 800, "season": None, "episode": None},
+    ]
+    task = Task(id="extras", kind="oneshot", state="awaiting_choice", session_id="s",
+                user_query="Сэйлор Мун", params={"title": "Красавица-воин Сейлор Мун", "type": "series"},
+                candidate=Torrent(id="242338", title="Сейлор Мун (5 сезонов + 3 фильма)").to_dict())
+    task.options = {"files": page_files}
+    asyncio.run(agent.store.save_task(task))
+
+    extras = agent._extra_video_files(task)  # noqa: SLF001
+    print("  лишние файлы:", [entry.name[:40] for entry in extras])
+    check("склеенная строка фильма не задваивается", len(extras) == 1,
+          [entry.name[:40] for entry in extras])
+    check("остался файл с чистым именем", extras and "Obewanie" in extras[0].name,
+          [entry.name[:40] for entry in extras])
+
+    # .torrent нумерует файлы иначе: фильм там индекс 2, а не 5.
+    entries = parse_files([
+        {"index": 0, "name": "Sejlor.Mun.Super.S.01.serija.iz.39.avi", "size": 300},
+        {"index": 1, "name": "Sejlor.Mun.Super.S.02.serija.iz.39.avi", "size": 300},
+        {"index": 2, "name": "Sejlor.Mun.R.Obewanie.rosy.1993.DVDRip-dfuy.avi", "size": 800},
+    ])
+    plan = {"kind": "single", "wanted": [5], "size": 800,
+            "names": ["Sejlor.Mun.R.Obewanie.rosy.1993.DVDRip-dfuy.avi"], "total_files": 3}
+    rebuilt = agent._plan_from_names(entries, plan)  # noqa: SLF001
+    print("  пересобранный план:", rebuilt and rebuilt.get("wanted"))
+    check("план пересобран по имени, а не по индексу страницы",
+          rebuilt is not None and rebuilt["wanted"] == [2], rebuilt and rebuilt.get("wanted"))
+    agent.store.close()
+
+
 def main() -> int:
     test_detect()
     test_selection()
@@ -795,6 +996,9 @@ def main() -> int:
     test_whole_season_limits_files()
     test_pack_asked_before_episodes()
     test_all_episodes_listed()
+    test_refusal_listing_falls_back_to_torrent()
+    test_unknown_composition_is_honest()
+    test_extra_files_and_name_rebuild()
     test_multi_season_pack()
     print("\n=== ИТОГ ===")
     if FAILS:

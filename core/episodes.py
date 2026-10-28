@@ -44,7 +44,7 @@ _SEASON_EPISODE_PATTERNS = (
 _EPISODE_ONLY_PATTERNS = (
     re.compile(r"(?i)\b(?:серия|эпизод|выпуск)[\s._-]*(\d{1,3})\b"),
     re.compile(r"(?i)(?:^|[\s._-])e(?:p)?[\s._-]*(\d{1,3})(?:[\s._-]|$)"),
-    re.compile(r"(?i)(?:^|[\s._-])(\d{1,3})[\s._-]+(?:из|of)[\s._-]+\d{1,3}\b"),
+    re.compile(r"(?i)(?:^|[\s._-])(\d{1,3})[\s._-]+(?:из|of|from)[\s._-]+\d{1,3}\b"),
     # «Название - 07 - что-то»: отдельно стоящий номер между разделителями.
     re.compile(r"(?:^|[\s._-])(\d{1,2})[\s._-]{1,3}(?:[^\d]|$)"),
 )
@@ -94,6 +94,9 @@ _LEADING_EPISODE = re.compile(r"^(\d{1,2})\s*[._-]\s*(?!\d)")
 _SEASON_ONLY = (
     re.compile(r"(?i)(\d{1,2})\s*[-_ .]?\s*(?:sezon|season)"),
     re.compile(r"(?i)\b(?:sezon|season)[\s._-]*(\d{1,2})\b"),
+    # «(1s46e)» — так подписывают папки сезонов: сезон 1, 46 серий. Без этого
+    # сезоны схлопывались в один список «Серия 1…46».
+    re.compile(r"(?i)(?<![\dа-яa-z])(\d{1,2})\s*s\s*\d{1,3}(?:\s*-?\s*e\b)?"),
     re.compile(r"(?i)\bs(\d{1,2})\b(?!\s*[._-]?\s*e)"),
     re.compile(r"(?i)(\d{1,2})\s*[-_]?\s*сезон"),
 )
@@ -145,6 +148,9 @@ def detect_episode(name: str) -> tuple[int | None, int | None]:
         if season is None:
             season = _detect_season(source)
         if episode is not None:
+            if season is None and source is base:
+                # Сезон часто указан только в папке: «…/01 Название (1s46e)/…01 episode from 46.avi».
+                season = _detect_season(name)
             return season, episode
     # Сезон нашёлся, а серии нет (например, «сезон 3, полный»).
     season = _detect_season(base) or _detect_season(name)
