@@ -2560,11 +2560,24 @@ class Agent:
                     group="Похожие названия",
                 )
             )
-        # О самом вероятном варианте можно прочитать сразу: иначе непонятно,
-        # чем «Дюна» отличается от «Планеты Дюна».
-        if suggestions:
-            message.actions.extend(
-                self._torrent_actions(task, torrent_id=str(suggestions[0].get("torrent_id") or ""))
+        # Кликабельная строка на каждый вариант: иначе непонятно, чем «Дюна»
+        # отличается от «Планеты Дюна», и открыть можно было только первый.
+        for item in suggestions[:10]:
+            torrent_id = str(item.get("torrent_id") or "")
+            if not torrent_id:
+                continue
+            hint_bits: list[str] = []
+            if item.get("count"):
+                hint_bits.append(_plural(int(item["count"]), "раздача", "раздачи", "раздач"))
+            if item.get("years"):
+                hint_bits.append(str(item["years"]))
+            message.actions.append(
+                self._variant_row(
+                    torrent_id,
+                    str(item.get("title") or ""),
+                    hint=" · ".join(hint_bits),
+                    task_id=task.id,
+                )
             )
         message.actions.append(
             Action(
@@ -2650,6 +2663,12 @@ class Agent:
                     style="primary" if item is suggestions[0] else "normal",
                 )
             )
+        for item in suggestions[:10]:
+            torrent_id = str(item.get("torrent_id") or "")
+            if torrent_id:
+                message.actions.append(
+                    self._variant_row(torrent_id, str(item.get("title") or ""), task_id=task.id)
+                )
         message.actions.append(
             Action(
                 id="keep-typo",
@@ -2774,11 +2793,20 @@ class Agent:
                     payload={"task_id": task.id, "dimension": "voice", "value": ""},
                 )
             )
-        # Подробности о лучшей из найденных — здесь же, чтобы можно было
-        # понять, тот ли это фильм, не начиная скачивание.
+        # Строка на каждый вариант: качество и озвучка открывают карточку
+        # лучшей раздачи этого варианта, а не одну общую «лучшую».
         message.actions.extend(
-            self._torrent_actions(task, torrent=self._best_torrent(by_title, params))
+            self._option_rows(
+                task, q_pool, "quality", q_options["qualities"][:6], params
+            )
         )
+        message.actions.extend(
+            self._option_rows(task, v_pool, "voice", v_options["voices"][:6], params)
+        )
+        if not (q_options["qualities"] or v_options["voices"]):
+            message.actions.extend(
+                self._torrent_actions(task, torrent=self._best_torrent(by_title, params))
+            )
         message.actions.append(
             Action(
                 id="cancel-options",
@@ -2884,11 +2912,16 @@ class Agent:
                         group="Похожие названия",
                     )
                 )
-        # «Подробнее» о лучшей раздаче прямо на этом шаге: решить, нужен ли
-        # этот фильм, хочется до выбора качества, а не после.
-        message.actions.extend(
-            self._torrent_actions(task, torrent=self._best_torrent(found, task.params))
-        )
+        # Кликабельная строка на КАЖДЫЙ вариант: нажал «DVDRip» — открылась
+        # карточка лучшей раздачи этого варианта. Одна кнопка «Подробнее о
+        # раздаче» показывала только лучшую из всех и сбивала с толку.
+        option_rows = self._option_rows(task, found, dimension, values, task.params)
+        if option_rows:
+            message.actions.extend(option_rows)
+        else:
+            message.actions.extend(
+                self._torrent_actions(task, torrent=self._best_torrent(found, task.params))
+            )
         message.actions.append(
             Action(
                 id="cancel-choose",
@@ -4337,6 +4370,30 @@ class Agent:
             warnings.append(f"⚠ Мало сидов ({torrent.seeds}) — скорость будет низкой.")
         return warnings
 
+    def _option_variants(
+        self,
+        found: list[Torrent],
+        dimension: str,
+        values: list[str],
+        params: dict[str, Any] | None = None,
+    ) -> list[tuple[str, Torrent | None, int]]:
+        """(подпись варианта, лучшая раздача, сколько их) по каждому значению.
+
+        Одна функция и для текста подсказок, и для кликабельных строк: иначе
+        список и кнопки под ним начинают расходиться.
+        """
+        params = params or {}
+        out: list[tuple[str, Torrent | None, int]] = []
+        for value in values[:8]:
+            if dimension == "quality":
+                subset = [item for item in found if quality_match(value, item.qualities)]
+                label = self._quality_label(value)
+            else:
+                subset = [item for item in found if voice_match(value, item.voices)]
+                label = value
+            out.append((label, rank(subset, params)[0] if subset else None, len(subset)))
+        return out
+
     def _option_summaries(
         self,
         found: list[Torrent],
@@ -4349,25 +4406,37 @@ class Agent:
         «1080p — 5 раздач, лучшая: 36,8 ГБ · 12 сидов · 2 дня назад». Так
         выбор качества перестаёт быть выбором вслепую.
         """
-        params = params or {}
         lines: list[str] = []
-        for value in values[:8]:
-            if dimension == "quality":
-                subset = [item for item in found if quality_match(value, item.qualities)]
-                label = self._quality_label(value)
-            else:
-                subset = [item for item in found if voice_match(value, item.voices)]
-                label = value
-            if not subset:
+        for label, best, count in self._option_variants(found, dimension, values, params):
+            if best is None:
                 lines.append(f"• {label} — вариантов нет")
                 continue
-            best = rank(subset, params)[0]
             detail = self._signals_line(best)
-            line = f"• {label} — {_plural(len(subset), 'раздача', 'раздачи', 'раздач')}"
+            line = f"• {label} — {_plural(count, 'раздача', 'раздачи', 'раздач')}"
             if detail:
                 line += f", лучшая: {detail}"
             lines.append(line)
         return lines
+
+    def _option_rows(
+        self,
+        task: Task,
+        found: list[Torrent],
+        dimension: str,
+        values: list[str],
+        params: dict[str, Any] | None = None,
+    ) -> list[Action]:
+        """Кликабельные строки по вариантам: клик — карточка лучшей раздачи."""
+        rows: list[Action] = []
+        for label, best, count in self._option_variants(found, dimension, values, params):
+            if best is None:
+                continue
+            hint = f"{_plural(count, 'раздача', 'раздачи', 'раздач')}"
+            signals = self._signals_line(best)
+            if signals:
+                hint += f" · {signals}"
+            rows.append(self._variant_row(best.id, label, hint=hint, task_id=task.id))
+        return rows
 
     async def torrent_details(self, torrent_id: str) -> dict[str, Any]:
         """Подробности раздачи для кнопки «Подробнее»: жанр, актёры, описание.

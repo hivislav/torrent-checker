@@ -334,10 +334,16 @@ def test_details_everywhere() -> None:
         agent._ask_dimension(task, turn, "quality", ["1080p", "720p"], len(pool), found=pool)  # noqa: SLF001
     )
     found_actions = details_actions(turn.messages[0])
-    check("на шаге выбора качества есть «Подробнее»", len(found_actions) == 1, turn.messages[0].actions)
-    check("подробности открывают лучшую раздачу",
-          found_actions and found_actions[0].payload.get("torrent_id") == "12",
-          found_actions[0].payload if found_actions else None)
+    # Кликабельная строка на КАЖДЫЙ вариант, а не одна «лучшая»: по строке
+    # видно, что даёт это качество, и можно открыть его раздачу.
+    check("на шаге выбора качества — строка на каждый вариант",
+          len(found_actions) == 2, [a.label for a in found_actions])
+    labels = [action.label for action in found_actions]
+    check("в подписях строк — качество и сигналы",
+          all("p" in label and "сид" in label for label in labels), labels)
+    check("строка ведёт на раздачу этого варианта",
+          {action.payload.get("torrent_id") for action in found_actions} == {"12", "11"},
+          [action.payload.get("torrent_id") for action in found_actions])
     # Ссылка на трекер переехала внутрь окна «Подробнее»: в чате её больше нет.
     check("в чате нет отдельной ссылки на трекер",
           not any(action.kind == "link" for action in turn.messages[0].actions),
@@ -347,8 +353,9 @@ def test_details_everywhere() -> None:
     relaxed = make_task(pool[1], params={"title": "Дюна", "quality": "2160p"})
     turn = Turn()
     asyncio.run(agent._offer_relaxed(relaxed, pool, turn))  # noqa: SLF001
-    check("в «ничего не подошло» есть «Подробнее»", len(details_actions(turn.messages[0])) == 1,
-          turn.messages[0].actions)
+    relaxed_rows = details_actions(turn.messages[0])
+    check("в «ничего не подошло» — строка на каждый доступный вариант",
+          len(relaxed_rows) == 2, [a.label for a in relaxed_rows])
 
     # Шаг «какой именно фильм» — подробности о самом вероятном варианте.
     title_task = make_task(pool[1], params={"title": "Дюна"})
@@ -359,11 +366,11 @@ def test_details_everywhere() -> None:
     ]
     asyncio.run(agent._ask_title(title_task, suggestions, 6, turn, weak=False))  # noqa: SLF001
     title_actions = details_actions(turn.messages[0])
-    check("на шаге выбора названия есть «Подробнее»", len(title_actions) == 1,
-          turn.messages[0].actions)
-    check("подробности открывают первый вариант",
-          title_actions and title_actions[0].payload.get("torrent_id") == "12",
-          title_actions[0].payload if title_actions else None)
+    check("на шаге выбора названия — строка на каждый вариант",
+          len(title_actions) == 2, [a.label for a in title_actions])
+    check("строки ведут на разные раздачи",
+          {action.payload.get("torrent_id") for action in title_actions} == {"12", "13"},
+          [action.payload.get("torrent_id") for action in title_actions])
 
     # Экранки: подробности о найденной экранке.
     screener = dataclasses.replace(MOVIE, id="99", screener=True, seeds=30)
