@@ -749,6 +749,27 @@ async def test_pack_needs_choice() -> None:
               if action.kind == "toggle_episode"]
     print("  кнопки после «Выбрать серии»:", labels[:3], "… всего", len(labels))
     check("выбор серий открылся", len(labels) == 20, len(labels))
+
+    # «Скачать всю пачку» — карточка на всю пачку, а не на одну серию.
+    pack_action = next(
+        (action for action in (notices[0]["actions"] if notices else [])
+         if action["label"] == "Скачать всю пачку"),
+        None,
+    )
+    check("кнопка «Скачать всю пачку» есть", pack_action is not None,
+          [action["label"] for action in (notices[0]["actions"] if notices else [])])
+    if pack_action is not None:
+        turn = await agent.handle_action("s1", "download_all", pack_action["payload"])
+        plan = (await agent.store.get_task(child.id)).options.get("plan") or {}
+        print("  «вся пачка»:", {"серий": len(plan.get("selected_episodes") or []),
+                                 "файлов": len(plan.get("wanted") or [])})
+        check("«вся пачка» — все серии раздачи",
+              len(plan.get("selected_episodes") or []) == 20,
+              plan.get("selected_episodes"))
+        check("и в карточке есть кнопка подтверждения",
+              any(action.kind == "start_download"
+                  for message in turn.messages for action in message.actions),
+              [action.kind for message in turn.messages for action in message.actions])
     agent.store.close()
 
 
@@ -1132,6 +1153,68 @@ async def test_default_interval() -> None:
     agent.store.close()
 
 
+async def test_check_searches_aliases() -> None:
+    """Проверка периодической задачи ищет так же, как разовый поиск.
+
+    Настоящий случай: задача «Сэйлор Мун» создана по подсказке («Красавица-воин
+    Сейлор Мун»), но трекер не индексирует транслит. Разовый поиск находил
+    раздачи по другим названиям, а проверка задачи искала только по title —
+    и каждый раз сообщала «ничего нет».
+    """
+    print("\n== проверка задачи ищет по другим названиям ==")
+    tmp = Path(tempfile.mkdtemp(prefix="periodic-alias-"))
+    settings = dataclasses.replace(
+        get_settings(),
+        data_dir=tmp,
+        db_path=tmp / "alias.sqlite3",
+        torrents_dir=tmp / "torrent-files",
+        transmission_download_dir=tmp / "torrents",
+    )
+    settings.torrents_dir.mkdir(parents=True, exist_ok=True)
+    agent = Agent(settings)
+
+    row = {
+        "id": "242338",
+        "title": "Красавица-воин Сейлор Мун (1-5 сезонов из 5) / 1992-1997 / ПМ, СТ / DVDRip",
+        "size": "62.83 ГБ",
+        "seeds": 2,
+        "peers": 0,
+        "uploadDate": "08.07.2014 в 12:58",
+    }
+
+    class AliasMCP:
+        def __init__(self) -> None:
+            self.queries: list[str] = []
+
+        async def search_pages(self, query: str, pages: int = 1) -> list[dict]:
+            self.queries.append(query)
+            # Транслит трекер не знает — раздача находится по другому названию.
+            return [row] if "sailor" in query.lower() else []
+
+    mcp = AliasMCP()
+    agent.mcp = mcp  # type: ignore[assignment]
+    agent.transmission = SimpleNamespace(  # type: ignore[assignment]
+        storage_info=lambda: SimpleNamespace(ok=False, error="нет диска", to_dict=lambda: {}),
+    )
+    from core.models import Task
+
+    task = Task(
+        id="alias-periodic", kind="periodic", state="monitoring", session_id="checks",
+        user_query="Сэйлор Мун", interval_minutes=60, auto_download=False,
+        params={"title": "Сэйлор Мун", "aliases": ["Sailor Moon", "Красавица-воин Сейлор Мун"]},
+    )
+    await agent.store.save_task(task)
+    await agent.check_task(task)
+    print("  запросы к трекеру:", mcp.queries[:4])
+    check("проверка не ограничилась транслитом",
+          any("sailor" in query.lower() for query in mcp.queries), mcp.queries[:5])
+    checks = await agent.store.list_checks("alias-periodic", limit=1)
+    found = (checks[-1] or {}).get("found") if checks else None
+    print("  найдено по проверке:", found)
+    check("раздача нашлась по другому названию", found == 1, found)
+    agent.store.close()
+
+
 def test_name_matching() -> None:
     print("\n== поиск не цепляет чужие сериалы ==")
     from core.matching import title_match
@@ -1173,6 +1256,7 @@ async def main() -> int:
     await test_refine_settings()
     await test_cancel_only_in_panel()
     await test_default_interval()
+    await test_check_searches_aliases()
     test_name_matching()
 
     print("\n=== ИТОГ ===")

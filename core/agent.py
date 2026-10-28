@@ -6419,7 +6419,13 @@ class Agent:
             task.last_check_at = now_iso()
             task.checks_done += 1
             try:
-                torrents = await self._search(params)
+                # Ищем так же, как при создании задачи: если по названию пусто,
+                # проверяем другие названия (алиасы). «Сэйлор Мун» трекер не
+                # индексирует — без этого периодическая задача считала, что на
+                # трекере ничего нет, хотя раздача находится по «Sailor Moon».
+                torrents, _suggestions = await self._search_with_suggestions(
+                    params, original=str(task.user_query or "")
+                )
             except MCPError as exc:
                 task.last_error = str(exc)
                 self._schedule_next(task)
