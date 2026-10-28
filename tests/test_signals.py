@@ -469,6 +469,18 @@ def test_pool_rows() -> None:
     check("строка знает задачу — из карточки можно взять раздачу",
           all(row.payload.get("task_id") == task.id for row in rows),
           rows[0].payload)
+    # DVD-образ в списке — последним: в нём нет отдельных серий.
+    dvd = dataclasses.replace(
+        MOVIE, id="900", seeds=30,
+        title="Черепашки мутанты ниндзя (1-9 сезоны: 1-183 серии из 183) / 1987-1995 / DVD-9 + 7 x DVD-5",
+    )
+    rows_with_dvd = agent._pool_rows(task, pool + [dvd], limit=25)  # noqa: SLF001
+    check("DVD-образ стоит последним",
+          rows_with_dvd[-1].payload.get("torrent_id") == "900",
+          rows_with_dvd[-1].payload.get("torrent_id"))
+    check("и об этом сказано в подписи",
+          "DVD-образ" in rows_with_dvd[-1].label, rows_with_dvd[-1].label[:120])
+
     wide = agent._pool_rows(task, pool, limit=25)  # noqa: SLF001
     check("раздача без сидов — последняя, а не первая",
           wide[-1].payload.get("torrent_id") == "100", wide[-1].payload)

@@ -872,8 +872,8 @@ def test_refusal_listing_falls_back_to_torrent() -> None:
     check("состав взят из .torrent, а не из отказа",
           "не можем показать" not in message.text, message.text[:200])
     labels = [a.label for a in message.actions]
-    check("предложены серии сезона", any(a.kind == "choose_episode" for a in message.actions),
-          labels)
+    check("предложены серии сезона (кнопками выбора)",
+          any(a.kind == "toggle_episode" for a in message.actions), labels)
     check("нулевого веса в карточке нет", "0 Б" not in message.text, message.text[:300])
     film = [a for a in message.actions if a.kind == "pick_file"]
     check("фильм можно взять отдельно", len(film) == 1, labels)
@@ -985,6 +985,106 @@ def test_extra_files_and_name_rebuild() -> None:
     agent.store.close()
 
 
+def test_folders_like_sezon01() -> None:
+    """«Sezon01Cherepashki…» — имя папки без разделителя перед номером сезона.
+
+    Настоящий случай: «Черепашки ниндзя 2 сезон» на раздаче «1-9 сезоны,
+    173 серии» дал список из 47 «серий» с весом 2,3 ГБ у первой: сезон не
+    разобрался, и в одну «серию» сложились файлы из всех сезонов.
+    """
+    print("\n== папки вида «Sezon01» ==")
+    files = []
+    names = {
+        1: ["Cherepashki.Nindzya.01.serija.iz.5.avi", "Cherepashki.Nindzya.02.serija.iz.5.avi"],
+        2: ["Cherepashki.Nindzya.01.serija.iz.13.avi", "Cherepashki.Nindzya.02.serija.iz.13.avi"],
+    }
+    for season, items in names.items():
+        glued = f"Sezon{season:02d}" + " ".join(items)
+        files.append({"index": len(files), "size": 100, "name": glued})
+        for item in items:
+            files.append({"index": len(files), "size": 100, "name": item})
+    entries = parse_files(files)
+    groups = episode_groups(entries)
+    print("  группы:", [(g["season"], g["episode"], len(g["indexes"])) for g in groups])
+    check("сезон берётся из имени папки",
+          [(g["season"], g["episode"]) for g in groups] == [(1, 1), (1, 2), (2, 1), (2, 2)],
+          [(g["season"], g["episode"]) for g in groups])
+    check("в группе ровно один файл, а не файлы всех сезонов",
+          all(len(group["indexes"]) == 1 for group in groups),
+          [len(group["indexes"]) for group in groups])
+
+
+def test_disc_image_and_merged_warning() -> None:
+    """DVD-образ: серий нет — говорим прямо. Склейка сезонов — предупреждение."""
+    print("\n== DVD-образ и склейка сезонов ==")
+    import asyncio
+
+    tmp = Path(tempfile.mkdtemp(prefix="dvd-"))
+    settings = dataclasses.replace(
+        get_settings(), data_dir=tmp, db_path=tmp / "s.sqlite3",
+        torrents_dir=tmp / "torrent-files",
+    )
+    agent = Agent(settings)
+    dvd_files = [
+        {"name": "tmnt1987/DVD01/VIDEO_TS/VIDEO_TS.BUP", "size": 8192},
+        {"name": "tmnt1987/DVD01/VIDEO_TS/VIDEO_TS.IFO", "size": 8192},
+        {"name": "tmnt1987/DVD01/VIDEO_TS/VTS_01_1.VOB", "size": 1 << 30},
+        {"name": "tmnt1987/DVD01/VIDEO_TS/VTS_01_2.VOB", "size": 1 << 30},
+    ]
+
+    class FakeMCP:
+        async def file_list(self, torrent_id: str) -> dict:
+            return {"success": True, "files": dvd_files}
+
+    agent.mcp = FakeMCP()  # type: ignore[assignment]
+    torrent = Torrent(
+        id="1145616",
+        title="Черепашки мутанты ниндзя (1-9 сезоны: 1-183 серии из 183) / 1987-1995 / DVD-9",
+        size="137.8 ГБ", seeds=1, series_title="Черепашки мутанты ниндзя",
+        seasons=[1, 2, 3], episodes=[1, 183],
+    )
+    task = Task(
+        id="dvd", kind="oneshot", state="searching", session_id="s",
+        user_query="Черепашки ниндзя 2 сезон",
+        params={"title": "Черепашки ниндзя", "type": "series", "season": 2},
+        candidate=torrent.to_dict(),
+    )
+    task.options = {"pool": [torrent.to_dict()]}
+
+    async def scenario():
+        await agent.store.save_task(task)
+        turn = Turn()
+        await agent._download_with_report(task, torrent, turn)  # noqa: SLF001
+        return turn
+
+    turn = asyncio.run(scenario())
+    text = turn.messages[-1].text
+    print("  карточка:", text.replace("\n", " | ")[:190])
+    check("сказано, что серии не разделены", "DVD-образ" in text, text[:400])
+    check("сезон назван с оговоркой",
+          "сезон 2: в этой раздаче отдельных серий нет" in text.lower(), text[:400])
+    check("нет «серия None»", "серия None" not in text, text[:400])
+    check("есть кнопка выбора другой раздачи",
+          any(a.kind == "show_pool" for a in turn.messages[-1].actions),
+          [a.kind for a in turn.messages[-1].actions])
+
+    # Склейка сезонов: сезон не указан, в группу попали файлы из разных сезонов.
+    groups = agent._merged_episode_groups([  # noqa: SLF001
+        {"season": None, "episode": 1, "size": 2 << 30,
+         "names": ["A.01.serija.iz.5.avi", "A.01.serija.iz.13.avi"]},
+        {"season": 1, "episode": 2, "size": 300 << 20, "names": ["A.02.avi"]},
+    ])
+    check("склейка распознана", len(groups) == 1, groups)
+    plan = {"kind": "choose", "episodes": [
+        {"season": None, "episode": 1, "size": 2 << 30,
+         "names": ["A.01.serija.iz.5.avi", "A.01.serija.iz.13.avi"]},
+    ], "total_size": 2 << 30}
+    warn = agent._episode_choice_text(task, plan)  # noqa: SLF001
+    print("  предупреждение:", warn.splitlines()[-2][:120] if warn else "")
+    check("есть предупреждение о склейке сезонов", "не сказано, какой сезон" in warn, warn)
+    agent.store.close()
+
+
 def main() -> int:
     test_detect()
     test_selection()
@@ -999,6 +1099,8 @@ def main() -> int:
     test_refusal_listing_falls_back_to_torrent()
     test_unknown_composition_is_honest()
     test_extra_files_and_name_rebuild()
+    test_folders_like_sezon01()
+    test_disc_image_and_merged_warning()
     test_multi_season_pack()
     print("\n=== ИТОГ ===")
     if FAILS:

@@ -162,6 +162,15 @@ kinozal.me, скачивает торрент-файлы и ставит их в
 # Склеенная строка пункта релиза из листинга трекера: «03.Фильм.1993…имя.avi».
 # Такой же файл приходит отдельной строкой с чистым именем — склеенную не берём.
 _GLUED_RELEASE = re.compile(r"^\d{1,2}\s*[._]\s*.*(?:19|20)\d{2}")
+# Раздача из DVD-образов: в названии так и пишут — «DVD-9 + 7 x DVD-5».
+_DISC_IMAGE_TITLE = re.compile(r"(?i)\bDVD-?\d\b|DVD-9|DVD-5")
+
+def _video_count(names: list[Any]) -> int:
+    """Сколько видеофайлов в группе серии (субтитры не считаем)."""
+    return sum(
+        1 for name in names if str(name).lower().endswith(VIDEO_EXT)
+    )
+
 
 # Одна и та же подсказка на шагах выбора: про кнопку «Подробнее» легко не
 # догадаться, а читать про фильм нужно до выбора качества, а не после.
@@ -1079,7 +1088,7 @@ class Agent:
             "periodic_pick", "periodic_back", "relax_filters",
             "download_selected", "download_all", "choose_episode", "confirm_download",
             "download_new", "periodic_auto", "periodic_notify", "make_periodic",
-            "expand_group", "pick_file",
+            "expand_group", "pick_file", "show_pool",
         )
         if task is not None and task.state == "cancelled" and (
             kind == "choose" or kind in CONT_SUFFIXES
@@ -1127,6 +1136,16 @@ class Agent:
         elif kind == "confirm_download" and task:
             torrent = Torrent.from_dict(task.candidate or {})
             await self._download_with_report(task, torrent, turn)
+        elif kind == "show_pool" and task:
+            pool = [Torrent.from_dict(item) for item in (task.options or {}).get("pool", [])]
+            if not pool:
+                turn.add(
+                    "Список раздач уже не под рукой — напишите запрос заново.",
+                    kind="error",
+                    task_id=task.id,
+                )
+            else:
+                await self._present_pool_choice(task, pool, turn)
         elif kind == "pick_file" and task:
             raw = payload.get("indexes")
             if raw in (None, ""):
@@ -3824,6 +3843,77 @@ class Agent:
         task.state = "awaiting_choice"
         await self.store.save_task(task)
 
+    @staticmethod
+    def _is_disc_image(entries: list[Any]) -> bool:
+        """Раздача из DVD-образов: серий в ней нет, только VIDEO_TS/VOB.
+
+        Такую раздачу нельзя разложить на сезоны и серии: внутри — структура
+        DVD (VIDEO_TS.IFO, VTS_01_1.VOB). Раньше карточка бодро предлагала
+        «Сезон 2, серия None» и 137 ГБ к скачиванию — без единого слова о том,
+        что выбрать серию здесь нельзя.
+        """
+        for entry in entries:
+            name = str(getattr(entry, "name", "")).lower()
+            if "video_ts" in name or name.endswith((".vob", ".ifo", ".bup")):
+                return True
+        return False
+
+    async def _confirm_disc_image(
+        self, task: Task, torrent: Torrent, entries: list[Any], turn: Turn
+    ) -> None:
+        """Раздача из DVD-образов: выбирать нечего, только «всю раздачу»."""
+        total = sum(int(entry.size) for entry in entries)
+        season = (task.params or {}).get("season")
+        episode = (task.params or {}).get("episode_from")
+        requested = ""
+        if season and episode:
+            requested = f"сезон {season}, серия {episode}"
+        elif season:
+            requested = f"сезон {season}"
+        elif episode:
+            requested = f"серия {episode}"
+        plan = {
+            "kind": "all",
+            "wanted": None,
+            "size": total,
+            "total_size": total,
+            "total_files": len(entries),
+            "names": [],
+            "episode": None,
+            "season": None,
+            "selected_episodes": [],
+            "disc_image": True,
+            "requested": requested,
+        }
+        task.options = {**(task.options or {}), "plan": plan}
+        task.state = "awaiting_confirm"
+        await self.store.save_task(task)
+        journal.add(
+            "agent",
+            "раздача из DVD-образов: серии выбрать нельзя",
+            {"раздача": torrent.id, "файлов": len(entries), "вес": human_bytes(total)},
+        )
+        message = turn.add(
+            self._confirm_card_text(task, torrent, plan),
+            kind="task",
+            task_id=task.id,
+            payload={"task": task.to_dict(), "plan": plan},
+        )
+        actions = self._start_actions(task, plan)
+        # Если человек искал сезон другой раздачи — пусть вернётся к списку,
+        # а не начинает поиск заново.
+        if (task.options or {}).get("pool"):
+            actions.insert(
+                1,
+                Action(
+                    id="show-pool",
+                    label="Выбрать другую раздачу",
+                    kind="show_pool",
+                    payload={"task_id": task.id},
+                ),
+            )
+        message.actions = actions
+
     def _extra_video_files(self, task: Task) -> list[Any]:
         """Видеофайлы раздачи, которых нет в списке серий: фильмы, спецвыпуски.
 
@@ -4700,32 +4790,23 @@ class Agent:
             **({"torrent_path": str(path)} if path is not None else {}),
         }
 
+        if self._is_disc_image(entries):
+            # Серий в такой раздаче нет: внутри DVD-структура. Предлагаем только
+            # «всю раздачу» — и говорим об этом прямо, а не показываем
+            # «Сезон 2, серия None».
+            await self._confirm_disc_image(task, torrent, entries, turn)
+            return
+
         if plan["kind"] == "choose":
-            # В пачке несколько сезонов — сначала сезон. Иначе «Серия 1» без
-            # сезона означает по файлу из каждого сезона (у «Сейлор Мун» это
-            # 200 серий в одном списке), а «Скачать весь сезон» — все 70 ГБ.
-            pack_seasons = sorted(
-                {
-                    int(group["season"])
-                    for group in plan.get("episodes") or []
-                    if group.get("season") is not None
-                }
+            # Один вид выбора серий на все случаи: `_show_episode_picker` сам
+            # спрашивает сезон в пачке, показывает только сезон задачи, даёт
+            # «Весь сезон N», «Другой сезон» и отдельные фильмы. Раньше здесь
+            # был свой список — и на «2 сезон» он вываливал все 173 серии
+            # девяти сезонов подряд.
+            task.options = {**(task.options or {}), "plan": plan}
+            await self._show_episode_picker(
+                task, torrent, plan.get("episodes") or [], path, turn
             )
-            if len(pack_seasons) > 1 and not task.params.get("season"):
-                task.options = {**(task.options or {}), "plan": plan}
-                await self._ask_pack_season(
-                    task, torrent, plan.get("episodes") or [], path, turn, pack_seasons
-                )
-                return
-            task.state = "awaiting_choice"
-            await self.store.save_task(task)
-            message = turn.add(
-                self._episode_choice_text(task, plan),
-                kind="tickets",
-                task_id=task.id,
-                payload={"task": task.to_dict(), "episodes": plan["episodes"]},
-            )
-            message.actions = self._episode_actions(task, plan)
             return
 
         task.state = "awaiting_confirm"
@@ -4822,6 +4903,15 @@ class Agent:
             "names": [entry.label for entry in entries if entry.index in (wanted or [entry.index for entry in entries])][:10],
         }
 
+    @staticmethod
+    def _merged_episode_groups(episodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Группы, где сезон неизвестен и в «серию» сложились файлы разных сезонов."""
+        return [
+            group
+            for group in episodes
+            if group.get("season") is None and _video_count(group.get("names") or []) > 1
+        ]
+
     def _episode_choice_text(self, task: Task, plan: dict[str, Any]) -> str:
         """Короткое описание перед списком серий.
 
@@ -4845,6 +4935,15 @@ class Agent:
             f"Ниже все {_plural(len(episodes), 'серия', 'серии', 'серий')} с весом — "
             "нажмите нужную или возьмите весь сезон."
         )
+        merged = self._merged_episode_groups(episodes)
+        if merged:
+            # Сезон в именах файлов не указан, и в «серию» сложились файлы из
+            # разных сезонов: за такой раздачей нужен глаз да глаз.
+            lines.append(
+                "⚠ В этой раздаче не сказано, какой сезон у серий: в «Серия 1» "
+                f"сложены {_video_count(merged[0].get('names') or [])} файлов — это "
+                "серии из разных сезонов. Возьмите другую раздачу, если такой выбор не подходит."
+            )
         extras = self._extra_video_files(task)
         if extras:
             lines.append(
@@ -4993,8 +5092,12 @@ class Agent:
         ordered = rank(pool, task.params or {})
         # Мёртвые раздачи — в конец: «без сидов» первой строкой читается как
         # совет её и брать (так и было: свежая, но мёртвая раздача обгоняла
-        # живую только за счёт даты заливки).
+        # живую только за счёт даты заливки). DVD-образы — туда же: в них нет
+        # отдельных серий, и для запроса «2 сезон» это плохой первый вариант.
         ordered = sorted(ordered, key=lambda item: 0 if (item.seeds or 0) > 0 else 1)
+        ordered = sorted(
+            ordered, key=lambda item: 1 if _DISC_IMAGE_TITLE.search(item.title or "") else 0
+        )
         # Если все строки — один сериал, название в каждой строке повторяется и
         # съедает место: «Красавица-воин Сейлор Мун (1 сезон: 1-46 серии) …».
         # Тогда показываем хвост названия — сезон, год, озвучку и качество.
@@ -5012,6 +5115,8 @@ class Agent:
             # строке уже есть сезон/серии, год, качество и озвучка. Дублировать
             # их значит обрезать самое важное — вес и сиды.
             hint = self._signals_line(torrent)
+            if _DISC_IMAGE_TITLE.search(torrent.title or ""):
+                hint = f"{hint} · DVD-образ, серий внутри нет" if hint else "DVD-образ, серий внутри нет"
             # Название режем отдельно, чтобы вес и сиды не пропали из-за
             # длинного хвоста вроде «(5 сезонов из 5 + 3 фильма из 3+5 спэшлов)».
             label = f"{index}. {shown[:170]}"
@@ -5162,8 +5267,15 @@ class Agent:
             lines.append("• Качество: " + ", ".join(torrent.qualities[:3]))
         if torrent.voices:
             lines.append("• Озвучка: " + ", ".join(torrent.voices[:3]))
+        disc_image = bool(plan.get("disc_image"))
+        requested = plan.get("requested") or ""
+        if disc_image and requested:
+            lines.append(
+                f"• {requested[0].upper()}{requested[1:]}: в этой раздаче отдельных "
+                "серий нет — это DVD-образ (VIDEO_TS)"
+            )
         selected_episodes = self._as_pairs(plan.get("selected_episodes"))
-        if plan.get("season") or plan.get("episode") or selected_episodes:
+        if not disc_image and (plan.get("season") or plan.get("episode") or selected_episodes):
             text = self._episodes_text(selected_episodes)
             if not text:
                 season = plan.get("season")
@@ -5194,6 +5306,8 @@ class Agent:
                 lines.append(f"    – {name}")
             if len(names) > 5:
                 lines.append(f"    … и ещё {len(names) - 5}")
+        elif disc_image:
+            lines.append("• Что качаем: раздачу целиком — серии внутри не разделены")
         elif size_unknown:
             lines.append("• Что качаем: всю раздачу — состав трекер не показал")
         else:

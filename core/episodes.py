@@ -93,7 +93,8 @@ _LEADING_EPISODE = re.compile(r"^(\d{1,2})\s*[._-]\s*(?!\d)")
 # релизы пачками: «01.Sejlor.Mun.(1.sezon.46.serij)»).
 _SEASON_ONLY = (
     re.compile(r"(?i)(\d{1,2})\s*[-_ .]?\s*(?:sezon|season)"),
-    re.compile(r"(?i)\b(?:sezon|season)[\s._-]*(\d{1,2})\b"),
+    # «Sezon01Cherepashki…» — номер сразу за словом, без разделителя.
+    re.compile(r"(?i)\b(?:sezon|season)\s*(\d{1,2})"),
     # «(1s46e)» — так подписывают папки сезонов: сезон 1, 46 серий. Без этого
     # сезоны схлопывались в один список «Серия 1…46».
     re.compile(r"(?i)(?<![\dа-яa-z])(\d{1,2})\s*s\s*\d{1,3}(?:\s*-?\s*e\b)?"),
