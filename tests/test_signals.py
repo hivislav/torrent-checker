@@ -180,6 +180,56 @@ def test_actions() -> None:
     agent.store.close()
 
 
+def test_frozen_filters_visible() -> None:
+    """Условия задачи видны, и лишний фильтр можно снять одним нажатием.
+
+    Настоящий случай: в задаче остался `year=1987` от прежнего уточнения, человек
+    написал коротко «черепашки ниндзя» и получил 3 раздачи из 102 — и нигде не
+    было сказано, что виноват год. Теперь шаг выбора честно пишет условия и даёт
+    кнопку «Без года 1987».
+    """
+    print("\n== условия задачи видны на шаге выбора ==")
+    agent = make_agent()
+    rows = [
+        ("1", "Черепашки мутанты ниндзя (1-9 сезоны: 1-183 серии) / 1987 / ДБ / DVDRip (480p)", 8000, 6),
+        ("2", "Черепашки мутанты ниндзя (сезон 3) / 1987 / ДБ / WEB-DL (1080p)", 3000, 9),
+        ("3", "Черепашки мутанты ниндзя (сезон 5) / 1987 / СТ / DVDRip", 2500, 4),
+        ("4", "Черепашки-ниндзя / Teenage Mutant Ninja Turtles / 2014 / ДБ / WEB-DL (2160p)", 20000, 40),
+    ]
+    pool = [
+        parse_torrent({"id": i, "title": t, "size": f"{size} ГБ", "seeds": seeds})
+        for i, t, size, seeds in rows
+    ]
+    task = make_task(
+        pool[0],
+        params={"title": "Черепашки ниндзя", "type": "series", "year": 1987},
+    )
+    task.options = {"pool": [t.to_dict() for t in pool]}
+    turn = Turn()
+    # Под условиями задачи (год 1987) нашлась всего одна раздача из четырёх по
+    # названию — ровно та ситуация, на которую жаловался владелец.
+    matched = pool[:1]
+    asyncio.run(
+        agent._ask_dimension(  # noqa: SLF001
+            task, turn, "quality", ["1080p", "720p", "DVDRip"], len(matched), found=matched
+        )
+    )
+    message = turn.messages[-1]
+    print("  текст:", message.text.replace("\n", " | ")[:180])
+    check("условия задачи названы в тексте", "год 1987" in message.text, message.text[:200])
+    check("сказано, что из-за них выдача уже",
+          "выдача уже" in message.text, message.text[:200])
+    labels = [action.label for action in message.actions]
+    check("есть кнопка «Без года 1987»", "Без года 1987" in labels, labels[:8])
+    drop = next((a for a in message.actions if a.label == "Без года 1987"), None)
+    if drop is not None:
+        check("кнопка снимает именно год", drop.payload.get("drop") == ["year"], drop.payload)
+    check("полный список по названию показан",
+          any(action.label.startswith("1.") for action in message.actions),
+          labels[:6])
+    agent.store.close()
+
+
 def test_pool_rows() -> None:
     """Полный список по названию: от лучшей к худшей, с ограничением.
 
@@ -433,6 +483,7 @@ def main() -> int:
     test_options()
     test_actions()
     test_pool_rows()
+    test_frozen_filters_visible()
     test_details_everywhere()
     test_link_flow()
     test_checks_journal()

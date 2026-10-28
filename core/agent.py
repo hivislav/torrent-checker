@@ -2891,6 +2891,18 @@ class Agent:
             {"title": str(task.params.get("title") or "")},
         )
         pool_rows = self._pool_rows(task, by_title_pool)
+        active = [
+            key for key in ("year", "quality", "voice", "season", "episode_from")
+            if (task.params or {}).get(key) not in (None, "", [])
+        ]
+        if active and len(by_title_pool) > len(found):
+            # Условия могли остаться от прошлого уточнения: человек пишет
+            # короткий запрос и не ждёт, что задача всё ещё держит год 1987.
+            lines.append("")
+            lines.append(
+                f"Условия задачи: {self._filters_text(task.params or {}).replace('Фильтр — ', '')}. "
+                "Из-за них выдача уже, чем по названию."
+            )
         if len(by_title_pool) > len(found) and pool_rows:
             shown = min(len(by_title_pool), len(pool_rows))
             lines.append("")
@@ -2943,6 +2955,39 @@ class Agent:
             )
         if pool_rows:
             message.actions.extend(pool_rows)
+        if active and len(by_title_pool) > len(found):
+            for key in active:
+                if key in ("quality", "voice"):
+                    value = ""  # пустое значение уже означает «без учёта»
+                else:
+                    value = ""
+                label = {
+                    "year": f"Без года {task.params.get('year')}",
+                    "quality": "Без учёта качества",
+                    "voice": "Без учёта озвучки",
+                    "season": "Без учёта сезона",
+                    "episode_from": "Без учёта серии",
+                }[key]
+                if key in ("quality", "voice"):
+                    message.actions.append(
+                        Action(
+                            id=f"drop-{key}",
+                            label=label,
+                            kind="choose",
+                            payload={"task_id": task.id, "dimension": key, "value": ""},
+                            group="Условия",
+                        )
+                    )
+                else:
+                    message.actions.append(
+                        Action(
+                            id=f"drop-{key}",
+                            label=label,
+                            kind="relax_filters",
+                            payload={"task_id": task.id, "drop": [key]},
+                            group="Условия",
+                        )
+                    )
         message.actions.append(
             Action(
                 id="cancel-choose",

@@ -350,13 +350,31 @@ async def health() -> dict[str, Any]:
 # ----------------------------------------------------------------------
 # Страница и PWA-мелочи
 # ----------------------------------------------------------------------
+def _versioned_index_html() -> str:
+    """index.html с версией у статики: `style.css?v=<mtime>`.
+
+    Браузер держит CSS/JS и после правок показывает старый интерфейс (элемент
+    новый, стилей к нему нет). Cache-Control помогает, но версия в ссылке
+    надёжнее: изменился файл — изменился адрес, кэш промахивается.
+    """
+    html = (WEB_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    for asset in ("style.css", "app.js"):
+        path = WEB_DIR / "static" / asset
+        try:
+            stamp = int(path.stat().st_mtime)
+        except OSError:
+            continue
+        html = html.replace(f'/static/{asset}"', f'/static/{asset}?v={stamp}"')
+    return html
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request) -> Any:
     if _auth_required():
         token = request.cookies.get(SESSION_COOKIE, "")
         if not token or not _verify(token):
             return FileResponse(WEB_DIR / "templates" / "login.html")
-    return FileResponse(WEB_DIR / "templates" / "index.html")
+    return HTMLResponse(_versioned_index_html())
 
 
 class PushPayload(BaseModel):

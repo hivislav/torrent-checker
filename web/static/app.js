@@ -269,9 +269,12 @@
         // Вариант раздачи — кликабельная строка, а не кнопка: нажал — открылась
         // карточка раздачи (жанр, сиды, описание), ссылка на трекер уже в ней.
         if (action.kind === "details" && action.payload && action.payload.row) {
-          const line = document.createElement("button");
-          line.type = "button";
+          // именно div, а не <button>: у браузеров своя отрисовка кнопок, и в
+          // некоторых тема превращалась в белую системную кнопку.
+          const line = document.createElement("div");
           line.className = "variant";
+          line.setAttribute("role", "button");
+          line.tabIndex = 0;
           line.title = "Открыть карточку раздачи";
           const caret = document.createElement("span");
           caret.className = "variant__caret";
@@ -280,11 +283,18 @@
           text.className = "variant__text";
           text.textContent = action.label;
           line.append(caret, text);
-          line.addEventListener("click", () => {
-            if (line.disabled) return;
+          const open = () => {
+            if (state.busy) return;
             showTorrentDetails(
               action.payload.torrent_id, line, action.payload.task_id || ""
             );
+          };
+          line.addEventListener("click", open);
+          line.addEventListener("keydown", (event) => {
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              open();
+            }
           });
           row.appendChild(line);
           continue;
