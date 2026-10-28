@@ -729,6 +729,61 @@ def test_pack_asked_before_episodes() -> None:
     agent.store.close()
 
 
+def test_all_episodes_listed() -> None:
+    """Список серий показывается целиком, без «… и ещё N».
+
+    Настоящий случай: в раздаче 46 серий, а в чате оказались кнопки с 1 по 24
+    и приписка «… и ещё 22 (номер можно указать в запросе)». Список серий —
+    главное, что нужно человеку, обрезать его нельзя.
+    """
+    print("\n== список серий без обрезки ==")
+    import asyncio
+
+    tmp = Path(tempfile.mkdtemp(prefix="allep-"))
+    settings = dataclasses.replace(
+        get_settings(), data_dir=tmp, db_path=tmp / "s.sqlite3", torrents_dir=tmp / "t"
+    )
+    agent = Agent(settings)
+    entries = parse_files(
+        [
+            {"index": index, "size": 1 << 30, "name": f"Sejlor.Mun.{index:02d}.serija.iz.46.avi"}
+            for index in range(1, 47)
+        ]
+    )
+    groups = episode_groups(entries)
+    torrent = Torrent(id="46", title="Красавица-воин Сейлор Мун (1 сезон: 1-46 серии из 46)",
+                      size="70 ГБ", seeds=2, series_title="Красавица-воин Сейлор Мун",
+                      seasons=[1], episodes=[1, 46])
+    task = Task(
+        id="allep", kind="oneshot", state="awaiting_choice", session_id="s",
+        user_query="Сэйлор Мун", params={"title": "Красавица-воин Сейлор Мун", "type": "series"},
+        candidate=torrent.to_dict(),
+    )
+
+    async def picker():
+        await agent.store.save_task(task)
+        turn = Turn()
+        await agent._show_episode_picker(task, torrent, groups, None, turn)  # noqa: SLF001
+        return turn
+
+    message = asyncio.run(picker()).messages[-1]
+    buttons = [a for a in message.actions if a.kind == "toggle_episode"]
+    print("  кнопок серий:", len(buttons), "| последняя:", buttons[-1].label if buttons else None)
+    check("в списке все 46 серий", len(buttons) == 46, len(buttons))
+    check("нет приписки «Показаны первые»", "Показаны первые" not in message.text,
+          message.text[-160:])
+
+    plan = agent._plan_files(task, entries, torrent)  # noqa: SLF001
+    text = agent._episode_choice_text(task, plan)  # noqa: SLF001
+    actions = agent._episode_actions(task, plan)  # noqa: SLF001
+    episode_actions = [a for a in actions if a.kind == "choose_episode"]
+    print("  кнопок в «какую качать»:", len(episode_actions), "|", episode_actions[-1].label)
+    check("кнопка на каждую серию", len(episode_actions) == 46, len(episode_actions))
+    check("в подписи кнопки вес", "ГБ" in episode_actions[0].label, episode_actions[0].label)
+    check("в тексте нет «… и ещё»", "и ещё" not in text, text)
+    agent.store.close()
+
+
 def main() -> int:
     test_detect()
     test_selection()
@@ -739,6 +794,7 @@ def main() -> int:
     test_pack_seasons_and_big_lists()
     test_whole_season_limits_files()
     test_pack_asked_before_episodes()
+    test_all_episodes_listed()
     test_multi_season_pack()
     print("\n=== ИТОГ ===")
     if FAILS:

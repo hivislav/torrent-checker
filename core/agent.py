@@ -3690,16 +3690,11 @@ class Agent:
             lines.append(f"• ⚠ Внешний диск недоступен: {storage.error}")
         lines.append("• Отметьте серии кнопками (можно несколько) — сумма посчитается сама.")
         lines.append("• Куда: " + str(self.settings.transmission_download_dir))
-        limit = 60
-        hidden = len(visible) - limit
-        if hidden > 0:
-            lines.append(
-                f"• Показаны первые {limit} из {len(visible)} серий — остальные "
-                "можно взять как «Весь сезон»."
-            )
         message = turn.add("\n".join(lines), kind="tickets", task_id=task.id,
                            payload={"task": task.to_dict(), "torrent": torrent.to_dict()})
-        for group in visible[:limit]:
+        # Список серий не обрезаем: раньше показывались первые 60, и раздача
+        # выглядела короче, чем она есть.
+        for group in visible:
             season, episode = self._pair_key(group.get("season"), group.get("episode"))
             label = f"Серия {episode} · {human_bytes(int(group.get('size') or 0))}"
             if multi_season and season is not None:
@@ -4479,10 +4474,12 @@ class Agent:
         plan = self._plan_files(task, entries, torrent)
         task.options = {
             **(task.options or {}),
+            # Состав раздачи сохраняем целиком: список серий и план по ним
+            # строятся из этих файлов, и обрезка молча теряла бы серии.
             "files": [
                 {"index": entry.index, "name": entry.name, "size": entry.size,
                  "season": entry.season, "episode": entry.episode}
-                for entry in entries[:400]
+                for entry in entries
             ],
             "plan": plan,
             **({"torrent_path": str(path)} if path is not None else {}),
@@ -4611,43 +4608,46 @@ class Agent:
         }
 
     def _episode_choice_text(self, task: Task, plan: dict[str, Any]) -> str:
+        """Короткое описание перед списком серий.
+
+        Перечня серий в тексте нет намеренно: список — это кнопки, и он всегда
+        полный. Раньше текст перечислял первые 24 и приписывал «… и ещё 22», а
+        кнопок было ещё меньше — человек видел не всю раздачу.
+        """
         episodes = plan.get("episodes") or []
         head = (
             f"Серии {plan.get('episode')} в этой раздаче нет. Какая нужна?"
             if plan.get("reason") == "missing_episode"
-            else f"В раздаче {len(episodes)} серий — какую качать?"
+            else f"В раздаче {_plural(len(episodes), 'серия', 'серии', 'серий')} — какую качать?"
         )
         seasons = {group.get("season") for group in episodes if group.get("season")}
         lines = [head]
         if len(seasons) == 1:
             lines.append(f"Сезон {seasons.pop()}.")
         lines.append(f"Вес всей раздачи: {human_bytes(plan.get('total_size'))}.")
-        shown = []
-        for group in episodes[:24]:
-            label = f"серия {group['episode']}"
-            if len(seasons if isinstance(seasons, set) else []) > 1 and group.get("season"):
-                label = f"{group['season']}×{group['episode']}"
-            shown.append(f"{label} — {human_bytes(group['size'])}")
         lines.append("")
-        lines.append("; ".join(shown))
-        if len(episodes) > 24:
-            lines.append(f"… и ещё {len(episodes) - 24} (номер можно указать в запросе)")
-        lines.append("")
-        lines.append("Выберите серию кнопкой ниже или нажмите «Скачать весь сезон».")
+        lines.append(
+            f"Ниже все {_plural(len(episodes), 'серия', 'серии', 'серий')} с весом — "
+            "нажмите нужную или возьмите весь сезон."
+        )
         return "\n".join(lines)
 
     def _episode_actions(self, task: Task, plan: dict[str, Any]) -> list[Action]:
+        """Кнопка на каждую серию раздачи — список не обрезается."""
         actions: list[Action] = []
-        for group in (plan.get("episodes") or [])[:24]:
+        for group in plan.get("episodes") or []:
             episode = group.get("episode")
             season = group.get("season")
+            size = int(group.get("size") or 0)
             label = f"Серия {episode}"
             if season and plan.get("season") and season != plan.get("season"):
                 label = f"{season}×{episode}"
+            if size:
+                label = f"{label} · {human_bytes(size)}"
             actions.append(
                 Action(
                     id=f"episode-{season}-{episode}",
-                    label=label,
+                    label=label[:60],
                     kind="choose_episode",
                     payload={"task_id": task.id, "episode": episode, "season": season},
                 )
