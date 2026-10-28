@@ -3074,6 +3074,25 @@ class Agent:
             bits.append("с экранкой")
         return ", ".join(bits) or "без уточнений"
 
+    @staticmethod
+    def _drop_dims_not_in_query(task: Task) -> None:
+        """Сбрасывает условия, которых не было в исходном запросе человека.
+
+        `quality=1080p` и `voice=ДБ (CTC)` попадают в задачу не только от
+        человека: агент подбирает их сам, чтобы не спрашивать о том, чего в
+        выдаче нет. После смены названия такие условия начинают врать — под
+        новым названием они оставляют одну раздачу. Условия, названные в
+        запросе словами («Дюна 1080p», «сезон 2»), остаются.
+        """
+        query = normalize(task.user_query or "")
+        for key in ("quality", "voice", "year", "season", "episode_from"):
+            value = (task.params or {}).get(key)
+            if value in (None, ""):
+                continue
+            token = normalize(str(value))
+            if not token or token not in query:
+                task.params.pop(key, None)
+
     async def _listing_entries(self, torrent: Torrent) -> list[dict[str, Any]] | None:
         """Состав раздачи со страницы трекера — без траты дневного лимита.
 
@@ -3411,9 +3430,17 @@ class Agent:
         task.params["title"] = title
         task.params.pop("original_title", None)
         task.params["seen_ids"] = []
+        # Смена названия — смена предмета поиска: качество, озвучка, год и сезон
+        # относились к прежнему названию (и часто были подобраны автоматически).
+        # Оставленные, они сужали выдачу до одной раздачи, и выбор пропадал.
+        self._drop_dims_not_in_query(task)
         task.state = "searching"
         await self.store.save_task(task)
-        journal.add("agent", "название исправлено по подсказке", {"стало": title})
+        journal.add(
+            "agent",
+            "название исправлено по подсказке",
+            {"стало": title, "условия задачи": task.params},
+        )
 
         try:
             torrents = await self._search(task.params)

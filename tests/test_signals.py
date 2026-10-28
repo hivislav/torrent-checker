@@ -268,6 +268,56 @@ def test_pool_choice_without_quality() -> None:
     agent.store.close()
 
 
+def test_title_change_drops_stale_filters() -> None:
+    """Смена названия не тащит за собой качество и озвучку прежней выдачи.
+
+    Настоящий случай: задача «Сэйлор Мун» уже держала `quality=1080p` и
+    `voice=ДБ (CTC)` — их подобрал сам агент. После нажатия «Это „Красавица-воин
+    Сейлор Мун“» под эти условия подходила одна раздача, и вместо списка
+    раздач сразу открывались её серии. Названные человеком условия остаются.
+    """
+    print("\n== смена названия сбрасывает подобранные условия ==")
+    agent = make_agent()
+    rows = [
+        ("1", "Красавица-воин Сейлор Мун (1 сезон: 1-46 серии из 46) / 1992 / ДБ (CTC) / BDRip (1080p)", "80 ГБ", 2),
+        ("2", "Красавица-воин Сейлор Мун (1 сезон: 1-46 серии из 46) / 1992 / ДБ / DVDRip (480p)", "12 ГБ", 6),
+        ("3", "Красавица-воин Сейлор Мун (1-5 сезоны: 1-200 серии из 200) / 1992-1997 / ЛМ / WEB-DL (1080p)", "300 ГБ", 9),
+    ]
+    pool = [
+        parse_torrent({"id": i, "title": t, "size": size, "seeds": seeds})
+        for i, t, size, seeds in rows
+    ]
+    task = make_task(
+        pool[0],
+        params={"title": "Сэйлор Мун", "quality": "1080p", "voice": "ДБ (CTC)", "type": "series"},
+    )
+    task.user_query = "Сэйлор Мун"
+    task.options = {"pool": [t.to_dict() for t in pool]}
+
+    async def fake_search(params, pages=2):
+        return pool
+
+    agent._search = fake_search  # type: ignore[assignment]  # noqa: SLF001
+    turn = Turn()
+    asyncio.run(agent._apply_title(task, "Красавица-воин Сейлор Мун", turn))  # noqa: SLF001
+    message = turn.messages[-1]
+    print("  текст:", message.text.replace("\n", " | ")[:160])
+    check("качество прежней выдачи снято", not task.params.get("quality"), task.params)
+    check("озвучка прежней выдачи снята", not task.params.get("voice"), task.params)
+    check("вместо серий — список раздач", "какую берём?" in message.text, message.text[:200])
+    check("в списке все три раздачи",
+          len([a for a in message.actions if a.kind == "details"]) == 3,
+          [a.label for a in message.actions])
+
+    # Условие, названное словами в запросе, остаётся: человек сам его попросил.
+    asked = make_task(pool[0], params={"title": "Дюна", "quality": "1080p", "year": 2024})
+    asked.user_query = "Дюна 2024 1080p"
+    agent._drop_dims_not_in_query(asked)  # noqa: SLF001
+    check("названное качество осталось", asked.params.get("quality") == "1080p", asked.params)
+    check("названный год остался", asked.params.get("year") == 2024, asked.params)
+    agent.store.close()
+
+
 def test_frozen_filters_visible() -> None:
     """Условия задачи видны, и лишний фильтр можно снять одним нажатием.
 
@@ -577,6 +627,7 @@ def main() -> int:
     test_frozen_filters_visible()
     test_pool_choice_before_episodes()
     test_pool_choice_without_quality()
+    test_title_change_drops_stale_filters()
     test_details_everywhere()
     test_link_flow()
     test_checks_journal()
