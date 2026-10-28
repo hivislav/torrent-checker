@@ -771,7 +771,12 @@ body {
   align-items: baseline;
   gap: 8px;
   width: 100%;
+  /* Своя отрисовка вместо системной кнопки: иначе браузер может показать
+     «системный» белый вид независимо от темы. */
+  appearance: none;
+  -webkit-appearance: none;
   padding: 7px 10px;
+  line-height: 1.35;
   font-family: var(--serif);
   font-size: 13px;
   text-align: left;

@@ -91,7 +91,22 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="Кинозал-агент", lifespan=lifespan)
-app.mount("/static", StaticFiles(directory=WEB_DIR / "static"), name="static")
+class _FreshStaticFiles(StaticFiles):
+    """Статика, которую браузер обязан перепроверять.
+
+    Без `Cache-Control` браузер кэширует CSS/JS по эвристике от Last-Modified, и
+    после правок человек видит старый интерфейс: элемент новый, а стилей к нему
+    в старом файле нет — кнопка выходит белой. `no-cache` заставляет
+    перепроверять файл: изменился — 200, не изменился — дешёвый 304.
+    """
+
+    def file_response(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        response = super().file_response(*args, **kwargs)
+        response.headers["Cache-Control"] = "no-cache, must-revalidate"
+        return response
+
+
+app.mount("/static", _FreshStaticFiles(directory=WEB_DIR / "static"), name="static")
 
 
 # ----------------------------------------------------------------------

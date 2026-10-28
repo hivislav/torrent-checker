@@ -1,7 +1,7 @@
 /* Service worker: нужен, чтобы приложение можно было «поставить» на телефон и
    чтобы уведомления доходили при свёрнутой вкладке. Кэш — только оболочка
    (HTML/CSS/JS), данные всегда тянутся из сети: раздачи меняются каждую минуту. */
-const SHELL = "kinozal-shell-v1";
+const SHELL = "kinozal-shell-v2";
 const ASSETS = ["/", "/static/style.css", "/static/app.js", "/static/icon-192.png"];
 
 self.addEventListener("install", (event) => {

@@ -150,6 +150,23 @@ def run() -> int:
                   and page.locator(".composer__modes").is_visible())
             check("и кнопки «Редактировать» нет", not edit_button.is_visible())
 
+        print("\n== статика не залипает в кэше ==")
+        # Без Cache-Control браузер кэширует CSS по эвристике, и после правок
+        # человек видит старый интерфейс: элемент новый, стилей к нему нет —
+        # кнопка выходит белой.
+        page.goto(BASE + "/static/style.css")
+        css_headers = page.evaluate("async () => { const r = await fetch('/static/style.css'); "
+                                    "return { cache: r.headers.get('cache-control') || '', text: await r.text() }; }")
+        check("статика просит перепроверять себя",
+              "no-cache" in css_headers["cache"], css_headers["cache"])
+        check("в CSS есть стили новых строк-вариантов",
+              ".variant" in css_headers["text"])
+        page.go_back(wait_until="domcontentloaded")
+        if settings.site_password and page.locator("#login-form").count():
+            page.fill("#password", settings.site_password)
+            page.click("button[type=submit]")
+        page.wait_for_selector("#chat", timeout=20000)
+
         print("\n== панель задач ==")
         # Карточка появляется не мгновенно: агент дописывает задачу, а панель
         # обновляется раз в 5 секунд.
