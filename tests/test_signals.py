@@ -155,23 +155,26 @@ def test_options() -> None:
 
 
 def test_actions() -> None:
-    print("\n== «Подробнее» и ссылка на трекер ==")
+    print("\n== карточка раздачи вместо двух кнопок ==")
     agent = make_agent()
     task = make_task(MOVIE)
     actions = agent._torrent_actions(task)  # noqa: SLF001
-    kinds = {action.kind for action in actions}
-    check("есть обе кнопки", kinds == {"details", "link"}, kinds)
-    link = next(action for action in actions if action.kind == "link")
-    check("ссылка ведёт на страницу раздачи",
-          link.url == "https://kinozal.me/details.php?id=1234567", link.url)
-    details = next(action for action in actions if action.kind == "details")
+    kinds = [action.kind for action in actions]
+    # Раньше тут было две кнопки — «Подробнее» и «Открыть на трекере». Теперь
+    # одна кликабельная строка: карточка раздачи, а ссылка на трекер внутри неё.
+    check("осталась одна строка-вариант", kinds == ["details"], kinds)
+    details = actions[0]
+    check("строка отмечена как кликабельная", details.payload.get("row") is True, details.payload)
     check("«Подробнее» знает номер раздачи",
           details.payload.get("torrent_id") == "1234567", details.payload)
+    check("кнопки-ссылки в чате больше нет", "link" not in kinds, kinds)
 
     start = agent._start_actions(task, PLAN)  # noqa: SLF001
     labels = [action.label for action in start]
-    check("на карточке подтверждения есть «Подробнее»", "Подробнее" in labels, labels)
-    check("на карточке подтверждения есть ссылка", "Открыть на трекере" in labels, labels)
+    check("на карточке подтверждения есть «Подробнее»",
+          any("Подробнее" in label for label in labels), labels)
+    check("на карточке подтверждения нет отдельной ссылки",
+          "Открыть на трекере" not in labels, labels)
     check("подтверждение осталось главным",
           start[0].kind == "start_download" and start[0].style == "primary", start[0])
     agent.store.close()
@@ -335,8 +338,10 @@ def test_details_everywhere() -> None:
     check("подробности открывают лучшую раздачу",
           found_actions and found_actions[0].payload.get("torrent_id") == "12",
           found_actions[0].payload if found_actions else None)
-    check("рядом есть ссылка на трекер",
-          any(action.kind == "link" for action in turn.messages[0].actions))
+    # Ссылка на трекер переехала внутрь окна «Подробнее»: в чате её больше нет.
+    check("в чате нет отдельной ссылки на трекер",
+          not any(action.kind == "link" for action in turn.messages[0].actions),
+          [action.kind for action in turn.messages[0].actions])
 
     # Шаг «под эти условия ничего не подошло» — тоже.
     relaxed = make_task(pool[1], params={"title": "Дюна", "quality": "2160p"})

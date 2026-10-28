@@ -765,6 +765,31 @@ body {
    видно, что к чему относится. */
 .msg__action-group { display: flex; flex-direction: column; gap: 6px; }
 
+/* Кликабельная строка-вариант: открывает карточку раздачи. */
+.variant {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 10px;
+  font-family: var(--serif);
+  font-size: 13px;
+  text-align: left;
+  color: var(--ink-dim);
+  background: rgba(0, 0, 0, .18);
+  border: 1px solid var(--line-soft);
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background .15s, border-color .15s, color .15s;
+}
+.variant:hover {
+  background: rgba(224, 162, 83, .1);
+  border-color: rgba(224, 162, 83, .45);
+  color: var(--ink);
+}
+.variant__caret { color: var(--amber); font-size: 15px; line-height: 1; }
+.variant__text { flex: 1; }
+
 .msg__action-caption {
   font-family: var(--mono);
   font-size: 9.5px;

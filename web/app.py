@@ -173,8 +173,11 @@ async def action(payload: ActionPayload, session: str = Depends(current_session)
 
 @app.get("/api/tasks")
 async def tasks(
-    all: bool = True, limit: int = 40, session: str = Depends(current_session)
+    all: bool = True, limit: int = 500, session: str = Depends(current_session)
 ) -> dict[str, Any]:
+    # Лимит раньше был 40, и при 50+ задачах часть картотеки просто не приезжала:
+    # «в работе» и «завершено» показывали меньше, чем есть, а периодические
+    # задачи «исчезали» из списка.
     return {"tasks": await agent.list_tasks(include_finished=all, limit=limit)}
 
 

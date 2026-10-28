@@ -441,6 +441,59 @@ def test_pack_seasons_and_big_lists() -> None:
     agent.store.close()
 
 
+def test_whole_season_limits_files() -> None:
+    """«Скачать весь сезон» ставит файлы этого сезона, а не всю раздачу.
+
+    Настоящий случай: в пачке «1-10 сезоны» нажали «Весь сезон 1» — агент
+    обещал сезон, а Transmission ставил все файлы раздачи (52 ГБ вместо 5).
+    """
+    print("\n== «весь сезон» — только файлы сезона ==")
+    import asyncio
+
+    from core.models import Task, Torrent
+
+    tmp = Path(tempfile.mkdtemp(prefix="season-"))
+    settings = dataclasses.replace(
+        get_settings(), data_dir=tmp, db_path=tmp / "s.sqlite3", torrents_dir=tmp / "t"
+    )
+    agent = Agent(settings)
+    groups = [
+        {"season": 1, "episode": 1, "indexes": [0], "size": 100, "names": ["s1e1.mkv"]},
+        {"season": 1, "episode": 2, "indexes": [1], "size": 100, "names": ["s1e2.mkv"]},
+        {"season": 1, "episode": 3, "indexes": [2], "size": 100, "names": ["s1e3.mkv"]},
+        {"season": 2, "episode": 1, "indexes": [3], "size": 200, "names": ["s2e1.mkv"]},
+    ]
+    task = Task(
+        id="season",
+        kind="oneshot",
+        state="awaiting_choice",
+        session_id="s",
+        user_query="Черепашки",
+        params={"title": "Черепашки", "season": 1},
+        candidate=Torrent(id="900", title="Черепашки (1-2 сезоны: 1-4 серии из 4)").to_dict(),
+        options={"episode_groups": groups},
+    )
+
+    async def scenario() -> None:
+        await agent.store.save_task(task)
+        turn = await agent.handle_action(
+            "s", "download_all", {"task_id": "season", "season": 1}
+        )
+        stored = await agent.store.get_task("season")
+        plan = (stored.options or {}).get("plan") or {}
+        print("  план:", {k: plan.get(k) for k in ("kind", "wanted", "size", "total_size")})
+        check("в плане только файлы первого сезона", plan.get("wanted") == [0, 1, 2],
+              plan.get("wanted"))
+        check("вес — только сезон, а не вся пачка", plan.get("size") == 300, plan.get("size"))
+        check("вес всей пачки всё равно виден", plan.get("total_size") == 500,
+              plan.get("total_size"))
+        labels = [action.label for action in (turn.messages[-1].actions if turn.messages else [])]
+        check("на карточке есть постановка в очередь", "Поставить в Transmission" in labels, labels)
+
+    asyncio.run(scenario())
+    agent.store.close()
+
+
 def test_multi_season_pack() -> None:
     """Пачка «1-4 сезоны: 1-40 серии» — серии различаются по сезону.
 
@@ -560,6 +613,7 @@ def main() -> int:
     test_multi_episode_plan()
     test_plan_rebuild()
     test_pack_seasons_and_big_lists()
+    test_whole_season_limits_files()
     test_multi_season_pack()
     print("\n=== ИТОГ ===")
     if FAILS:

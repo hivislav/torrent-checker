@@ -197,11 +197,41 @@ async def test_agent_flow() -> None:
     agent.store.close()
 
 
+async def test_hyphen_split_queries() -> None:
+    """Склеенное дефисами название с опечаткой ищется по частям.
+
+    Настоящий случай: «черепашки-мутантантах-ниндзя» — для трекера это одно
+    слово, и опечатка в нём оставляет запрос вообще без ответа: укороченные
+    варианты строятся по словам, а слово одно.
+    """
+    print("\n== опечатка в названии через дефисы ==")
+    tmp = Path(tempfile.mkdtemp(prefix="hyphen-"))
+    settings = dataclasses.replace(
+        get_settings(), data_dir=tmp, db_path=tmp / "t.sqlite3", torrents_dir=tmp / "tr"
+    )
+    settings.torrents_dir.mkdir(parents=True, exist_ok=True)
+    agent = Agent(settings)
+    mcp = TypoMCP()
+    agent.mcp = mcp  # type: ignore[assignment]
+    await agent._search_with_suggestions(  # noqa: SLF001
+        {"title": "черепашки-мутантантах-ниндзя"}, original="черепашки-мутантантах-ниндзя"
+    )
+    print("  запросы к трекеру:", mcp.queries)
+    check("исходный запрос спросили",
+          "черепашки-мутантантах-ниндзя" in mcp.queries, mcp.queries)
+    check("искали и по частям названия",
+          any(item == "черепашки" for item in mcp.queries), mcp.queries)
+    check("и по последнему слову",
+          any(item == "ниндзя" for item in mcp.queries), mcp.queries)
+    agent.store.close()
+
+
 async def main() -> int:
     test_variants()
     test_similarity()
     test_ranking()
     await test_agent_flow()
+    await test_hyphen_split_queries()
 
     print("\n=== ИТОГ ===")
     if FAILS:

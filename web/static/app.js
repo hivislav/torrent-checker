@@ -266,6 +266,28 @@
       row.className = "msg__action-row";
 
       for (const action of items) {
+        // Вариант раздачи — кликабельная строка, а не кнопка: нажал — открылась
+        // карточка раздачи (жанр, сиды, описание), ссылка на трекер уже в ней.
+        if (action.kind === "details" && action.payload && action.payload.row) {
+          const line = document.createElement("button");
+          line.type = "button";
+          line.className = "variant";
+          line.title = "Открыть карточку раздачи";
+          const caret = document.createElement("span");
+          caret.className = "variant__caret";
+          caret.textContent = "›";
+          const text = document.createElement("span");
+          text.className = "variant__text";
+          text.textContent = action.label;
+          line.append(caret, text);
+          line.addEventListener("click", () => {
+            if (line.disabled) return;
+            showTorrentDetails(action.payload.torrent_id, line);
+          });
+          row.appendChild(line);
+          continue;
+        }
+
         // Кнопка-ссылка: уходит на трекер в новой вкладке, на сервер не ходит.
         // Рисуем именно <a>: на телефоне это открывается в браузере, а не в PWA.
         if (action.kind === "link" && action.url) {
@@ -448,6 +470,12 @@
 
   async function runAction(action, button) {
     if (state.busy) return;
+    // Действие принадлежит конкретной задаче. Если открыта другая («Проверить»
+    // нажали в списке), сначала открываем её — иначе ответ писался в чужой чат.
+    const ownerTask = action.payload && action.payload.task_id;
+    if (ownerTask && ownerTask !== state.taskId) {
+      await openConversation(ownerTask);
+    }
     state.busy = true;
     const owner = button.closest(".msg");
     if (owner) lockMessage(owner);

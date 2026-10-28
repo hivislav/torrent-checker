@@ -1392,11 +1392,13 @@ class Agent:
                 plan = self._plan_files(task, entries)
             plan = {
                 **plan,
+                # `wanted` НЕ обнуляем: «весь сезон» — это файлы выбранного
+                # сезона. Раньше здесь стояло wanted=None, и Transmission ставил
+                # всю раздачу (в пачке 1-10 сезонов это 52 ГБ вместо 5).
                 "kind": "all",
-                "wanted": None,
-                "size": plan.get("total_size"),
+                "size": plan.get("size") or plan.get("total_size"),
                 "episode": None,
-                "names": [],
+                "names": plan.get("names") or [],
                 "season": whole_season if whole_season is not None else plan.get("season"),
             }
             task.options = {**(task.options or {}), "plan": plan}
@@ -1441,7 +1443,7 @@ class Agent:
     # ------------------------------------------------------------------
     # Задачи: чтение и отмена
     # ------------------------------------------------------------------
-    async def list_tasks(self, include_finished: bool = True, limit: int = 40) -> list[dict[str, Any]]:
+    async def list_tasks(self, include_finished: bool = True, limit: int = 500) -> list[dict[str, Any]]:
         tasks = await self.store.list_tasks(limit=limit)
         if not include_finished:
             tasks = [task for task in tasks if task.is_active]
@@ -2107,6 +2109,13 @@ class Agent:
         # 2) Укороченные варианты запроса — на случай лишних слов.
         for variant in query_variants(source):
             add_query(variant)
+        # 3) Дефисы и подчёркивания: «черепашки-мутантантах-ниндзя» для трекера —
+        #    одно слово, и опечатка в нём оставляет запрос вообще без ответа.
+        #    Ищем и по частям, а похожесть потом отфильтрует лишнее.
+        for chunk in re.split(r"[-_/]+", str(source)):
+            chunk = chunk.strip()
+            if len(chunk) > 2 and " " not in chunk:
+                add_query(chunk)
 
         wanted_type = str(params.get("type") or "").lower()
         for query in queries:
@@ -2199,6 +2208,18 @@ class Agent:
     # ------------------------------------------------------------------
     # Разовая задача
     # ------------------------------------------------------------------
+    async def _same_periodic_title(self, session_id: str, title: str) -> Task | None:
+        """Уже следящая периодическая задача с тем же названием (без дублей)."""
+        wanted = normalize(title)
+        if not wanted:
+            return None
+        for task in await self.store.list_tasks(limit=200):
+            if task.kind != "periodic" or task.state not in ("monitoring", "failed"):
+                continue
+            if normalize(str((task.params or {}).get("title") or "")) == wanted:
+                return task
+        return None
+
     async def _same_title_task(self, session_id: str, title: str) -> Task | None:
         """Незакрытая задача этой сессии с тем же названием (чтобы не плодить дубли)."""
         wanted = normalize(title)
@@ -3017,11 +3038,13 @@ class Agent:
                 line += f" — {_comma(whole.size)}"
             text += f"\n{line}"
         alternatives = best_list[1:4]
+        variant_rows: list[Action] = []
         if alternatives:
-            text += "\n\nДругие раздачи по этому запросу:"
+            text += "\n\nДругие раздачи по этому запросу (нажмите, чтобы посмотреть):"
             for index, item in enumerate(alternatives, start=2):
                 label = self._short_torrent_label(item)
                 text += f"\n{index}. {item.title}" + (f" — {label}" if label else "")
+                variant_rows.append(self._variant_row(item.id, item.title, hint=label))
         text += "\n\nСтавлю в Transmission?"
         message = turn.add(
             text,
@@ -3051,6 +3074,8 @@ class Agent:
                         group="Похожие названия",
                     )
                 )
+        # Кликабельные строки вариантов: нажал на раздачу — открылась её карточка.
+        message.actions.extend(variant_rows)
         if alternatives:
             for index, alternative in enumerate(alternatives, start=2):
                 label = self._short_torrent_label(alternative)
@@ -3798,15 +3823,46 @@ class Agent:
 
         interval = parsed.get("interval_minutes") or self.settings.default_interval_minutes
         interval = max(self.settings.min_interval_minutes, int(interval))
-        task = await self._task_from_params(
-            session_id,
-            text,
-            parsed,
-            kind="periodic",
-            interval=interval,
-            auto_download=bool(parsed.get("auto_download")),
-        )
-        turn.task = task
+        # Вторая задача на тот же сериал — это два независимых «жду серию N»:
+        # они качают одно и то же дважды и расходятся в прогрессе. Если такая
+        # уже следит, правим её.
+        same = await self._same_periodic_title(session_id, str(parsed.get("title") or ""))
+        if same is not None:
+            merged = dict(same.params or {})
+            for key, value in parsed.items():
+                if key in PARAM_KEYS and value not in (None, "", "null", []):
+                    merged[key] = value
+            same.params = merged
+            same.user_query = text
+            if same.interval_minutes != interval:
+                same.interval_minutes = interval
+            same.auto_download = bool(parsed.get("auto_download"))
+            if same.state not in ("monitoring",):
+                same.state = "monitoring"
+            self._schedule_next(same)
+            await self.store.save_task(same)
+            journal.add(
+                "agent",
+                "второй периодической задачи не завожу — правлю существующую",
+                {"задача": same.id, "название": same.title, "интервал": interval},
+            )
+            turn.task = same
+            turn.add(
+                f"За «{same.title}» уже слежу — правлю эту задачу, вторую не завожу.",
+                kind="text",
+                task_id=same.id,
+            )
+            task = same
+        else:
+            task = await self._task_from_params(
+                session_id,
+                text,
+                parsed,
+                kind="periodic",
+                interval=interval,
+                auto_download=bool(parsed.get("auto_download")),
+            )
+            turn.task = task
 
         try:
             torrents, suggestions = await self._search_with_suggestions(
@@ -4603,22 +4659,28 @@ class Agent:
         ).strip()
         if not identifier:
             return []
-        return [
-            Action(
-                id=f"details-{identifier}",
-                label="Подробнее",
-                kind="details",
-                payload={"task_id": task.id, "torrent_id": identifier},
-                group="Раздача",
-            ),
-            Action(
-                id=f"open-{identifier}",
-                label="Открыть на трекере",
-                kind="link",
-                url=self._torrent_link(identifier),
-                group="Раздача",
-            ),
-        ]
+        # Одна строка вместо двух кнопок: «Подробнее» открывает окно, а ссылка на
+        # трекер живёт уже внутри него — но только если человек захочет.
+        return [self._variant_row(identifier, "Подробнее о раздаче", task_id=task.id)]
+
+    @staticmethod
+    def _variant_row(
+        torrent_id: str, label: str, *, hint: str = "", task_id: str = ""
+    ) -> Action:
+        """Кликабельная строка-вариант: открывает окно «Подробнее».
+
+        Раньше у каждой раздачи в списке висели две кнопки — «Подробнее» и
+        «Открыть на трекере». Теперь список читается как список: клик по строке
+        открывает карточку раздачи, а ссылка на трекер — внутри неё.
+        """
+        text = label if not hint else f"{label} — {hint}"
+        return Action(
+            id=f"details-{torrent_id}",
+            label=text[:140],
+            kind="details",
+            payload={"task_id": task_id, "torrent_id": torrent_id, "row": True},
+            group="Варианты",
+        )
 
     def _best_torrent(self, torrents: list[Torrent], params: dict[str, Any] | None = None) -> Torrent | None:
         """Лучшая раздача из списка — о ней и показываем подробности."""
@@ -5641,6 +5703,13 @@ class Agent:
             # качала фильм 2024 года.
             pool = matched
             series = str(pool[0].series_key) if pool else ""
+            if not series:
+                # Ничего не нашлось или трекер молчит — ключ сериала берём из
+                # самой задачи. Иначе прогресс «забывается», и задача снова
+                # ждёт уже скачанную серию (а иногда качает её повторно).
+                series = str(params.get("series_key") or "")
+            if series and params.get("series_key") != series:
+                params["series_key"] = series
             season_episodes: dict[int, int] = {}
             max_ts = 0.0
             if series:
@@ -5662,6 +5731,10 @@ class Agent:
             # начиная с третьей» после скачивания третьей ищет четвёртую, а не
             # третью повторно.
             next_episode = self._next_episode(params, season_episodes)
+            if not season_episodes:
+                # Прогресса под рукой нет: не откатываем номер назад к «начиная
+                # с N», иначе задача ждёт серию, которая уже лежит на диске.
+                next_episode = max(next_episode, int(params.get("next_episode") or 0))
             task.params["next_episode"] = next_episode
 
             fresh = find_new(

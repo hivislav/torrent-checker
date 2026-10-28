@@ -801,6 +801,61 @@ async def test_notify_buttons_stay_alive() -> None:
 
 
 
+async def test_next_episode_not_rolled_back() -> None:
+    """Пустая выдача не откатывает «какую серию ждём».
+
+    Настоящий случай: скачали 3-ю серию, трекер на следующей проверке ничего не
+    вернул — и номер откатился к «начиная с 3», задача снова ждала 3-ю.
+    """
+    print("\n== трекер молчит: номер серии не откатывается ==")
+    agent, mcp, transmission = build_agent()
+    task = await create_task(agent, auto=True)
+    assert task is not None
+    mcp.episodes = 3
+    await agent.check_task(task)
+    task = await agent.store.get_task(task.id)
+    assert task is not None
+    print("  после скачивания 3-й:", task.params.get("next_episode"))
+    check("ждём 4-ю", task.params.get("next_episode") == 4, task.params.get("next_episode"))
+
+    # Трекер перестал отвечать раздачами (Cloudflare, пустая выдача).
+    mcp.episodes = 0
+    await agent.check_task(task)
+    task = await agent.store.get_task(task.id)
+    assert task is not None
+    print("  после пустой проверки:", task.params.get("next_episode"))
+    check("номер не откатился назад", task.params.get("next_episode") == 4,
+          task.params.get("next_episode"))
+    check("ключ сериала запомнен", bool(task.params.get("series_key")),
+          task.params.get("series_key"))
+    agent.store.close()
+
+
+async def test_no_duplicate_periodic() -> None:
+    """Вторая задача на тот же сериал не заводится: правки идут в существующую."""
+    print("\n== дубль периодической задачи не создаётся ==")
+    agent, mcp, transmission = build_agent()
+    first = await create_task(agent, auto=True)
+    assert first is not None
+    before = [t for t in await agent.store.list_tasks(limit=100) if t.kind == "periodic"]
+    check("первая задача есть", len(before) == 1, [t.id for t in before])
+
+    # Второй раз просим следить за тем же сериалом.
+    turn = await agent.handle_message(
+        first.session_id, "Звёзды в джунглях", "periodic"
+    )
+    after = [t for t in await agent.store.list_tasks(limit=100) if t.kind == "periodic"]
+    print("  периодических задач:", len(after))
+    check("вторая не завелась", len(after) == 1, [t.id for t in after])
+    check("правка ушла в существующую",
+          turn.task is not None and turn.task.id == first.id,
+          turn.task.id if turn.task else None)
+    text = " ".join(m.text for m in turn.messages).lower()
+    check("сказано, что вторая задача не нужна", "вторую не завожу" in text, text[:160])
+    agent.store.close()
+
+
+
 async def test_refine_periodic() -> None:
     print("\n== уточнение внутри периодической задачи ==")
     from core.models import Turn
@@ -1110,6 +1165,8 @@ async def main() -> int:
     await test_listing_before_torrent()
     await test_pack_needs_choice()
     await test_notify_buttons_stay_alive()
+    await test_next_episode_not_rolled_back()
+    await test_no_duplicate_periodic()
     await test_refine_periodic()
     await test_strict_conditions()
     await test_make_periodic_in_place()
