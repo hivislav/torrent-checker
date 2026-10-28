@@ -29,7 +29,7 @@ from core.episodes import (  # noqa: E402
     pick_episode,
     pick_new_episodes,
 )
-from core.models import Task, Torrent  # noqa: E402
+from core.models import Task, Torrent, Turn  # noqa: E402
 from core.torrent_meta import human_bytes  # noqa: E402
 
 FAILS: list[str] = []
@@ -385,8 +385,32 @@ def test_pack_seasons_and_big_lists() -> None:
     )
     groups = episode_groups(glued)
     print("  группы:", [f"{g['season']}×{g['episode']}" for g in groups])
-    check("склеенная строка сезона не считается файлом", glued[0].is_junk, glued[0].name[:40])
+    # Склеенная строка папки больше не попадает в файлы вовсе: её вес повторяет
+    # вес первого файла папки. Сезон из неё при этом не теряется — см. ниже.
+    check("склеенной строки папки нет среди файлов",
+          all("Сезон..01" not in entry.name for entry in glued),
+          [entry.name[:30] for entry in glued])
     check("в группы попали только настоящие файлы", len(groups) == 2, len(groups))
+
+    # Настоящий случай: листинг трекера — папки сезонов, а в именах файлов
+    # сезона нет вовсе («Sejlor.Mun.01.serija.iz.46.avi»). Сезон берём из строки
+    # папки, иначе пять сезонов схлопываются в один список «Серия 1…46».
+    folders = parse_files(
+        [
+            {"index": 0, "size": 10, "name": "01.Sejlor.Mun.(1.sezon.46.serij).1992.X-dfuySejlor.Mun.01.serija.iz.46.avi Sejlor.Mun.02.serija.iz.46.avi"},
+            {"index": 1, "size": 500, "name": "Sejlor.Mun.01.serija.iz.46.avi"},
+            {"index": 2, "size": 500, "name": "Sejlor.Mun.02.serija.iz.46.avi"},
+            {"index": 3, "size": 10, "name": "02.Sejlor.Mun.R.(2.sezon.43.serii).1993.X-dfuySejlor.Mun.R.01.serija.iz.43.avi Sejlor.Mun.R.02.serija.iz.43.avi"},
+            {"index": 4, "size": 700, "name": "Sejlor.Mun.R.01.serija.iz.43.avi"},
+        ]
+    )
+    folder_groups = episode_groups(folders)
+    print("  сезоны из папок:", [f"{g['season']}×{g['episode']}" for g in folder_groups])
+    check("сезон берётся из строки папки",
+          [(g["season"], g["episode"]) for g in folder_groups] == [(1, 1), (1, 2), (2, 1)],
+          [f"{g['season']}×{g['episode']}" for g in folder_groups])
+    check("вес папки не считается дважды",
+          sum(entry.size for entry in folders) == 1700, sum(entry.size for entry in folders))
 
     tmp = Path(tempfile.mkdtemp(prefix="seasons-"))
     settings = dataclasses.replace(
@@ -602,6 +626,106 @@ def test_multi_season_pack() -> None:
     check("и это только второй сезон",
           {item.get("season") for item in whole_plan.get("selected_episodes")} == {2},
           whole_plan.get("selected_episodes"))
+
+    # Кнопка «Скачать весь сезон» приходит без payload сезона: сезон берём из
+    # задачи. Раньше здесь подставлялись ВСЕ сезоны пачки (у «Сейлор Мун» —
+    # 70 ГБ вместо сезона).
+    bare_turn = asyncio.run(
+        agent.handle_action("s", "download_all", {"task_id": task.id})
+    )
+    bare_plan = (asyncio.run(agent.store.get_task(task.id)).options or {}).get("plan") or {}
+    print("  кнопка без сезона:", {"файлов": len(bare_plan.get("selected_episodes") or [])})
+    check("«весь сезон» без payload берёт сезон задачи",
+          {item.get("season") for item in bare_plan.get("selected_episodes")} == {2},
+          bare_plan.get("selected_episodes"))
+    check("и не тянет первый сезон",
+          len(bare_plan.get("selected_episodes") or []) == 10,
+          bare_plan.get("selected_episodes"))
+    agent.store.close()
+
+
+def test_pack_asked_before_episodes() -> None:
+    """«Взять эту раздачу» в пачке на 5 сезонов спрашивает сезон, а не серии.
+
+    Настоящий случай: выбрали раздачу «5 сезонов + 3 фильма», нажали «Взять эту
+    раздачу» — и получили список «Серия 1…46» из чужого сезона, где «Серия 1»
+    означала по файлу из каждого сезона, а «Скачать весь сезон» — все 70 ГБ.
+    """
+    print("\n== пачка: сначала сезон, потом серии ==")
+    import asyncio
+
+    tmp = Path(tempfile.mkdtemp(prefix="pack-"))
+    settings = dataclasses.replace(
+        get_settings(), data_dir=tmp, db_path=tmp / "s.sqlite3", torrents_dir=tmp / "t"
+    )
+    agent = Agent(settings)
+    files = [
+        {"name": "01.Sejlor.Mun.(1.sezon.2.serij).1992.X-dfuySejlor.Mun.01.serija.iz.2.avi Sejlor.Mun.02.serija.iz.2.avi", "size": 10},
+        {"name": "Sejlor.Mun.01.serija.iz.2.avi", "size": 100},
+        {"name": "Sejlor.Mun.02.serija.iz.2.avi", "size": 100},
+        {"name": "02.Sejlor.Mun.R.(2.sezon.2.serii).1993.X-dfuySejlor.Mun.R.01.serija.iz.2.avi Sejlor.Mun.R.02.serija.iz.2.avi", "size": 10},
+        {"name": "Sejlor.Mun.R.01.serija.iz.2.avi", "size": 200},
+        {"name": "Sejlor.Mun.R.02.serija.iz.2.avi", "size": 200},
+    ]
+
+    class FakeMCP:
+        async def file_list(self, torrent_id: str) -> dict:
+            return {"success": True, "files": files}
+
+    agent.mcp = FakeMCP()  # type: ignore[assignment]
+    torrent = Torrent(id="242338", title="Красавица-воин Сейлор Мун (1-2 сезоны) / 1992-1993 / DVDRip",
+                      size="66 ГБ", seeds=4, series_title="Красавица-воин Сейлор Мун",
+                      seasons=[1, 2], episodes=[1, 2])
+    task = Task(
+        id="pack2", kind="oneshot", state="awaiting_choice", session_id="s",
+        user_query="Сэйлор Мун", params={"title": "Красавица-воин Сейлор Мун", "type": "series"},
+        candidate=torrent.to_dict(),
+    )
+
+    async def scenario():
+        await agent.store.save_task(task)
+        turn = Turn()
+        await agent._download_with_report(task, torrent, turn)  # noqa: SLF001
+        return turn
+
+    turn = asyncio.run(scenario())
+    message = turn.messages[-1]
+    print("  шаг:", message.text.replace("\n", " | ")[:120])
+    check("сначала спрашивается сезон", "какой сезон?" in message.text, message.text[:200])
+    season_actions = [a for a in message.actions if a.kind == "pick_season"]
+    check("кнопки по сезонам", [a.payload.get("season") for a in season_actions] == [1, 2],
+          [a.label for a in season_actions])
+    check("серии на этом шаге не предлагаются",
+          not any(a.kind == "toggle_episode" for a in message.actions),
+          [a.label for a in message.actions])
+    # Фильмы и спецвыпуски не входят ни в один сезон — до них можно добраться
+    # только кнопкой «Вся раздача».
+    check("есть кнопка «Вся раздача»",
+          any(a.kind == "download_all" and a.payload.get("season") == "all"
+              for a in message.actions), [a.label for a in message.actions])
+
+    second = asyncio.run(agent.handle_action("s", "pick_season", {"task_id": task.id, "season": 2}))
+    labels = [a.label for a in second.messages[-1].actions]
+    print("  серии сезона 2:", labels[:4])
+    check("показаны серии выбранного сезона",
+          [a.label.split(" ·")[0] for a in second.messages[-1].actions
+           if a.kind == "toggle_episode"] == ["Серия 1", "Серия 2"], labels)
+
+    asyncio.run(agent.handle_action("s", "download_all", {"task_id": task.id}))
+    plan = (asyncio.run(agent.store.get_task(task.id)).options or {}).get("plan") or {}
+    print("  «весь сезон»:", plan.get("selected_episodes"), "| файлов:", len(plan.get("wanted") or []))
+    check("«весь сезон» — только выбранный сезон",
+          {item.get("season") for item in plan.get("selected_episodes") or []} == {2},
+          plan.get("selected_episodes"))
+    check("и файлов ровно две серии", len(plan.get("wanted") or []) == 2, plan.get("wanted"))
+
+    # «Вся раздача» — единственный способ взять фильмы и спецвыпуски пачки.
+    asyncio.run(agent.handle_action("s", "download_all", {"task_id": task.id, "season": "all"}))
+    whole = (asyncio.run(agent.store.get_task(task.id)).options or {}).get("plan") or {}
+    print("  вся раздача:", {"файлов": whole.get("total_files"), "wanted": whole.get("wanted")})
+    check("вся раздача ставит всю раздачу (без списка файлов)",
+          whole.get("wanted") is None, whole.get("wanted"))
+    check("и считает все файлы раздачи", whole.get("total_files") == 4, whole.get("total_files"))
     agent.store.close()
 
 
@@ -614,6 +738,7 @@ def main() -> int:
     test_plan_rebuild()
     test_pack_seasons_and_big_lists()
     test_whole_season_limits_files()
+    test_pack_asked_before_episodes()
     test_multi_season_pack()
     print("\n=== ИТОГ ===")
     if FAILS:

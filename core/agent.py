@@ -1370,8 +1370,16 @@ class Agent:
                     }
                     await self.store.save_task(task)
                     await self._start_download(task, turn)
+        elif kind == "download_all" and task and str(payload.get("season") or "").strip().lower() in ("all", "вся", "*"):
+            # Явно попросили всю раздачу: качаем всё, включая фильмы и
+            # спецвыпуски, которых нет в списке серий.
+            await self._confirm_whole_torrent(task, turn)
         elif kind == "download_all" and task:
+            # «Весь сезон» — это сезон, который человек выбрал. Без этой подмены
+            # пачка 1-5 сезонов скачивалась целиком (у «Сейлор Мун» 70 ГБ вместо 12).
             season_filter = payload.get("season")
+            if season_filter in (None, ""):
+                season_filter = (task.params or {}).get("season")
             groups = [
                 group for group in (task.options or {}).get("episode_groups") or []
                 if group.get("episode") is not None
@@ -2581,15 +2589,13 @@ class Agent:
         task.state = "awaiting_choice"
         await self.store.save_task(task)
 
-    async def _expand_group(self, task: Task, title: str, turn: Turn) -> None:
-        """Раскрывает «одно название — несколько раздач» в список этих раздач.
+    async def _group_torrents(self, task: Task, title: str) -> list[Torrent]:
+        """Раздачи, которые стоят за названием (для раскрытия строки-названия).
 
-        На шаге уточнения названия строка — это название, а не раздача: за
-        «Красавица-воин Сейлор Мун — 4 раздачи» стоят четыре разных релиза с
-        разным составом сезонов. «Подробнее» такой строкой открывало карточку
-        первой попавшейся — то есть ничего не говорило о выборе. Поэтому клик
-        раскрывает сами раздачи, а карточка (и «Взять эту раздачу» → серии)
-        открывается уже у конкретной.
+        Строка на шаге уточнения — это название, а не раздача: за «Красавица-воин
+        Сейлор Мун — 4 раздачи» стоят четыре разных релиза с разным составом
+        сезонов. Считаем по тем же правилам, что и счётчик в строке: под условия
+        задачи и без уже скачанных раздач, иначе «4 раздачи» раскрываются в пять.
         """
         wanted = normalize(title)
 
@@ -2603,10 +2609,6 @@ class Agent:
             ]
 
         pool = [Torrent.from_dict(item) for item in (task.options or {}).get("pool", [])]
-        # Счётчик в строке-названии считался по выдаче под условия задачи и без
-        # уже скачанных раздач — раскрываем ровно столько же, иначе «4 раздачи»
-        # раскрываются в пять (в пуле бывают раздачи, найденные по другому
-        # варианту названия).
         downloaded = await self.store.downloaded_ids()
         candidates = filter_candidates(pool, task.params or {}) or pool
         group = [item for item in group_of(candidates) if item.id not in downloaded]
@@ -2614,6 +2616,23 @@ class Agent:
             # Название из подсказки могло прийти не из этой выдачи — тогда
             # показываем всё, что стоит за названием, включая скачанное.
             group = group_of(pool) or [item for item in pool if title_match(title, item)]
+        return group
+
+    def _group_rows(self, task: Task, group: list[Torrent], limit: int = 15) -> list[dict[str, str]]:
+        """Строки раскрытого названия для клиента: id раздачи и готовая подпись."""
+        return [
+            {"torrent_id": row.payload.get("torrent_id", ""), "label": row.label}
+            for row in self._pool_rows(task, group, limit=limit)
+        ]
+
+    async def _expand_group(self, task: Task, title: str, turn: Turn) -> None:
+        """Раскрывает «одно название — несколько раздач» в список этих раздач.
+
+        Клиент раскрывает список сам, не спрашивая сервер (`children` в
+        сообщении), — это действие остаётся для уже отправленных сообщений, где
+        списка внутри строки ещё нет.
+        """
+        group = await self._group_torrents(task, title)
         if not group:
             turn.add(
                 f"Раздачи «{title}» пропали из выдачи — напишите запрос заново.",
@@ -2700,12 +2719,22 @@ class Agent:
             label = str(item.get("title") or "")
             if bits:
                 label = f"{label} — {' · '.join(bits)}"
+            # Раздачи названия кладём в само сообщение: клиент раскрывает их на
+            # месте, сворачивает обратно и не заставляет листать переписку.
+            children = self._group_rows(
+                task, await self._group_torrents(task, str(item["title"]))
+            )
             message.actions.append(
                 Action(
                     id=f"expand-{normalize(str(item.get('title') or ''))[:40]}",
                     label=label[:220],
                     kind="expand_group",
-                    payload={"task_id": task.id, "title": item["title"], "row": True},
+                    payload={
+                        "task_id": task.id,
+                        "title": item["title"],
+                        "row": True,
+                        "children": children,
+                    },
                     group="Подробнее о вариантах",
                 )
             )
@@ -2800,12 +2829,20 @@ class Agent:
         # Раскрывающаяся строка на название, а не карточка первой раздачи:
         # за названием из подсказки может стоять несколько раздач.
         for item in suggestions[:10]:
+            children = self._group_rows(
+                task, await self._group_torrents(task, str(item["title"]))
+            )
             message.actions.append(
                 Action(
                     id=f"expand-{normalize(str(item.get('title') or ''))[:40]}",
                     label=str(item.get("title") or "")[:220],
                     kind="expand_group",
-                    payload={"task_id": task.id, "title": item["title"], "row": True},
+                    payload={
+                        "task_id": task.id,
+                        "title": item["title"],
+                        "row": True,
+                        "children": children,
+                    },
                     group="Подробнее о вариантах",
                 )
             )
@@ -3726,6 +3763,31 @@ class Agent:
         task.state = "awaiting_choice"
         await self.store.save_task(task)
 
+    async def _confirm_whole_torrent(self, task: Task, turn: Turn) -> None:
+        """Карточка «вся раздача целиком» — со всеми файлами, включая фильмы."""
+        entries = self._entries_from_task(task)
+        total = sum(int(entry.size) for entry in entries)
+        plan = {
+            "kind": "all",
+            "wanted": None,
+            "size": total,
+            "total_size": total,
+            "total_files": len(entries),
+            "names": [entry.label for entry in entries[:10]],
+            "episode": None,
+            "season": None,
+            "selected_episodes": [],
+        }
+        task.options = {**(task.options or {}), "plan": plan}
+        await self.store.save_task(task)
+        message = turn.add(
+            self._confirm_card_text(task, Torrent.from_dict(task.candidate or {}), plan),
+            kind="task",
+            task_id=task.id,
+            payload={"task": task.to_dict(), "plan": plan},
+        )
+        message.actions = self._start_actions(task, plan)
+
     async def _ask_pack_season(
         self,
         task: Task,
@@ -3758,6 +3820,16 @@ class Agent:
             lines.append(f"• Раздача: {signals}")
         lines.append("• " + ", ".join(f"{season} — {counts.get(season, 0)}" for season in pack_seasons))
         lines.append("• Затем отметьте серии этого сезона.")
+        # В пачке кроме серий бывают фильмы и спецвыпуски: они не входят ни в
+        # один сезон, и без отдельной кнопки до них не добраться.
+        plan = (task.options or {}).get("plan") or {}
+        total = int(plan.get("total_size") or 0)
+        episode_files = sum(len(group.get("indexes") or []) for group in groups)
+        if total and plan.get("total_files") and int(plan["total_files"]) > episode_files:
+            lines.append(
+                f"• Кроме серий в раздаче есть другие файлы (фильмы, спецвыпуски) — "
+                f"вся раздача целиком: {human_bytes(total)}."
+            )
         message = turn.add(
             "\n".join(lines),
             kind="tickets",
@@ -3775,6 +3847,19 @@ class Agent:
                 )
             )
         message.actions.extend(self._torrent_actions(task))
+        plan_total = int(((task.options or {}).get("plan") or {}).get("total_size") or 0)
+        whole_label = "Вся раздача"
+        if plan_total:
+            whole_label += f" · {human_bytes(plan_total)}"
+        message.actions.append(
+            Action(
+                id="whole-torrent",
+                label=whole_label[:60],
+                kind="download_all",
+                payload={"task_id": task.id, "season": "all"},
+                group="Действие",
+            )
+        )
         message.actions.append(
             Action(
                 id="cancel-season",
@@ -4404,6 +4489,22 @@ class Agent:
         }
 
         if plan["kind"] == "choose":
+            # В пачке несколько сезонов — сначала сезон. Иначе «Серия 1» без
+            # сезона означает по файлу из каждого сезона (у «Сейлор Мун» это
+            # 200 серий в одном списке), а «Скачать весь сезон» — все 70 ГБ.
+            pack_seasons = sorted(
+                {
+                    int(group["season"])
+                    for group in plan.get("episodes") or []
+                    if group.get("season") is not None
+                }
+            )
+            if len(pack_seasons) > 1 and not task.params.get("season"):
+                task.options = {**(task.options or {}), "plan": plan}
+                await self._ask_pack_season(
+                    task, torrent, plan.get("episodes") or [], path, turn, pack_seasons
+                )
+                return
             task.state = "awaiting_choice"
             await self.store.save_task(task)
             message = turn.add(

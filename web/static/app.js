@@ -216,6 +216,39 @@
   // Кнопки сообщения: сгруппированы по смыслу («Качество», «Озвучка», «Серии»).
   // Кнопки с multi включаются/выключаются без похода на сервер, а выбранное
   // уходит одним действием «Скачать выбранные (N)».
+  // Кликабельная строка-вариант: div, а не <button> — у браузеров своя
+  // отрисовка кнопок, и в этой теме она превращалась в белую системную кнопку.
+  // Возвращаем строку, а обработчик вешаем снаружи: у раскрывающейся строки он
+  // свой (свернуть/развернуть), у раздачи — открыть карточку.
+  function variantRow(label, onOpen, hint) {
+    const line = document.createElement("div");
+    line.className = "variant";
+    line.setAttribute("role", "button");
+    line.tabIndex = 0;
+    if (hint) line.title = hint;
+    const caret = document.createElement("span");
+    caret.className = "variant__caret";
+    caret.textContent = "›";
+    const text = document.createElement("span");
+    text.className = "variant__text";
+    text.textContent = label;
+    line.append(caret, text);
+    if (onOpen) {
+      const open = () => {
+        if (state.busy) return;
+        onOpen();
+      };
+      line.addEventListener("click", open);
+      line.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          open();
+        }
+      });
+    }
+    return line;
+  }
+
   function renderActions(box, actions) {
     if (!box || !actions.length) return;
     box.innerHTML = "";
@@ -269,64 +302,64 @@
         // Вариант раздачи — кликабельная строка, а не кнопка: нажал — открылась
         // карточка раздачи (жанр, сиды, описание), ссылка на трекер уже в ней.
         if (action.kind === "details" && action.payload && action.payload.row) {
-          // именно div, а не <button>: у браузеров своя отрисовка кнопок, и в
-          // некоторых тема превращалась в белую системную кнопку.
-          const line = document.createElement("div");
-          line.className = "variant";
-          line.setAttribute("role", "button");
-          line.tabIndex = 0;
-          line.title = "Открыть карточку раздачи";
-          const caret = document.createElement("span");
-          caret.className = "variant__caret";
-          caret.textContent = "›";
-          const text = document.createElement("span");
-          text.className = "variant__text";
-          text.textContent = action.label;
-          line.append(caret, text);
-          const open = () => {
-            if (state.busy) return;
+          row.appendChild(variantRow(action.label, () => {
             showTorrentDetails(
-              action.payload.torrent_id, line, action.payload.task_id || ""
+              action.payload.torrent_id, null, action.payload.task_id || ""
             );
-          };
-          line.addEventListener("click", open);
-          line.addEventListener("keydown", (event) => {
-            if (event.key === "Enter" || event.key === " ") {
-              event.preventDefault();
-              open();
-            }
-          });
-          row.appendChild(line);
+          }, "Открыть карточку раздачи"));
           continue;
         }
 
-        // Раскрытие названия: за ним стоят несколько раздач, поэтому клик не
-        // открывает карточку, а показывает сами раздачи (тоже строками).
+        // Название раскрывается в свои раздачи прямо здесь, в этом же
+        // сообщении: если вариант не подошёл, не надо возвращаться назад по
+        // переписке — список просто сворачивается обратно.
         if (action.kind === "expand_group" && action.payload && action.payload.row) {
-          const line = document.createElement("div");
-          line.className = "variant";
-          line.setAttribute("role", "button");
-          line.tabIndex = 0;
-          line.title = "Показать раздачи этого названия";
-          const caret = document.createElement("span");
-          caret.className = "variant__caret";
-          caret.textContent = "›";
-          const text = document.createElement("span");
-          text.className = "variant__text";
-          text.textContent = action.label;
-          line.append(caret, text);
-          const open = () => {
-            if (state.busy) return;
-            runAction(action, line);
-          };
-          line.addEventListener("click", open);
-          line.addEventListener("keydown", (event) => {
-            if (event.key === "Enter" || event.key === " ") {
-              event.preventDefault();
-              open();
+          const children = Array.isArray(action.payload.children) ? action.payload.children : [];
+          const line = variantRow(action.label, null, "Показать раздачи этого названия");
+          const caret = line.querySelector(".variant__caret");
+          const box = document.createElement("div");
+          box.className = "variant-group";
+          box.append(line);
+          if (children.length) {
+            const list = document.createElement("div");
+            list.className = "variant-children";
+            list.hidden = true;
+            for (const child of children) {
+              const sub = variantRow(child.label || "", () => {
+                showTorrentDetails(
+                  child.torrent_id, null, action.payload.task_id || ""
+                );
+              }, "Открыть карточку раздачи");
+              sub.classList.add("variant--child");
+              list.appendChild(sub);
             }
-          });
-          row.appendChild(line);
+            box.appendChild(list);
+            const toggle = () => {
+              list.hidden = !list.hidden;
+              if (caret) caret.textContent = list.hidden ? "›" : "⌄";
+            };
+            line.addEventListener("click", toggle);
+            line.addEventListener("keydown", (event) => {
+              if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault();
+                toggle();
+              }
+            });
+          } else {
+            // Старое сообщение: раздачи придут отдельным ответом агента.
+            const open = () => {
+              if (state.busy) return;
+              runAction(action, line);
+            };
+            line.addEventListener("click", open);
+            line.addEventListener("keydown", (event) => {
+              if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault();
+                open();
+              }
+            });
+          }
+          row.appendChild(box);
           continue;
         }
 

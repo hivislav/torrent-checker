@@ -89,8 +89,11 @@ _NOT_EPISODE = {264, 265, 480, 576, 720, 1080, 1440, 2160, 4320}
 # Номер серии в начале имени файла: так оформляют релизы на трекере
 # («01. Звёзды в джунглях.S03.2026.WEB-DLRip.avi», «02 - Название.mkv»).
 _LEADING_EPISODE = re.compile(r"^(\d{1,2})\s*[._-]\s*(?!\d)")
-# Только сезон, без серии: «S03», «3 сезон».
+# Только сезон, без серии: «S03», «3 сезон», «1.sezon» (латиницей так пишут
+# релизы пачками: «01.Sejlor.Mun.(1.sezon.46.serij)»).
 _SEASON_ONLY = (
+    re.compile(r"(?i)(\d{1,2})\s*[-_ .]?\s*(?:sezon|season)"),
+    re.compile(r"(?i)\b(?:sezon|season)[\s._-]*(\d{1,2})\b"),
     re.compile(r"(?i)\bs(\d{1,2})\b(?!\s*[._-]?\s*e)"),
     re.compile(r"(?i)(\d{1,2})\s*[-_]?\s*сезон"),
 )
@@ -148,17 +151,66 @@ def detect_episode(name: str) -> tuple[int | None, int | None]:
     return season, None
 
 
+# Сколько раз в строке встречается имя файла (расширение видео/субтитров).
+_ONE_FILE = re.compile(r"\.(" + "|".join(
+    ext.lstrip(".") for ext in VIDEO_EXT + SIDE_EXT
+) + r")\b", re.I)
+# Год в имени релиза: отличает «03.Название.1993.…» (пункт релиза) от «01. Серия».
+_YEAR_IN_NAME = re.compile(r"(?:19|20)\d{2}")
+# Номер пункта релиза: «01.», «07.» — не серия и не сезон.
+_RELEASE_INDEX = re.compile(r"^\d{1,2}\s*[._]\s*")
+
+
+def _is_folder_row(name: str) -> bool:
+    """Строка папки из листинга трекера, а не файл.
+
+    Страница раздачи отдаёт состав папки одной строкой: имя папки склеено с
+    именами всех файлов внутри («01.Sejlor.Mun.(1.sezon.46.serij)… 01.serija.iz.46.avi
+    02.serija.iz.46.avi …»). Такая строка — не файл: её вес повторяет вес
+    первого файла, а в имени зато есть сезон, которого нет в именах серий.
+    """
+    return len(_ONE_FILE.findall(name)) > 1
+
+
 def parse_files(files: Iterable[dict]) -> list[FileEntry]:
-    """Превращает файлы раздачи (из .torrent) в записи с сезонами и сериями."""
+    """Превращает файлы раздачи (из .torrent) в записи с сезонами и сериями.
+
+    Листинг трекера приходит «папками»: одна строка — папка сезона со всеми
+    файлами внутри, следующие — сами файлы. В именах файлов сезона нет
+    («Sejlor.Mun.01.serija.iz.46.avi»), поэтому сезон берём из строки папки и
+    передаём файлам под ней. Без этого четыре сезона схлопывались в один
+    список «Серия 1…46», и «серия 1» означала по файлу из каждого сезона.
+    """
     entries: list[FileEntry] = []
+    folder_season: int | None = None
     for item in files:
         name = str(item.get("name") or "")
-        season, episode = detect_episode(name)
+        size = int(item.get("size") or 0)
+        index = int(item.get("index") or 0)
+        # Пункт релиза: «01.Название.1992…», «07.Название.(4.sezon.39.serij)…».
+        # Номер в начале — порядок на диске, а не серия.
+        release_item = bool(_RELEASE_INDEX.match(name) and _YEAR_IN_NAME.search(name))
+        head = name[: _ONE_FILE.search(name).start()] if _ONE_FILE.search(name) else name
+        if _is_folder_row(name) or (release_item and _ONE_FILE.search(name) is None):
+            # Строка папки: файлом не считается, но задаёт сезон своим файлам.
+            folder_season = _detect_season(head)
+            continue
+        if release_item:
+            # Новый пункт релиза обрывает контекст предыдущей папки: фильм после
+            # сезона — не «серия последнего сезона».
+            folder_season = _detect_season(head)
+        if release_item and _detect_season(name) is None:
+            # Фильм или спецвыпуск: «03.Название.1993…» — не серия номер 3.
+            season, episode = detect_episode(_RELEASE_INDEX.sub("", name, count=1))
+        else:
+            season, episode = detect_episode(name)
+        if season is None and folder_season is not None:
+            season = folder_season
         entries.append(
             FileEntry(
-                index=int(item.get("index") or 0),
+                index=index,
                 name=name,
-                size=int(item.get("size") or 0),
+                size=size,
                 season=season,
                 episode=episode,
             )

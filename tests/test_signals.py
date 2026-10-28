@@ -354,7 +354,19 @@ def test_expand_group_lists_releases() -> None:
     ))
     row = [a for a in turn.messages[-1].actions if a.kind == "expand_group"][0]
     check("строка-название раскрывается, а не открывает карточку",
-          row.kind == "expand_group" and row.payload.get("row") is True, row.payload)
+          row.kind == "expand_group" and row.payload.get("row") is True,
+          {key: row.payload.get(key) for key in ("title", "row")})
+    # Список раздач лежит в самом сообщении: раскрытие на месте, без нового
+    # сообщения и без возврата по переписке.
+    children = row.payload.get("children") or []
+    check("раздачи названия пришли вместе со строкой", len(children) == 2,
+          [child.get("label", "")[:40] for child in children])
+    check("в строках-детях только раздачи этой группы",
+          all("Кристалл" not in child["label"] for child in children),
+          [child["label"][:40] for child in children])
+    check("строка-ребёнок знает свою раздачу",
+          {child["torrent_id"] for child in children} == {"1", "2"},
+          [child["torrent_id"] for child in children])
 
     expanded = asyncio.run(
         agent.handle_action("s", "expand_group", {"task_id": task.id, "title": row.payload["title"]})
