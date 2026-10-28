@@ -159,7 +159,10 @@ kinozal.me, скачивает торрент-файлы и ставит их в
 
 # Одна и та же подсказка на шагах выбора: про кнопку «Подробнее» легко не
 # догадаться, а читать про фильм нужно до выбора качества, а не после.
-DETAILS_HINT = "Кнопка «Подробнее» покажет жанр, описание и актёров."
+DETAILS_HINT = (
+    "Нажмите на вариант — откроется карточка раздачи: жанр, описание, актёры, сиды. "
+    "Это только просмотр: скачивание начнётся отдельной кнопкой."
+)
 
 
 PARAM_TITLES = {
@@ -2506,7 +2509,49 @@ class Agent:
                 fresh = filter_candidates(by_title, task.params) or fresh
 
         best_list = rank(fresh, task.params)
+        if len(best_list) > 1:
+            # Несколько раздач подходят под условия — сначала выбор раздачи.
+            # Раньше агент молча брал лучшую и показывал её серии: у «Сейлор
+            # Мун» это был первый сезон первой попавшейся раздачи.
+            await self._present_pool_choice(task, best_list, turn)
+            return
         await self._present_candidate(task, best_list, turn)
+
+    async def _present_pool_choice(
+        self, task: Task, pool: list[Torrent], turn: Turn
+    ) -> None:
+        """Подходит несколько раздач: человек выбирает раздачу, а не серию вслепую.
+
+        Каждая строка открывает карточку раздачи, скачивание — только кнопкой
+        «Взять эту раздачу» внутри неё. Так выбор виден целиком: у «Сейлор Мун»
+        четыре раздачи с разным составом сезонов, и первая из них — не ответ.
+        """
+        lines = [
+            f"По запросу «{task.title}» подходит "
+            f"{_plural(len(pool), 'раздача', 'раздачи', 'раздач')} — какую берём?",
+            "",
+        ]
+        lines.append(DETAILS_HINT)
+        lines.append("Порядок — по соответствию условиям и живучести раздачи.")
+        message = turn.add(
+            "\n".join(lines),
+            kind="tickets",
+            task_id=task.id,
+            payload={"task": task.to_dict()},
+        )
+        message.actions = self._pool_rows(task, pool, limit=15)
+        message.actions.append(
+            Action(
+                id="cancel-pool",
+                label="Отмена",
+                kind="cancel",
+                payload={"task_id": task.id},
+                style="danger",
+            )
+        )
+        task.options = {**(task.options or {}), "pool": [t.to_dict() for t in pool]}
+        task.state = "awaiting_choice"
+        await self.store.save_task(task)
 
     async def _ask_title(
         self,
@@ -4856,7 +4901,7 @@ class Agent:
             label=text[:140],
             kind="details",
             payload={"task_id": task_id, "torrent_id": torrent_id, "row": True},
-            group="Варианты",
+            group="Подробнее о вариантах",
         )
 
     def _best_torrent(self, torrents: list[Torrent], params: dict[str, Any] | None = None) -> Torrent | None:

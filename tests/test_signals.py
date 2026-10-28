@@ -180,6 +180,48 @@ def test_actions() -> None:
     agent.store.close()
 
 
+def test_pool_choice_before_episodes() -> None:
+    """Несколько раздач подходят — сначала выбираем раздачу, а не серии.
+
+    Настоящий случай: выбрали «Красавица-воин Сейлор Мун», и агент сразу
+    открыл серии первого сезона первой попавшейся раздачи, хотя подходящих было
+    четыре — с разным составом сезонов.
+    """
+    print("\n== несколько раздач: сначала выбор раздачи ==")
+    agent = make_agent()
+    rows = [
+        ("1", "Красавица-воин Сейлор Мун (1 сезон: 1-46 серии из 46) / 1992 / ДБ / DVDRip (480p)", "80 ГБ", 2),
+        ("2", "Красавица-воин Сейлор Мун (2 сезон: 1-43 серии из 43) / 1993 / ДБ / DVDRip (480p)", "70 ГБ", 5),
+        ("3", "Красавица-воин Сейлор Мун (1-5 сезоны: 1-200 серии из 200) / 1992-1997 / ДБ / WEB-DL (1080p)", "300 ГБ", 12),
+    ]
+    pool = [
+        parse_torrent({"id": i, "title": t, "size": size, "seeds": seeds})
+        for i, t, size, seeds in rows
+    ]
+    task = make_task(
+        pool[0],
+        params={"title": "Красавица-воин Сейлор Мун", "quality": "480p", "type": "series"},
+    )
+    task.options = {"pool": [t.to_dict() for t in pool]}
+    turn = Turn()
+    asyncio.run(agent._selection_step(task, turn))  # noqa: SLF001
+    message = turn.messages[-1]
+    print("  текст:", message.text.replace("\n", " | ")[:150])
+    check("спрашиваем, какую раздачу брать", "какую берём?" in message.text, message.text[:120])
+    check("серии не открываются раньше выбора",
+          not any(action.kind == "toggle_episode" for action in message.actions),
+          [a.kind for a in message.actions])
+    labels = [action.label for action in message.actions]
+    check("в списке обе подходящие раздачи",
+          sum(1 for label in labels if label[:2] in ("1.", "2.")) == 2, labels)
+    check("подпись группы говорит, что это просмотр",
+          all("Подробнее о вариантах" in (action.group or "") for action in message.actions
+              if action.kind == "details"), [a.group for a in message.actions])
+    check("в подсказке сказано, что это не скачивание",
+          "только просмотр" in message.text, message.text[:400])
+    agent.store.close()
+
+
 def test_frozen_filters_visible() -> None:
     """Условия задачи видны, и лишний фильтр можно снять одним нажатием.
 
@@ -484,6 +526,7 @@ def main() -> int:
     test_actions()
     test_pool_rows()
     test_frozen_filters_visible()
+    test_pool_choice_before_episodes()
     test_details_everywhere()
     test_link_flow()
     test_checks_journal()
