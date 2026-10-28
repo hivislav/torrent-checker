@@ -2487,34 +2487,27 @@ class Agent:
             await self._ask_title(task, options, len(fresh), turn, weak=False)
             return
 
-        # Не хватает параметров — предлагаем только то, что реально есть
-        # с учётом уже заданных условий.
-        missing: list[str] = []
-        if not params.get("quality"):
-            missing.append("quality")
-        if not params.get("voice"):
-            missing.append("voice")
-        for dimension in missing:
-            options, options_pool = self._options_under(by_title, params, dimension)
-            values = options["qualities"] if dimension == "quality" else options["voices"]
-            if len(values) > 1:
-                await self._ask_dimension(
-                    task, turn, dimension, values, len(fresh), found=fresh
-                )
-                return
-            if len(values) == 1:
-                # Один вариант — спрашивать не о чем, фиксируем автоматически.
-                task.params[dimension] = values[0]
-                await self.store.save_task(task)
-                fresh = filter_candidates(by_title, task.params) or fresh
-
+        # Несколько раздач подходят под запрос — сначала выбираем раздачу.
+        # Раньше агент молча брал лучшую и показывал её серии: у «Сейлор Мун»
+        # это был первый сезон первой попавшейся раздачи из пяти подходящих.
+        # Качество и озвучку здесь тоже не подставляем автоматически: «1080p» и
+        # «ДБ (CTC)», подобранные из выдачи, оставляли ровно одну раздачу — и
+        # выбор пропадал, хотя человек его ждал.
         best_list = rank(fresh, task.params)
         if len(best_list) > 1:
-            # Несколько раздач подходят под условия — сначала выбор раздачи.
-            # Раньше агент молча брал лучшую и показывал её серии: у «Сейлор
-            # Мун» это был первый сезон первой попавшейся раздачи.
             await self._present_pool_choice(task, best_list, turn)
             return
+
+        # Раздача одна — спрашивать не о чем: фиксируем её качество и озвучку,
+        # чтобы дальнейшие уточнения не возвращались к вопросам об отсутствующем.
+        for dimension in ("quality", "voice"):
+            if task.params.get(dimension):
+                continue
+            options, _ = self._options_under(by_title, task.params, dimension)
+            values = options["qualities"] if dimension == "quality" else options["voices"]
+            if len(values) == 1:
+                task.params[dimension] = values[0]
+                await self.store.save_task(task)
         await self._present_candidate(task, best_list, turn)
 
     async def _present_pool_choice(
@@ -2531,8 +2524,20 @@ class Agent:
             f"{_plural(len(pool), 'раздача', 'раздачи', 'раздач')} — какую берём?",
             "",
         ]
+        # Раздачи одного сериала различаются составом сезонов больше, чем чем-либо
+        # ещё: «1 сезон: 1-46 серии», «1-5 сезоны: 1-200 серий». Без этого
+        # список выглядит как повторы одного и того же.
+        seasons = sorted({int(s) for item in pool for s in (item.seasons or []) if s is not None})
+        if len(seasons) > 1:
+            span = f"{seasons[0]}–{seasons[-1]}" if len(seasons) > 2 else ", ".join(map(str, seasons))
+            lines.append(f"Сезоны в выдаче: {span} — у раздач разный состав сезонов и серий.")
+            lines.append("")
         lines.append(DETAILS_HINT)
-        lines.append("Порядок — по соответствию условиям и живучести раздачи.")
+        shown = min(len(pool), 15)
+        if len(pool) > shown:
+            lines.append(f"Всего подходит {len(pool)} — ниже первые {shown}, от лучшей к худшей.")
+        else:
+            lines.append("Порядок — по соответствию условиям и живучести раздачи.")
         message = turn.add(
             "\n".join(lines),
             kind="tickets",
@@ -2874,7 +2879,14 @@ class Agent:
         count: int,
         found: list[Torrent] | None = None,
     ) -> None:
-        """Спрашивает качество или озвучку — отдельной группой кнопок."""
+        """Спрашивает качество или озвучку — отдельной группой кнопок.
+
+        Основной путь выбора теперь другой: в выдаче несколько раздач — значит
+        показываем их списком (`_present_pool_choice`), а не спрашиваем качество
+        до него. Этот вопрос остался для старых сообщений в чате (кнопки
+        «1080p/720p» уже отправлены и работают) и как точный сужатель, когда
+        человек сам называет качество.
+        """
         title = "Какое качество берём?" if dimension == "quality" else "Какую озвучку берём?"
         shown = ", ".join(
             self._quality_label(v) if dimension == "quality" else v for v in values[:8]
@@ -4517,30 +4529,39 @@ class Agent:
         if not pool:
             return []
         ordered = rank(pool, task.params or {})
+        # Мёртвые раздачи — в конец: «без сидов» первой строкой читается как
+        # совет её и брать (так и было: свежая, но мёртвая раздача обгоняла
+        # живую только за счёт даты заливки).
+        ordered = sorted(ordered, key=lambda item: 0 if (item.seeds or 0) > 0 else 1)
+        # Если все строки — один сериал, название в каждой строке повторяется и
+        # съедает место: «Красавица-воин Сейлор Мун (1 сезон: 1-46 серии) …».
+        # Тогда показываем хвост названия — сезон, год, озвучку и качество.
+        series_names = {
+            normalize((item.series_title or "").strip()) for item in ordered
+        } - {""}
+        common_series = (ordered[0].series_title or "").strip() if len(series_names) == 1 else ""
         rows: list[Action] = []
         for index, torrent in enumerate(ordered[:limit], start=1):
-            # Подпись: качество/серия без веса (вес есть в сигналах) — иначе
-            # «8,47 ГБ» повторяется дважды.
-            hint_bits: list[str] = []
-            episodes = sorted({int(item) for item in (torrent.episodes or [])})
-            if len(episodes) > 1:
-                hint_bits.append(
-                    f"сезон {torrent.season}, серии {episodes[0]}–{episodes[-1]}"
-                    if torrent.season else f"серии {episodes[0]}–{episodes[-1]}"
-                )
-            elif episodes:
-                hint_bits.append(f"серия {episodes[0]}")
-            if torrent.year:
-                hint_bits.append(str(torrent.year))
-            if torrent.quality:
-                hint_bits.append(torrent.quality)
-            signals = self._signals_line(torrent)
-            if signals:
-                hint_bits.append(signals)
-            hint = " · ".join(hint_bits)
+            title = (torrent.title or "").strip()
+            shown = title
+            if common_series and title.lower().startswith(common_series.lower()):
+                shown = title[len(common_series):].strip(" /-—") or title
+            # В подписи — только то, чего нет в названии: у раздач kinozal в
+            # строке уже есть сезон/серии, год, качество и озвучка. Дублировать
+            # их значит обрезать самое важное — вес и сиды.
+            hint = self._signals_line(torrent)
+            # Название режем отдельно, чтобы вес и сиды не пропали из-за
+            # длинного хвоста вроде «(5 сезонов из 5 + 3 фильма из 3+5 спэшлов)».
+            label = f"{index}. {shown[:170]}"
+            if hint:
+                label = f"{label} — {hint}"
             rows.append(
-                self._variant_row(
-                    torrent.id, f"{index}. {torrent.title}", hint=hint, task_id=task.id
+                Action(
+                    id=f"details-{torrent.id}",
+                    label=label[:260],
+                    kind="details",
+                    payload={"task_id": task.id, "torrent_id": torrent.id, "row": True},
+                    group="Подробнее о вариантах",
                 )
             )
         return rows

@@ -222,6 +222,52 @@ def test_pool_choice_before_episodes() -> None:
     agent.store.close()
 
 
+def test_pool_choice_without_quality() -> None:
+    """Без заданного качества выбор раздачи не должен схлопываться в одну.
+
+    Настоящий случай: «Сэйлор Мун» → нажали «Это „Красавица-воин Сейлор Мун“»,
+    и агент сразу открыл серии первой раздачи. Причина: на шаге выбора он сам
+    подставил `quality=1080p` и `voice=ДБ (CTC)` из выдачи, после чего под
+    условия подходила ровно одна раздача — и вопроса «какую берём?» не было.
+    """
+    print("\n== выбор раздачи без заданного качества ==")
+    agent = make_agent()
+    rows = [
+        ("1", "Красавица-воин Сейлор Мун (1 сезон: 1-46 серии из 46) / 1992 / ДБ (CTC) / BDRip (1080p)", 80, 2),
+        ("2", "Красавица-воин Сейлор Мун (1 сезон: 1-46 серии из 46) / 1992 / ДБ / DVDRip (480p)", 12, 6),
+        ("3", "Красавица-воин Сейлор Мун (2 сезон: 1-43 серии из 43) / 1993 / ДБ / DVDRip (480p)", 11, 4),
+        ("4", "Красавица-воин Сейлор Мун (1-5 сезоны: 1-200 серии из 200) / 1992-1997 / ЛМ / WEB-DL (1080p)", 300, 9),
+        ("5", "Красавица-воин Сейлор Мун (3 сезон: 1-38 серии из 38) / 1994 / СТ / HDTV (720p)", 20, 3),
+    ]
+    pool = [
+        parse_torrent({"id": i, "title": t, "size": f"{size} ГБ", "seeds": seeds})
+        for i, t, size, seeds in rows
+    ]
+    task = make_task(
+        pool[0],
+        params={"title": "Красавица-воин Сейлор Мун", "type": "series"},
+    )
+    task.options = {"pool": [t.to_dict() for t in pool]}
+    turn = Turn()
+    asyncio.run(agent._selection_step(task, turn))  # noqa: SLF001
+    message = turn.messages[-1]
+    print("  текст:", message.text.replace("\n", " | ")[:200])
+    check("качество не подставлено само", not task.params.get("quality"), task.params)
+    check("озвучка не подставлена сама", not task.params.get("voice"), task.params)
+    check("спрашиваем, какую раздачу брать", "какую берём?" in message.text, message.text[:150])
+    check("серии не открываются раньше выбора",
+          not any(action.kind == "toggle_episode" for action in message.actions),
+          [a.kind for a in message.actions])
+    rows = [action for action in message.actions if action.kind == "details"]
+    check("в списке все пять раздач", len(rows) == 5, [action.label for action in rows])
+    check("в подписях видно качество и сиды",
+          any("1080p" in action.label and "сид" in action.label for action in rows),
+          [action.label for action in rows][:3])
+    check("сказано про разный состав сезонов",
+          "разный состав сезонов" in message.text, message.text[:300])
+    agent.store.close()
+
+
 def test_frozen_filters_visible() -> None:
     """Условия задачи видны, и лишний фильтр можно снять одним нажатием.
 
@@ -299,6 +345,9 @@ def test_pool_rows() -> None:
     check("строка знает задачу — из карточки можно взять раздачу",
           all(row.payload.get("task_id") == task.id for row in rows),
           rows[0].payload)
+    wide = agent._pool_rows(task, pool, limit=25)  # noqa: SLF001
+    check("раздача без сидов — последняя, а не первая",
+          wide[-1].payload.get("torrent_id") == "100", wide[-1].payload)
     agent.store.close()
 
 
@@ -527,6 +576,7 @@ def main() -> int:
     test_pool_rows()
     test_frozen_filters_visible()
     test_pool_choice_before_episodes()
+    test_pool_choice_without_quality()
     test_details_everywhere()
     test_link_flow()
     test_checks_journal()
