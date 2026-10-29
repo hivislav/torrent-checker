@@ -1201,6 +1201,50 @@ async def test_first_finding_is_not_news() -> None:
     agent.store.close()
 
 
+async def test_movie_task_waits_no_episodes() -> None:
+    """Задача про фильм не ждёт серий, даже если серии есть в выдаче.
+
+    Настоящий случай: у задачи «Диггер» (фильм) в параметрах оказались серии
+    из чужого сериала в выдаче, и карточка писала «жду серию 7».
+    """
+    print("\n== фильмовая задача не ждёт серий ==")
+    agent, mcp, transmission = build_agent()
+    movie_row = {
+        "id": "300", "title": "Диггер / Digger / 2026 / ДБ / WEB-DL (1080p)",
+        "size": "5 ГБ", "seeds": 20, "peers": 1, "comments": 2,
+        "uploadDate": "20.10.2026 в 10:00", "uploader": "x", "category": "1",
+    }
+    series_row = {
+        "id": "301", "title": "Диггеры (1 сезон: 1-6 серии из 6) / Diggers / 2026 / РУ / WEB-DL (1080p)",
+        "size": "4 ГБ", "seeds": 9, "peers": 0, "comments": 0,
+        "uploadDate": "21.10.2026 в 10:00", "uploader": "x", "category": "46",
+    }
+    mcp.custom_rows = [movie_row, series_row]
+    from core.models import Task
+
+    task = Task(
+        id="movie-periodic", kind="periodic", state="monitoring", session_id="checks",
+        user_query="Диггер", interval_minutes=1440, auto_download=False,
+        params={"title": "Диггер", "type": "movie", "seen_ids": [],
+                "baseline_at": "2026-10-28T07:00:00+00:00"},
+    )
+    await agent.store.save_task(task)
+    await agent.check_task(task)
+    stored = await agent.store.get_task(task.id)
+    print("  params:", {k: v for k, v in stored.params.items()
+                        if k in ("baseline_episodes", "next_episode")})
+    check("серии в базовой линии не записались",
+          not (stored.params or {}).get("baseline_episodes"),
+          (stored.params or {}).get("baseline_episodes"))
+    check("ждать серию фильм не начал",
+          not (stored.params or {}).get("next_episode"),
+          (stored.params or {}).get("next_episode"))
+    watch = agent._watch_text(stored)  # noqa: SLF001
+    print("  строка задачи:", watch)
+    check("в строке задачи нет «жду серию»", "жду серию" not in watch, watch)
+    agent.store.close()
+
+
 async def test_check_searches_aliases() -> None:
     """Проверка периодической задачи ищет так же, как разовый поиск.
 
@@ -1305,6 +1349,7 @@ async def main() -> int:
     await test_cancel_only_in_panel()
     await test_default_interval()
     await test_first_finding_is_not_news()
+    await test_movie_task_waits_no_episodes()
     await test_check_searches_aliases()
     test_name_matching()
 

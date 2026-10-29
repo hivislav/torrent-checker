@@ -4452,10 +4452,19 @@ class Agent:
         # на момент создания ничего не нашлось (транслит вроде «Сэйлор Мун»),
         # при первой же находке объявляла бы новинкой всё, что лежит на трекере.
         task.params["baseline_at"] = now_iso()
-        by_season = episodes_by_season(torrents)
+        # Серии — только у сериала. Иначе фильмовая задача («Диггер») получала
+        # baseline из случайного сериала в выдаче и начинала «ждать серию 7».
+        best = rank(torrents, task.params) if torrents else []
+        is_series = str(task.params.get("type") or "").lower() == "series" or bool(
+            best and (best[0].seasons or best[0].episodes)
+        )
+        by_season = episodes_by_season(torrents) if is_series else {}
         if by_season:
             # Ключи JSON всегда строки — приводим к ним явно.
             task.params["baseline_episodes"] = {str(k): v for k, v in by_season.items()}
+        elif str(task.params.get("type") or "").lower() == "movie":
+            task.params.pop("baseline_episodes", None)
+            task.params.pop("next_episode", None)
         if stamps:
             task.params["baseline_ts"] = max(stamps)
 
@@ -6598,7 +6607,13 @@ class Agent:
                 # Прогресса под рукой нет: не откатываем номер назад к «начиная
                 # с N», иначе задача ждёт серию, которая уже лежит на диске.
                 next_episode = max(next_episode, int(params.get("next_episode") or 0))
-            task.params["next_episode"] = next_episode
+            if str(params.get("type") or "").lower() == "movie":
+                # Фильм не ждёт серий: даже если серии затесались в параметры
+                # (их мог записать прошлый разбор), задачу они не касаются.
+                next_episode = 0
+                task.params.pop("next_episode", None)
+            else:
+                task.params["next_episode"] = next_episode
 
             fresh = find_new(
                 matched,
@@ -6725,7 +6740,7 @@ class Agent:
             bits.append(str(params["voice"]))
         if params.get("season"):
             bits.append(f"сезон {params['season']}")
-        if task.kind == "periodic":
+        if task.kind == "periodic" and str(params.get("type") or "").lower() != "movie":
             episodes = params.get("next_episode")
             if params.get("episode_from") and not episodes:
                 episodes = params.get("episode_from")
