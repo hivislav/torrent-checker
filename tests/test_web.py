@@ -339,6 +339,40 @@ def run() -> int:
         page.wait_for_timeout(300)
         check("окно закрывается", page.locator("#debug-modal[hidden]").count() == 1)
 
+        print("\n== киножурнал ==")
+        # Журнал живёт на сервере: список читается из базы, а не из памяти
+        # страницы. Проверяем и маршрут, и отрисовку.
+        # Тот же лимит, что у клиента: иначе число записей в ответе и на экране
+        # не совпадёт, и проверка будет ругаться на саму себя.
+        response = page.request.get(BASE + "/api/notifications?limit=100")
+        check("журнал отдаётся API", response.status == 200, response.status)
+        payload = response.json() if response.ok else {}
+        items = payload.get("notifications") or []
+        check("журнал отвечает списком", isinstance(items, list), type(items).__name__)
+        page.click("#bell")
+        page.wait_for_timeout(600)
+        tray = page.locator("#notification-tray")
+        check("киножурнал открылся", tray.is_visible())
+        rendered = page.locator("#notification-list .notification-item").count()
+        print("  записей в журнале:", len(items), "| отрисовано:", rendered)
+        if items:
+            check("записи журнала отрисованы", rendered == len(items), (rendered, len(items)))
+            check("у записи видно дату и время",
+                  bool(page.locator(".notification-item__time").first.inner_text().strip()),
+                  page.locator(".notification-item__time").first.inner_text())
+        else:
+            check("пустой журнал объясняет себя",
+                  page.locator(".notification-empty").count() == 1)
+        page.screenshot(path=str(SHOTS / "journal.png"), animations="disabled")
+        page.click("#bell")
+        page.wait_for_timeout(300)
+
+        print("\n== дата у сообщений ==")
+        stamps = page.locator(".msg--agent .msg__time").all_inner_texts()
+        print("  метки времени:", stamps[:3])
+        check("у сообщений есть дата, а не только время",
+              bool(stamps) and all("," in stamp for stamp in stamps if stamp), stamps[:3])
+
         print("\n== мобильная раскладка ==")
         mobile = context.new_page()
         mobile.set_viewport_size({"width": 390, "height": 844})

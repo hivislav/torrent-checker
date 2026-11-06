@@ -5611,15 +5611,9 @@ class Agent:
                 style="danger",
             ),
         ]
-        await self.events.publish(
-            {
-                "type": "notification",
-                "level": "error",
-                "task_id": task.id,
-                "title": "Нет места на внешнем диске",
-                "text": text,
-                "message": message.to_dict(),
-            }
+        await self._publish_notification(
+            "error", "Нет места на внешнем диске", text,
+            task_id=task.id, message=message,
         )
         await self.desktop.send("Нет места на внешнем диске", f"{torrent.title}"[:120])
         await self.push.send("Нет места на внешнем диске", text[:200])
@@ -6476,14 +6470,13 @@ class Agent:
                 message = Message(role="agent", text=text, kind="task", task_id=task.id,
                                   payload={"task": task.to_dict(), "progress": state})
                 await self._remember_many(task.session_id, [message])
-                await self.events.publish(
-                    {
-                        "type": "download_complete",
-                        "task_id": task.id,
-                        "title": state.get("name") or task.title,
-                        "text": text,
-                        "message": message.to_dict(),
-                    }
+                await self._publish_notification(
+                    "success",
+                    "Скачивание завершено",
+                    text,
+                    task_id=task.id,
+                    message=message,
+                    event_type="download_complete",
                 )
                 await self.desktop.send("Скачивание завершено", str(state.get("name") or "")[:120])
                 continue
@@ -7020,15 +7013,9 @@ class Agent:
         )
         message.actions = self._task_actions(task)
         await self._remember_many(task.session_id, [message])
-        await self.events.publish(
-            {
-                "type": "notification",
-                "level": "success",
-                "task_id": task.id,
-                "title": "Скачивание по задаче",
-                "text": text,
-                "message": message.to_dict(),
-            }
+        await self._publish_notification(
+            "success", "Скачивание по задаче", text,
+            task_id=task.id, message=message,
         )
         await self.desktop.send("Скачивание по задаче", torrent.title[:120])
         await self.push.send(
@@ -7194,15 +7181,9 @@ class Agent:
             )
         )
         await self._remember_many(task.session_id, [message])
-        await self.events.publish(
-            {
-                "type": "notification",
-                "level": "info",
-                "task_id": task.id,
-                "title": "Нужно выбрать серии",
-                "text": text,
-                "message": message.to_dict(),
-            }
+        await self._publish_notification(
+            "info", "Нужно выбрать серии", text,
+            task_id=task.id, message=message,
         )
         await self.desktop.send("По задаче нужна серия", torrent.title[:120])
         return True
@@ -7234,15 +7215,9 @@ class Agent:
         )
         message.actions = self._task_actions(task)
         await self._remember_many(task.session_id, [message])
-        await self.events.publish(
-            {
-                "type": "notification",
-                "level": "info",
-                "task_id": task.id,
-                "title": "Ничего не найдено",
-                "text": text,
-                "message": message.to_dict(),
-            }
+        await self._publish_notification(
+            "info", "Ничего не найдено", text,
+            task_id=task.id, message=message,
         )
 
     async def _notify_new(self, task: Task, fresh: list[Torrent]) -> None:
@@ -7269,15 +7244,9 @@ class Agent:
             )
         message.actions.extend(self._task_actions(task))
         await self._remember_many(task.session_id, [message])
-        await self.events.publish(
-            {
-                "type": "notification",
-                "level": "info",
-                "task_id": task.id,
-                "title": "Новое по задаче",
-                "text": text,
-                "message": message.to_dict(),
-            }
+        await self._publish_notification(
+            "info", "Новое по задаче", text,
+            task_id=task.id, message=message,
         )
         await self.desktop.send("Новое по задаче", f"{task.title}: {fresh[0].title}"[:200])
         await self.push.send(
@@ -7289,14 +7258,48 @@ class Agent:
         text = f"Задача «{task.title}»: не смог скачать «{torrent.title}» — {error}"
         message = Message(role="agent", text=text, kind="error", task_id=task.id)
         await self._remember_many(task.session_id, [message])
-        await self.events.publish(
-            {"type": "notification", "level": "error", "task_id": task.id, "title": "Ошибка", "text": text}
-        )
+        await self._publish_notification("error", "Ошибка", text, task_id=task.id)
         await self.push.send("Ошибка в задаче", text[:200])
 
     # ------------------------------------------------------------------
     # Вспомогательные тексты
     # ------------------------------------------------------------------
+    async def _publish_notification(
+        self,
+        level: str,
+        title: str,
+        text: str,
+        *,
+        task_id: str | None = None,
+        message: Message | None = None,
+        event_type: str = "notification",
+    ) -> None:
+        """Одна точка для «Киножурнала»: сохраняем запись и шлём событие.
+
+        Раньше уведомления жили только в памяти открытой вкладки: не было
+        вкладки — не было и уведомления. Теперь каждая запись ложится в базу,
+        и журнал переживает перезагрузку и перезапуск приложения.
+        """
+        try:
+            await self.store.add_notification(level, title, text, task_id)
+        except Exception as exc:  # noqa: BLE001 - журнал не должен ронять ход
+            journal.add(
+                "agent",
+                "не удалось записать уведомление в журнал",
+                {"ошибка": str(exc), "заголовок": title},
+                level="warn",
+            )
+        payload: dict[str, Any] = {
+            "type": event_type,
+            "level": level,
+            "task_id": task_id,
+            "title": title,
+            "text": text,
+        }
+        if message is not None:
+            payload["message"] = message.to_dict()
+        await self.events.publish(payload)
+
     def _filter_text(self, task: Task) -> str:
         bits = []
         params = task.params or {}

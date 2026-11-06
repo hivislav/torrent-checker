@@ -286,6 +286,22 @@ async def test_auto_download() -> None:
     check("в память записана серия 3", [e["episode"] for e in episodes] == [3],
           [e["episode"] for e in episodes])
 
+    # Киножурнал: находка периодической задачи должна остаться в базе, а не
+    # только мелькнуть в открытой вкладке.
+    journal_items = await agent.store.list_notifications()
+    titles = [item["title"] for item in journal_items]
+    print("  в киножурнале:", titles)
+    check("в киножурнале есть запись о скачивании по задаче",
+          any("Скачивание по задаче" in title for title in titles), titles)
+    found_entry = next((item for item in journal_items
+                        if "Скачивание по задаче" in item["title"]), None)
+    check("запись журнала ссылается на задачу",
+          bool(found_entry) and found_entry["task_id"] == task.id,
+          found_entry and found_entry["task_id"])
+    check("в записи журнала есть текст и время",
+          bool(found_entry) and bool(found_entry["text"]) and bool(found_entry["created_at"]),
+          found_entry)
+
     # Скачивание живёт отдельной разовой задачей: иначе прогресса не видно.
     children = [
         item for item in await agent.store.list_tasks(limit=50)

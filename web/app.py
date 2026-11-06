@@ -223,6 +223,24 @@ async def downloads(limit: int = 50, session: str = Depends(current_session)) ->
     return {"downloads": items, "meta": agent.downloads_meta}
 
 
+@app.get("/api/notifications")
+async def notifications(
+    limit: int = 100, session: str = Depends(current_session)
+) -> dict[str, Any]:
+    """Киножурнал: что нашлось, что скачалось, где ошибка.
+
+    Читается из базы, поэтому уведомления не теряются, если вкладка была
+    закрыта: раньше они жили только в памяти открытой страницы и приходили
+    выборочно — по SSE, пока соединение живо.
+    """
+    return {"notifications": await agent.store.list_notifications(limit)}
+
+
+@app.post("/api/notifications/clear")
+async def clear_notifications(session: str = Depends(current_session)) -> dict[str, Any]:
+    return {"cleared": await agent.store.clear_notifications()}
+
+
 @app.post("/api/transmission/restart")
 async def transmission_restart(session: str = Depends(current_session)) -> dict[str, Any]:
     """Перезапуск Transmission из панели: лечит зависший в записи демон."""

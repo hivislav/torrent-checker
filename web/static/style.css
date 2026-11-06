@@ -625,6 +625,41 @@ body {
   white-space: pre-wrap;
 }
 .notification-item--error { border-left-color: var(--red); }
+.notification-item--success { border-left-color: var(--green); }
+.notification-item--info { border-left-color: var(--amber); }
+
+/* Заголовок записи и время: по ним видно, к чему относится сообщение. */
+.notification-item__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 3px;
+}
+
+.notification-item__head strong {
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.notification-item__time {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: .06em;
+  color: var(--ink-faint);
+  white-space: nowrap;
+}
+
+.notification-item__text {
+  white-space: pre-wrap;
+}
+
+.notification-empty {
+  font-family: var(--serif);
+  font-size: 13px;
+  color: var(--ink-faint);
+  padding: 10px 4px;
+}
 
 /* ---------- Чат ---------- */
 .chat {

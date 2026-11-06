@@ -19,6 +19,10 @@
     // «Редактировать». До этого задача — только для просмотра.
     editing: false,
     introHTML: null,
+    // Последняя прочитанная запись Киножурнала: по ней решаем, показывать ли
+    // точку на колокольчике после перезагрузки страницы.
+    journalSeen: Number(localStorage.getItem("journalSeen") || 0),
+    journalNewest: 0,
   };
 
   // ------------------------------------------------------------------
@@ -202,7 +206,9 @@
 
     node.querySelector(".msg__role").textContent =
       ROLE_LABEL[message.role] || message.role;
-    node.querySelector(".msg__time").textContent = formatTime(message.created_at);
+    // Дата и время: в задаче, которая живёт неделю, «11:37» без даты
+    // не говорит ничего.
+    node.querySelector(".msg__time").textContent = formatStamp(message.created_at);
     node.querySelector(".msg__text").textContent = message.text || "";
 
     renderActions(node.querySelector(".msg__actions"), message.actions || []);
@@ -1103,17 +1109,65 @@
   // ------------------------------------------------------------------
   // Уведомления
   // ------------------------------------------------------------------
+  // Киножурнал живёт на сервере: список приходит из базы и переживает
+  // перезагрузку. SSE теперь только подсказывает «появилось новое» —
+  // раньше уведомления существовали лишь в памяти открытой вкладки.
+  async function loadJournal() {
+    const list = $("notification-list");
+    try {
+      const data = await api("/api/notifications?limit=100");
+      const items = data.notifications || [];
+      state.journalNewest = Number((items[0] || {}).id || 0);
+      if (state.journalNewest > state.journalSeen) $("bell-dot").hidden = false;
+      renderJournal(items);
+      return items;
+    } catch (error) {
+      if (!list.children.length) {
+        const empty = document.createElement("div");
+        empty.className = "notification-empty";
+        empty.textContent = `Журнал недоступен: ${error.message}`;
+        list.appendChild(empty);
+      }
+      return [];
+    }
+  }
+
+  function renderJournal(items) {
+    const list = $("notification-list");
+    list.innerHTML = "";
+    if (!items.length) {
+      const empty = document.createElement("div");
+      empty.className = "notification-empty";
+      empty.textContent = "Пока пусто. Сюда попадут находки периодических задач, скачивания и ошибки.";
+      list.appendChild(empty);
+      return;
+    }
+    for (const item of items) {
+      const node = document.createElement("div");
+      node.className = `notification-item notification-item--${item.level || "info"}`;
+      const head = document.createElement("div");
+      head.className = "notification-item__head";
+      const title = document.createElement("strong");
+      title.textContent = item.title || "Сообщение";
+      const stamp = document.createElement("span");
+      stamp.className = "notification-item__time";
+      stamp.textContent = formatStamp(item.created_at);
+      head.append(title, stamp);
+      const body = document.createElement("div");
+      body.className = "notification-item__text";
+      body.textContent = item.text || "";
+      node.append(head, body);
+      list.appendChild(node);
+    }
+  }
+
   function pushNotification(message) {
     state.notifications += 1;
     $("bell-dot").hidden = false;
-    const list = $("notification-list");
-    const item = document.createElement("div");
-    item.className = "notification-item";
-    if (message.kind === "error") item.classList.add("notification-item--error");
-    item.textContent = message.text || "";
-    list.prepend(item);
-    while (list.children.length > 40) list.lastChild.remove();
-
+    if (!message || (!message.text && !message.title)) {
+      // Без текста в журнал нечего писать (например, пустое событие).
+      return;
+    }
     if (window.Notification && Notification.permission === "granted") {
       try {
         new Notification("Кинозал", { body: (message.text || "").slice(0, 180), icon: "/static/icon-192.png" });
@@ -1121,6 +1175,8 @@
         /* на самоподписанном сертификате браузер может отказать — это не ошибка */
       }
     }
+    // Список берём с сервера: там уже и запись, и время, и порядок.
+    if (!$("notification-tray").hidden) loadJournal();
   }
 
   function connectEvents() {
@@ -1138,10 +1194,12 @@
       if (data.type === "notification") {
         if (data.message) {
           renderMessage(data.message);
-          pushNotification(data.message);
         }
+        pushNotification(data.message || { text: data.text || "" });
         refreshTasks();
       } else if (data.type === "download_complete") {
+        if (data.message) renderMessage(data.message);
+        pushNotification(data.message || { text: data.text || "" });
         refreshTasks();
         refreshStatus();
       } else if (data.type === "download_progress") {
@@ -1811,8 +1869,15 @@
       if ($("notification-tray").hidden) trayOpen();
       else closeTray();
     });
-    $("clear-notifications").addEventListener("click", () => {
-      $("notification-list").innerHTML = "";
+    $("clear-notifications").addEventListener("click", async () => {
+      try {
+        await api("/api/notifications/clear", { method: "POST", body: {} });
+      } catch (error) {
+        /* очистка не критична — просто покажем старый список */
+      }
+      await loadJournal();
+      $("bell-dot").hidden = true;
+      state.notifications = 0;
     });
 
     $("refresh-status").addEventListener("click", refreshStatus);
@@ -1889,6 +1954,10 @@
     tray.hidden = false;
     state.notifications = 0;
     $("bell-dot").hidden = true;
+    loadJournal().then(() => {
+      state.journalSeen = state.journalNewest;
+      localStorage.setItem("journalSeen", String(state.journalSeen));
+    });
     pushOverlay();
   }
 
@@ -2072,6 +2141,9 @@
     syncComposer();
     await openLatestConversation();
     await refreshStatus();
+    // Журнал читаем сразу: точка на колокольчике должна быть видна и после
+    // перезагрузки, а не только когда прилетит новое событие по SSE.
+    loadJournal();
     connectEvents();
     // Пока вкладка/приложение скрыты, ничего не опрашиваем: телефон в кармане
     // не должен дёргать сервер и Transmission каждые 5 секунд. Вернулись —

@@ -101,6 +101,16 @@ CREATE TABLE IF NOT EXISTS checks (
 );
 CREATE INDEX IF NOT EXISTS idx_checks_task ON checks(task_id, id);
 
+CREATE TABLE IF NOT EXISTS notifications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    level TEXT NOT NULL DEFAULT 'info',
+    title TEXT NOT NULL DEFAULT '',
+    text TEXT NOT NULL DEFAULT '',
+    task_id TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_notifications_id ON notifications(id);
+
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -702,6 +712,54 @@ class Store:
     # ------------------------------------------------------------------
     # журнал проверок периодических задач
     # ------------------------------------------------------------------
+    async def add_notification(
+        self, level: str, title: str, text: str, task_id: str | None = None
+    ) -> int:
+        """Запись «Киножурнала»: находки, ошибки, готовые скачивания.
+
+        Хранится в базе, а не только в памяти страницы: журнал должен
+        переживать перезагрузку и закрытый браузер — раньше уведомления
+        появлялись, только если вкладка была открыта в этот момент.
+        """
+
+        def run(conn: sqlite3.Connection) -> int:
+            cursor = conn.execute(
+                "INSERT INTO notifications (created_at, level, title, text, task_id) "
+                "VALUES (?,?,?,?,?)",
+                (now_iso(), str(level or "info"), str(title or ""), str(text or ""), task_id),
+            )
+            # Журнал не растёт бесконечно: держим последние 500 записей.
+            conn.execute(
+                "DELETE FROM notifications WHERE id NOT IN "
+                "(SELECT id FROM notifications ORDER BY id DESC LIMIT 500)"
+            )
+            return int(cursor.lastrowid or 0)
+
+        return await self._call(run)
+
+    async def list_notifications(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Последние записи журнала — свежие первыми."""
+
+        def run(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+            rows = conn.execute(
+                "SELECT id, created_at, level, title, text, task_id FROM notifications "
+                "ORDER BY id DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+        return await self._call(run)
+
+    async def clear_notifications(self) -> int:
+        """Очищает журнал. Возвращает, сколько записей было."""
+
+        def run(conn: sqlite3.Connection) -> int:
+            count = int(conn.execute("SELECT COUNT(*) FROM notifications").fetchone()[0])
+            conn.execute("DELETE FROM notifications")
+            return count
+
+        return await self._call(run)
+
     async def add_check(self, task_id: str, found: int, new_count: int, message: str = "") -> None:
         def run(conn: sqlite3.Connection) -> None:
             conn.execute(
