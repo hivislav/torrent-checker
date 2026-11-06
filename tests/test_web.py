@@ -357,9 +357,11 @@ def run() -> int:
         print("  записей в журнале:", len(items), "| отрисовано:", rendered)
         if items:
             check("записи журнала отрисованы", rendered == len(items), (rendered, len(items)))
+            stamp = page.locator(".notification-item__time").first.inner_text().strip()
+            print("  время записи:", stamp)
+            import re as _re
             check("у записи видно дату и время",
-                  bool(page.locator(".notification-item__time").first.inner_text().strip()),
-                  page.locator(".notification-item__time").first.inner_text())
+                  bool(_re.match(r"\d{2}\.\d{2}\.\d{4}, \d{2}:\d{2}", stamp)), stamp)
         else:
             check("пустой журнал объясняет себя",
                   page.locator(".notification-empty").count() == 1)

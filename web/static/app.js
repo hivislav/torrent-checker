@@ -69,6 +69,16 @@
     return date.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
   }
 
+  // «18.10.2026, 12:40» — для Киножурнала: записи копятся месяцами, и год
+  // нужен, чтобы старые не путались с новыми.
+  function formatStampFull(value) {
+    if (!value) return "";
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return "";
+    return `${date.toLocaleDateString("ru-RU", { day: "2-digit", month: "2-digit", year: "numeric" })}, ` +
+      date.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
+  }
+
   // «18.10, 12:40» — для журнала проверок: там важен и день, а не только время.
   function formatStamp(value) {
     if (!value) return "";
@@ -1149,10 +1159,11 @@
       head.className = "notification-item__head";
       const title = document.createElement("strong");
       title.textContent = item.title || "Сообщение";
-      const stamp = document.createElement("span");
+      const stamp = document.createElement("div");
       stamp.className = "notification-item__time";
-      stamp.textContent = formatStamp(item.created_at);
-      head.append(title, stamp);
+      // Время — отдельной строкой, всегда видно и не сливается с текстом.
+      stamp.textContent = formatStampFull(item.created_at);
+      head.append(stamp, title);
       const body = document.createElement("div");
       body.className = "notification-item__text";
       body.textContent = item.text || "";

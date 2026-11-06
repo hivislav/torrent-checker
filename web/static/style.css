@@ -631,10 +631,9 @@ body {
 /* Заголовок записи и время: по ним видно, к чему относится сообщение. */
 .notification-item__head {
   display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 10px;
-  margin-bottom: 3px;
+  flex-direction: column;
+  gap: 2px;
+  margin-bottom: 4px;
 }
 
 .notification-item__head strong {
@@ -642,12 +641,15 @@ body {
   font-weight: 600;
 }
 
+/* Время отдельной строкой сверху: записи копятся месяцами, и «когда это
+   было» должно читаться сразу, а не угадываться в конце строки. */
 .notification-item__time {
   font-family: var(--mono);
-  font-size: 10px;
-  letter-spacing: .06em;
-  color: var(--ink-faint);
-  white-space: nowrap;
+  font-size: 10.5px;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--amber);
+  opacity: .85;
 }
 
 .notification-item__text {
