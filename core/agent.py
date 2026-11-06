@@ -294,6 +294,8 @@ class Agent:
         self._started = False
         self._check_locks: dict[str, asyncio.Lock] = {}
         self._running_checks: set[str] = set()
+        # Раздачи, которые мы уже перезапускали из-за «нуля при живых пирах».
+        self._nudged_seen: set[str] = set()
         # Подробности раздачи (жанр, актёры, описание) запрашиваются по кнопке,
         # а не при каждом поиске: это ещё один поход через шлюз Cloudflare.
         # Кэш на 10 минут — чтобы повторное нажатие не ходило на трекер.
@@ -6446,6 +6448,12 @@ class Agent:
             task.params.pop("missing_polls", None)
             task.params["progress"] = state
             task.last_result = self._progress_text(state)
+            nudged = await self._heal_stuck_download(task, torrent_hash, state)
+            if nudged:
+                # Перезапущенная раздача опрашивается в следующий раз — сейчас
+                # в состоянии всё ещё ноль.
+                await self.store.save_task(task)
+                continue
             if task.state == "done" and not state.get("done"):
                 # Раздача ещё качается — задача не завершена.
                 task.state = "downloading"
@@ -6480,6 +6488,69 @@ class Agent:
                 await self.desktop.send("Скачивание завершено", str(state.get("name") or "")[:120])
                 continue
             await self.store.save_task(task)
+
+    async def _heal_stuck_download(
+        self, task: Task, torrent_hash: str, state: dict[str, Any]
+    ) -> bool:
+        """Раздача «качается» на нуле при живых пирах — перезапускаем.
+
+        Известная беда: торрент добавлен, файлы выбраны, пиры подключены — а
+        Transmission так и не запрашивает части. Ручное «пауза → старт» это
+        лечит, поэтому лечим сами. Один раз на раздачу и только если прошло
+        достаточно времени: свежий торрент может просто ещё не разогнаться.
+        """
+        if not torrent_hash:
+            return False
+        status = str(state.get("status") or "")
+        # Раздача остановлена, хотя задача качает: команда «старт» потерялась
+        # (демон был занят) — включаем заново, без ожидания «нуля с пирами».
+        if status in ("stopped", "stopped DL", "paused") or status.endswith("stopped"):
+            if torrent_hash in self._nudged_seen:
+                return False
+            self._nudged_seen.add(torrent_hash)
+            journal.add(
+                "agent",
+                "раздача остановлена, хотя задача качает — включаю",
+                {"задача": task.id, "хеш": torrent_hash, "состояние": status},
+                level="warn",
+            )
+            ok = await self.transmission.resume(torrent_hash)
+            task.last_result = (
+                "раздача была остановлена — включил заново"
+                if ok
+                else "раздача остановлена, включить не удалось"
+            )
+            return ok
+        if torrent_hash in self._nudged_seen:
+            return False
+        if state.get("done") or float(state.get("percent") or 0) > 0:
+            return False
+        if int(state.get("rate") or 0) > 0:
+            return False
+        if int(state.get("peers") or 0) <= 0:
+            return False
+        added = float(state.get("added_ts") or 0)
+        if not added or (time.time() - added) < 10 * 60:
+            return False
+        self._nudged_seen.add(torrent_hash)
+        journal.add(
+            "agent",
+            "скачивание стоит на нуле при живых пирах — перезапускаю раздачу",
+            {
+                "задача": task.id,
+                "хеш": torrent_hash,
+                "пиров": state.get("peers"),
+                "добавлена": int(added),
+            },
+            level="warn",
+        )
+        ok = await self.transmission.nudge(torrent_hash)
+        task.last_result = (
+            "скачивание стояло на нуле — перезапустил раздачу"
+            if ok
+            else "скачивание стоит на нуле, перезапустить не удалось"
+        )
+        return ok
 
     async def _progress_loop(self) -> None:
         while True:

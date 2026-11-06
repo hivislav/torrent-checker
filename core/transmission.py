@@ -42,6 +42,35 @@ from core.torrent_meta import human_bytes, total_length
 log = logging.getLogger("transmission")
 
 
+def _ts(value: Any) -> float:
+    """Дата из Transmission (datetime) → секунды эпохи. 0, если её нет."""
+    if value is None:
+        return 0.0
+    try:
+        return float(value.timestamp())
+    except AttributeError:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
+
+def _human_eta(seconds: int | None) -> str:
+    """«12 мин», «2 ч 5 мин» — сколько ещё качать по оценке Transmission."""
+    if not seconds or seconds <= 0:
+        return ""
+    minutes = int(seconds) // 60
+    if minutes < 1:
+        return "меньше минуты"
+    if minutes < 60:
+        return f"{minutes} мин"
+    hours, rest = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours} ч {rest} мин" if rest else f"{hours} ч"
+    days, hours = divmod(hours, 24)
+    return f"{days} д {hours} ч" if hours else f"{days} д"
+
+
 class TransmissionError(RuntimeError):
     pass
 
@@ -482,27 +511,52 @@ class Transmission:
         def run() -> dict[str, Any]:
             client = self._get_client()
             data = torrent_path.read_bytes()
-            # download_dir передаём явно — это и есть гарантия «всегда на EAGET».
-            result = client.add_torrent(data, download_dir=str(self.download_dir))
+            # Порядок важен. Раньше торрент добавлялся «как есть» (Transmission
+            # сразу начинал искать пиры), а выбранные файлы выставлялись вторым
+            # вызовом — и свежая раздача застревала на 0 % с живыми пирами:
+            # запросы частей считались по старому набору файлов. Ручной
+            # «пауза → старт» это лечил, значит и здесь: добавляем на паузе,
+            # выбираем файлы в том же вызове и только потом запускаем.
+            selected: list[int] = []
+            add_kwargs: dict[str, Any] = {
+                # download_dir передаём явно — это и есть гарантия «всегда на EAGET».
+                "download_dir": str(self.download_dir),
+                "paused": True,
+            }
+            if files_wanted is not None:
+                wanted = sorted({int(index) for index in files_wanted})
+                add_kwargs["files_wanted"] = wanted
+                selected = wanted[:]
+            result = client.add_torrent(data, **add_kwargs)
             torrent_hash = (
                 getattr(result, "hash_string", "") or getattr(result, "hashString", "")
             )
-            selected: list[int] = []
             if files_wanted is not None:
-                files = client.get_torrent(torrent_hash).get_files()
-                wanted = {int(index) for index in files_wanted}
-                unwanted = [item.id for item in files if item.id not in wanted]
-                client.change_torrent(
-                    torrent_hash,
-                    files_wanted=sorted(index for index in wanted if index < len(files)),
-                    files_unwanted=unwanted,
-                )
-                selected = sorted(wanted)
+                try:
+                    files_count = len(client.get_torrent(torrent_hash).get_files())
+                except Exception:  # noqa: BLE001 - счётчик только для журнала
+                    files_count = len(selected)
                 journal.add(
                     "transmission",
-                    f"выбраны файлы раздачи: {len(selected)} из {len(files)}",
+                    f"выбраны файлы раздачи: {len(selected)} из {files_count}",
                     {"индексы": selected[:20]},
                 )
+            # Запускаем сразу, минуя очередь: человек нажал «скачать», а не
+            # «встань в конец». Именно это и делал ручной «пауза → старт».
+            # Запускаем и проверяем, что раздача действительно пошла: одна
+            # команда «старт» иногда теряется, если демон занят записью.
+            status = ""
+            for _attempt in range(3):
+                client.start_torrent_now(torrent_hash)
+                status = self._wait_status(client, torrent_hash, self._ACTIVE_STATUSES)
+                if status in self._ACTIVE_STATUSES:
+                    break
+            journal.add(
+                "transmission",
+                "раздача запущена после выбора файлов",
+                {"хеш": torrent_hash, "статус": status},
+                level="info" if status in self._ACTIVE_STATUSES else "warn",
+            )
             return {
                 "ok": True,
                 "name": getattr(result, "name", ""),
@@ -573,6 +627,11 @@ class Transmission:
                 result[torrent_hash] = {
                     "hash": torrent_hash,
                     "name": getattr(torrent, "name", ""),
+                    # Для самолечения: «висит на нуле при живых пирах» — беда
+                    # Transmission, когда файлы выбрали сразу после добавления.
+                    "peers": int(getattr(torrent, "peers_connected", 0) or 0),
+                    "added_ts": _ts(getattr(torrent, "added_date", None)),
+                    "activity_ts": _ts(getattr(torrent, "activity_date", None)),
                     "percent": round(percent * 100, 1),
                     "done": percent >= 0.999,
                     "status": str(getattr(torrent, "status", "")),
@@ -596,6 +655,80 @@ class Transmission:
         except Exception as exc:  # noqa: BLE001
             log.warning("не удалось получить прогресс: %s", exc)
             return None
+
+    _ACTIVE_STATUSES = ("downloading", "seeding")
+
+    def _wait_status(self, client, torrent_hash: str, want: tuple[str, ...], *, timeout: float = 8.0) -> str:
+        """Ждёт нужного состояния раздачи. Возвращает последнее увиденное."""
+        deadline = time.monotonic() + timeout
+        status = ""
+        while time.monotonic() < deadline:
+            status = str(getattr(client.get_torrent(torrent_hash), "status", "") or "")
+            if status in want:
+                return status
+            time.sleep(0.4)
+        return status
+
+    async def resume(self, torrent_hash: str) -> bool:
+        """Запускает раздачу и убеждается, что она действительно качается.
+
+        `torrent-start-now` не ждёт: если демон был занят, команда могла
+        потеряться, и раздача оставалась остановленной. Поэтому после запуска
+        проверяем состояние и, если нужно, повторяем.
+        """
+        def run() -> bool:
+            client = self._get_client()
+            for _attempt in range(3):
+                client.start_torrent_now(torrent_hash)
+                status = self._wait_status(client, torrent_hash, self._ACTIVE_STATUSES)
+                if status in self._ACTIVE_STATUSES:
+                    return True
+            log.warning("раздача %s не запустилась (состояние %s)", torrent_hash, status)
+            return False
+
+        try:
+            return bool(await self._run(run, budget=30.0, ignore_pause=True))
+        except Exception as exc:  # noqa: BLE001 - не критично
+            log.warning("не удалось запустить раздачу %s: %s", torrent_hash, exc)
+            return False
+
+    async def nudge(self, torrent_hash: str) -> bool:
+        """«Пауза → старт» для застрявшей раздачи: перезапускает запросы частей.
+
+        Transmission иногда принимает выбор файлов, но так и не начинает качать:
+        пиры подключены, скорость ноль, прогресс ноль. Ручное «пауза → старт»
+        всегда помогало — теперь это делает агент.
+
+        Пауза и старт — по очереди и с проверкой: команды асинхронные, и
+        отправленные подряд они выполнялись в обратном порядке — раздача
+        оставалась остановленной.
+        """
+        def run() -> bool:
+            client = self._get_client()
+            client.stop_torrent(torrent_hash)
+            stopped = self._wait_status(client, torrent_hash, ("stopped",), timeout=10.0)
+            if stopped not in ("stopped",):
+                log.warning("раздача %s не встала на паузу (состояние %s)", torrent_hash, stopped)
+            for _attempt in range(3):
+                client.start_torrent_now(torrent_hash)
+                status = self._wait_status(client, torrent_hash, self._ACTIVE_STATUSES)
+                if status in self._ACTIVE_STATUSES:
+                    return True
+            return False
+
+        try:
+            ok = bool(await self._run(run, budget=40.0, ignore_pause=True))
+        except Exception as exc:  # noqa: BLE001 - не критично
+            log.warning("не удалось перезапустить раздачу %s: %s", torrent_hash, exc)
+            return False
+        journal.add(
+            "transmission",
+            "раздача висела на нуле — перезапустил (пауза → старт)"
+            if ok else "раздачу не удалось перезапустить",
+            {"хеш": torrent_hash},
+            level="info" if ok else "warn",
+        )
+        return ok
 
     async def find_by_hash(self, torrent_hash: str) -> dict[str, Any] | None:
         """Раздача в очереди по хешу: имя, файлы, каталог, размер."""

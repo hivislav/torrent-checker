@@ -131,6 +131,25 @@ async def main() -> int:
     found = [t for t in torrents if t.get("hash") == added.get("hash")]
     check("раздача видна в очереди", bool(found), added.get("hash"))
 
+    # Добавленная раздача должна сразу качаться, а не стоять на паузе: раньше
+    # выбор файлов шёл вторым вызовом, Transmission застревал на нуле и помогал
+    # только ручной «пауза → старт».
+    if found:
+        def read_state() -> dict:
+            client = transmission._get_client()  # noqa: SLF001 - тест про внутренности
+            torrent = client.get_torrent(added["hash"])
+            return {
+                "status": str(getattr(torrent, "status", "")),
+                "files_wanted": getattr(torrent, "files_wanted", None),
+            }
+
+        state = await asyncio.to_thread(read_state)
+        print("  состояние после add:", state)
+        check("после добавления раздача не на паузе",
+              state["status"] not in ("stopped", ""), state)
+        check("выбор файлов применился при добавлении",
+              state["files_wanted"] in (None, []), state)
+
     # Убираем за собой, чтобы тест не оставлял мусора в загрузках.
     if found:
         def cleanup() -> None:
