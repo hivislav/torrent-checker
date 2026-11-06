@@ -4565,13 +4565,73 @@ class Agent:
         )
         message.actions = self._task_actions(task)
 
+    @staticmethod
+    def _waits_once(task: Task, torrent: Torrent | None = None) -> bool:
+        """Задача ждёт одну вещь, а не поток серий.
+
+        «Прайм-тайм 2026 4K, скачай как появится» — ждём одну раздачу: нашлась
+        и скачалась — работа сделана, дальше следить не за чем. А «следи за
+        сериалом» (сезон, «начиная с N серии») живёт, пока её не отменят.
+        """
+        if task.kind != "periodic":
+            return False
+        params = task.params or {}
+        if str(params.get("type") or "").lower() == "series":
+            return False
+        if params.get("season") or params.get("episode_from"):
+            return False
+        if torrent is not None and (getattr(torrent, "seasons", None) or getattr(torrent, "episodes", None)):
+            # Нашли раздачу с сезонами/сериями — это сериал, а не «одна вещь».
+            return False
+        return True
+
+    async def _finish_wait_once(self, task: Task, torrent: Torrent) -> bool:
+        """Закрывает задачу, которая ждала одну раздачу: работа выполнена."""
+        if not self._waits_once(task, torrent):
+            return False
+        task.state = "done"
+        task.next_check_at = None
+        task.last_result = "нашёл, что ждал, и скачал — задача завершена"
+        await self.store.save_task(task)
+        journal.add(
+            "agent",
+            "периодическая задача завершена: ждали одну раздачу",
+            {"задача": task.id, "название": task.title, "раздача": torrent.title[:120]},
+        )
+        text = (
+            f"Задача «{task.title}» выполнена: нашёл, что ждали, и поставил качать.\n"
+            f"• {torrent.title}\n"
+            "Следить дальше не нужно — задача закрыта. Если понадобится новая, "
+            "заведите её отдельно."
+        )
+        message = Message(
+            role="agent", text=text, kind="task", task_id=task.id,
+            payload={"task": task.to_dict(), "torrent": torrent.to_dict()},
+        )
+        await self._remember_many(task.session_id, [message])
+        # В журнале — короткая строка: полный текст уже лежит в чате задачи.
+        await self._publish_notification(
+            "success",
+            "Задача выполнена",
+            f"«{task.title}»: нашёл, что ждали, и поставил качать. Задача закрыта.",
+            task_id=task.id,
+            message=message,
+        )
+        return True
+
     def _monitoring_text(self, task: Task) -> str:
         mode = "и сразу качать" if task.auto_download else "и сообщать о находках"
-        return (
+        text = (
             f"Взял в работу: «{task.title}».\n"
             f"Буду проверять {self._human_interval(task.interval_minutes)} {mode}.\n"
             f"{self._filter_text(task)}"
         )
+        if self._waits_once(task):
+            text += (
+                "\nЖду одну раздачу: как только она появится и скачается, "
+                "задача завершится сама."
+            )
+        return text
 
     def _task_actions(self, task: Task) -> list[Action]:
         """Кнопки под сообщением задачи.
@@ -6996,6 +7056,10 @@ class Agent:
             task.last_result = "нашёл новую раздачу — качает отдельная задача"
         await self._advance_next_episode(task, torrent)
         await self.store.save_task(task)
+
+        # Задача, которая ждала одну раздачу («скачай, как появится»), на этом
+        # сделана: следить дальше не за чем. Сериальные остаются в работе.
+        await self._finish_wait_once(task, torrent)
 
         lines = [f"Новая серия по задаче «{task.title}»: нашёл{'' if not found else f' серию {found}'} и поставил качать."]
         lines.append(f"• {torrent.title}")

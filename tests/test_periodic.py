@@ -1217,6 +1217,59 @@ async def test_first_finding_is_not_news() -> None:
     agent.store.close()
 
 
+async def test_wait_once_task_completes() -> None:
+    """«Скачай, как появится» — не вечный мониторинг: задача закрывается сама.
+
+    Настоящий случай: «Прайм-тайм 2026 4K, скачай как появится» — фильм ждали
+    один раз. Раздача нашлась и скачалась, а задача продолжала висеть в работе
+    и проверять трекер дальше. Сериальные задачи («начиная с 4 серии») при
+    этом должны оставаться в работе.
+    """
+    print("\n== задача «ждать один раз» закрывается сама ==")
+    agent, mcp, transmission = build_agent()
+    movie_row = {
+        "id": "2154968", "title": "Прайм-тайм / Primetime / 2026 / ДБ / 4K, HEVC, HDR / WEB-DL (2160p)",
+        "size": "25 ГБ", "seeds": 12, "peers": 1, "comments": 6,
+        "uploadDate": "18.11.2026 в 10:00", "uploader": "x", "category": "1",
+    }
+    mcp.custom_rows = [movie_row]
+    from core.models import Task
+
+    task = Task(
+        id="wait-once", kind="periodic", state="monitoring", session_id="checks",
+        user_query="Прайм-тайм 2026 4к", interval_minutes=1440, auto_download=True,
+        params={"title": "Прайм-тайм", "type": "movie", "quality": "2160p"},
+    )
+    await agent.store.save_task(task)
+    print("  режим:", "ждать один раз" if agent._waits_once(task) else "мониторинг")  # noqa: SLF001
+    check("фильмовая задача — «ждать один раз»", agent._waits_once(task), task.params)  # noqa: SLF001
+
+    await agent.check_task(task)
+    stored = await agent.store.get_task(task.id)
+    print("  после находки:", stored.state, "|", stored.last_result)
+    check("раздача поставлена в очередь", bool(transmission.added), transmission.added)
+    check("задача завершена", stored.state == "done", stored.state)
+    check("следующих проверок нет", not stored.next_check_at, stored.next_check_at)
+    due = [item.id for item in await agent.store.due_periodic()]
+    check("в расписание больше не попадает", task.id not in due, due)
+    titles = [item["title"] for item in await agent.store.list_notifications()]
+    print("  киножурнал:", titles)
+    check("в журнале есть «Задача выполнена»", "Задача выполнена" in titles, titles)
+
+    # Сериальная задача так не закрывается: она ждёт следующую серию.
+    series = Task(
+        id="series-forever", kind="periodic", state="monitoring", session_id="checks",
+        user_query="Выживалити с 4 серии", interval_minutes=60, auto_download=True,
+        params={"title": "Выживалити", "type": "series", "season": 4, "episode_from": 4},
+    )
+    check("сериальная задача не «ждать один раз»", not agent._waits_once(series), series.params)  # noqa: SLF001
+    await agent.store.save_task(series)
+    await agent.check_task(series)
+    kept = await agent.store.get_task("series-forever")
+    check("сериальная остаётся в работе", kept.state == "monitoring", kept.state)
+    agent.store.close()
+
+
 async def test_movie_task_waits_no_episodes() -> None:
     """Задача про фильм не ждёт серий, даже если серии есть в выдаче.
 
@@ -1365,6 +1418,7 @@ async def main() -> int:
     await test_cancel_only_in_panel()
     await test_default_interval()
     await test_first_finding_is_not_news()
+    await test_wait_once_task_completes()
     await test_movie_task_waits_no_episodes()
     await test_check_searches_aliases()
     test_name_matching()
