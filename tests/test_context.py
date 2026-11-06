@@ -633,6 +633,33 @@ async def test_live_dialog() -> None:
         conn.close()
 
 
+async def test_title_from_request() -> None:
+    """Название берётся из запроса, даже если модель выделила только качество.
+
+    Настоящий случай: «вспомнить все 4к» — модель вернула `title: null,
+    quality: 2160p`, и агент ответил «Не понял, что искать».
+    """
+    print("\n== название из запроса, когда модель дала только качество ==")
+    agent = make_agent("title-text-")
+    cases = [
+        ("вспомнить все 4к", "вспомнить все"),
+        ("вспомнить всё", "вспомнить всё"),
+        ("Тед Лассо 1080p", "Тед Лассо"),
+        ("Дюна", "Дюна"),
+        ("1920x1080", ""),
+        ("4к", ""),
+        ("7 серия", ""),
+        ("сезон 3", ""),
+        ("а можно 4K", ""),
+        ("нет", ""),
+    ]
+    for text, expected in cases:
+        got = agent._title_from_text(text)  # noqa: SLF001
+        print(f"  {text!r:22} → {got!r}")
+        check(f"«{text}» → {expected!r}", got == expected, got)
+    agent.store.close()
+
+
 async def main() -> int:
     await test_window()
     await test_reset()
@@ -643,6 +670,7 @@ async def main() -> int:
     await test_foreign_query()
     await test_prompt()
     test_refinement_rules()
+    await test_title_from_request()
     await test_merge()
     await test_live_dialog()
 

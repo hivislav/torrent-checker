@@ -455,7 +455,9 @@ class Agent:
             )
             turn.add(self._locked_note(current, parsed, text), kind="text")
             turn.start_new = True
-            has_title = bool(str(parsed.get("title") or "").strip()) or self._looks_like_title(text)
+            has_title = bool(str(parsed.get("title") or "").strip()) or bool(
+                self._title_from_text(text)
+            )
             current = None
             active = None
             if not has_title:
@@ -507,12 +509,9 @@ class Agent:
             repeats_old = not model_title or (
                 old_title and normalize(model_title) == normalize(old_title)
             )
-            if (
-                repeats_old
-                and self._looks_like_title(text)
-                and not self._text_about_title(text, old_title)
-            ):
-                parsed = {**parsed, "title": self._clean_title_text(text)}
+            from_text = self._title_from_text(text)
+            if repeats_old and from_text and not self._text_about_title(text, old_title):
+                parsed = {**parsed, "title": from_text}
                 journal.add(
                     "agent",
                     "название взято из нового запроса",
@@ -539,10 +538,12 @@ class Agent:
                 await self._remember_many(session_id, turn.messages)
                 return turn
 
-        if not parsed.get("title") and self._looks_like_title(text):
-            # «Извне» без года и качества — это название, пусть модель его
-            # и не выделила: ищем по тому, что человек написал.
-            parsed = {**parsed, "title": self._clean_title_text(text)}
+        from_text = self._title_from_text(text)
+        if not parsed.get("title") and from_text:
+            # «Извне», «вспомнить все 4к» — название есть в самом запросе,
+            # пусть модель его и не выделила: качество отбрасываем, остальное
+            # ищем как название. Без этого агент отвечал «Не понял, что искать».
+            parsed = {**parsed, "title": from_text}
             journal.add("agent", "название взято из текста запроса", {"название": parsed["title"]})
         journal.add(
             "agent",
@@ -620,22 +621,65 @@ class Agent:
         tokens = [token for token in cleaned.split() if token]
         return bool(tokens) and all(token in self.GENRE_WORDS for token in tokens)
 
+    # Качество и вес в запросе — не часть названия: «вспомнить все 4к» — это
+    # название «вспомнить все» и качество 2160p.
+    QUALITY_TOKENS = {
+        "4к", "4k", "2k", "8k", "uhd", "hd", "fullhd", "full-hd", "fhd",
+        "2160p", "1440p", "1080p", "1080i", "720p", "576p", "480p", "360p",
+        "hevc", "avc", "h264", "h265", "x264", "x265", "hdr", "hdr10",
+        "web-dl", "webdl", "webrip", "bdrip", "dvdrip", "hdrip", "hdtv",
+        "blu-ray", "bluray", "bdremux", "remux", "sd", "hd",
+    }
+    # Слова-команды: сами по себе названием не являются.
+    COMMAND_TOKENS = {
+        "можно", "дай", "давай", "хочу", "покажи", "найди", "найти", "поищи",
+        "скачай", "скачать", "качай", "проверяй", "следи", "смотри", "надо",
+        "нужен", "нужна", "нужно", "пожалуйста", "плиз", "это", "тот", "этот",
+        "ещё", "еще", "потом", "сейчас", "пожалуста",
+    }
+
+    def _title_from_text(self, text: str) -> str:
+        """Название из самого запроса, когда модель его не выделила.
+
+        Модель иногда возвращает только качество («вспомнить все 4к» →
+        `quality: 2160p, title: null`), и запрос превращался в «Не понял, что
+        искать». Здесь качество отбрасываем, а оставшиеся слова считаем
+        названием — но только если среди них есть что-то кроме команд
+        («а можно 4K» названием не считается).
+        """
+        cleaned = self._clean_title_text(text)
+        if not cleaned:
+            return ""
+        tokens = []
+        for token in cleaned.split():
+            low = token.lower()
+            if low in self.QUALITY_TOKENS:
+                continue
+            # «1,5 ГБ», «2160», «1920x1080» — вес и разрешение, не название.
+            if re.fullmatch(r"\d+([.,]\d+)?\s*(гб|мб|тб|kb|gb|mb|tb)?", low):
+                continue
+            if re.fullmatch(r"\d{3,4}\s*[xх]\s*\d{3,4}", low):
+                continue
+            if any(word in low for word in self.REFINE_KEYWORDS):
+                continue
+            tokens.append(token)
+        if not tokens:
+            return ""
+        if len(tokens) > 6:
+            return ""
+        meaningful = [
+            token for token in tokens
+            if len(token) > 2
+            and token.lower() not in self.COMMAND_TOKENS
+            and token.lower() not in self.REFINE_STOPWORDS
+        ]
+        if not meaningful:
+            return ""
+        return " ".join(tokens).strip()
+
     def _looks_like_title(self, text: str) -> bool:
         """Текст похож на название, а не на уточнение («4K», «7 серия», «нет»)."""
-        cleaned = re.sub(r"[«»\"'.,!?:;()\[\]]+", " ", str(text or "")).strip()
-        if not cleaned:
-            return False
-        low = cleaned.lower()
-        if re.search(r"\d", low):
-            return False
-        if any(word in low for word in self.REFINE_KEYWORDS):
-            return False
-        tokens = [token for token in low.split() if token]
-        if not tokens or len(tokens) > 6:
-            return False
-        if any(token in self.REFINE_STOPWORDS for token in tokens):
-            return False
-        return any(len(token) > 2 for token in tokens)
+        return bool(self._title_from_text(text))
 
     @staticmethod
     def _owns_live_download(task: Task) -> bool:
@@ -683,8 +727,8 @@ class Agent:
         # Название новой задачи берём из запроса, если оно там есть: «а можно 4K»
         # названием не является, и обещать «начинаю новую: „а можно 4K“» нельзя.
         new_title = str(parsed.get("title") or "").strip()
-        if not new_title and self._looks_like_title(text):
-            new_title = self._clean_title_text(text)
+        if not new_title:
+            new_title = self._title_from_text(text)
         tail = (
             f"Начинаю новую: «{new_title}»."
             if new_title
@@ -707,16 +751,27 @@ class Agent:
             and not genre_only
         ):
             return False
-        plain_title = self._looks_like_title(text)
+        plain_title = bool(self._title_from_text(text))
         if not new_title:
-            # Модель не распознала название, а текст на него похож — это новый
-            # поиск, а не «что поправить» в старой задаче («Извне»).
-            return not plain_title
-        if normalize(new_title) == normalize(old_title) and plain_title:
+            # Модель не распознала название. Если в тексте название есть — это
+            # новый поиск («Извне»), кроме случая, когда он про ту же задачу
+            # («Тед Лассо 1080p» при открытом «Тед Лассо»): тогда это уточнение.
+            from_text = self._title_from_text(text)
+            if not from_text:
+                return True
+            return self._text_about_title(from_text, old_title)
+        if (
+            normalize(new_title) == normalize(old_title)
+            and plain_title
+            and not parsed.get("refine")
+        ):
             # Модель могла просто повторить текущую задачу (и приписать к ней
             # параметры из контекста). Если человек написал другое — это новый
             # поиск: «Извне» после «Человека-паука» ищет «Извне».
-            if not self._text_about_title(text, old_title):
+            # Сравниваем с названием без качества: «Тед Лассо 1080p» — про то
+            # же сериал, а «Тед Лассо против Дюны» — нет.
+            about = self._title_from_text(text) or text
+            if not self._text_about_title(about, old_title):
                 return False
         parsed_params = [
             key
@@ -817,7 +872,11 @@ class Agent:
 
     def _text_about_title(self, text: str, title: str) -> bool:
         """Текст относится к этому названию? («Тед Лассо» ⊂ «Тед Лассо»)."""
-        wanted = [token for token in str(text or "").lower().split() if token]
+        # normalize переводит кириллицу в латиницу («Тед Лассо» → «tedlasso»),
+        # поэтому сравнивать надо нормализованные слова, а не исходные: иначе
+        # любое русское название выглядело «другим».
+        wanted = [normalize(token) for token in str(text or "").lower().split() if token]
+        wanted = [token for token in wanted if token]
         haystack = normalize(title)
         return bool(wanted) and all(token in haystack for token in wanted)
 
