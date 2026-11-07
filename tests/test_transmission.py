@@ -45,6 +45,20 @@ def bencode(value) -> bytes:
     raise TypeError(type(value))
 
 
+def make_multi_torrent(path: Path, files: int = 4) -> None:
+    """Торрент из нескольких файлов — для проверки выбора нужного файла."""
+    torrent = {
+        "announce": "http://127.0.0.1:1/announce",
+        "info": {
+            "name": "kinozal-agent-multi",
+            "piece length": 16384,
+            "pieces": b"\x00" * 20,
+            "files": [{"length": 1024, "path": [f"episode-{i}.txt"]} for i in range(files)],
+        },
+    }
+    path.write_bytes(bencode(torrent))
+
+
 def make_torrent(path: Path) -> None:
     payload = b"kinozal-agent self test"
     torrent = {
@@ -118,6 +132,37 @@ async def main() -> int:
         return 1
 
     print("\n== постановка .torrent ==")
+    # Выбор одного файла из пачки: Transmission по умолчанию считает выбранными
+    # ВСЕ файлы, поэтому нужен и files-wanted, и files-unwanted. Без этого
+    # качался весь сезон вместо одной серии («Ставка на любовь», серия 4).
+    print("\n== из пачки качается только выбранный файл ==")
+    multi_path = Path("/tmp/agent-selftest-multi.torrent")
+    make_multi_torrent(multi_path, files=4)
+    multi = await transmission.add(multi_path, files_wanted=[3])
+    print("  add(files_wanted=[3]):", multi.get("files_selected"))
+
+    def read_multi() -> dict:
+        client = transmission._get_client()  # noqa: SLF001 - тест про внутренности
+        torrent = client.get_torrent(multi["hash"])
+        return {
+            "status": str(getattr(torrent, "status", "")),
+            "selected": [item.selected for item in torrent.get_files()],
+        }
+
+    multi_state = await asyncio.to_thread(read_multi)
+    print("  состояние:", multi_state)
+    check("выбран ровно один файл из пачки",
+          multi_state["selected"] == [False, False, False, True], multi_state["selected"])
+    check("раздача запущена, а не на паузе",
+          multi_state["status"] not in ("stopped", ""), multi_state["status"])
+
+    def drop_multi() -> None:
+        client = transmission._get_client()  # noqa: SLF001
+        client.remove_torrent(multi["hash"], delete_data=True)
+
+    await asyncio.to_thread(drop_multi)
+    multi_path.unlink(missing_ok=True)
+
     torrent_path = Path("/tmp/agent-selftest.torrent")
     make_torrent(torrent_path)
     print("  собран тестовый torrent:", torrent_path, torrent_path.stat().st_size, "байт")

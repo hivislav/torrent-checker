@@ -37,7 +37,7 @@ from core.storage_target import (  # общие правила для внешн
     can_write as _can_write,
     volume_root,
 )
-from core.torrent_meta import human_bytes, total_length
+from core.torrent_meta import file_list, human_bytes, total_length
 
 log = logging.getLogger("transmission")
 
@@ -524,8 +524,23 @@ class Transmission:
                 "paused": True,
             }
             if files_wanted is not None:
+                # ВАЖНО: одного `files-wanted` мало. Transmission по умолчанию
+                # считает выбранными ВСЕ файлы, а `files-wanted` только добавляет
+                # к этому списку. Без `files-unwanted` качался весь сезон вместо
+                # одной серии (так и вышло со «Ставкой на любовь»).
+                try:
+                    files_count = len(file_list(torrent_path))
+                except Exception:  # noqa: BLE001 - без списка работаем как раньше
+                    files_count = 0
                 wanted = sorted({int(index) for index in files_wanted})
-                add_kwargs["files_wanted"] = wanted
+                if files_count:
+                    wanted = [index for index in wanted if 0 <= index < files_count]
+                    add_kwargs["files_wanted"] = wanted
+                    add_kwargs["files_unwanted"] = [
+                        index for index in range(files_count) if index not in set(wanted)
+                    ]
+                else:
+                    add_kwargs["files_wanted"] = wanted
                 selected = wanted[:]
             result = client.add_torrent(data, **add_kwargs)
             torrent_hash = (
